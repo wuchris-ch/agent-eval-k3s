@@ -1,0 +1,32 @@
+[project]
+name = "agent-eval"
+version = "0.1.0"
+description = "Coding-agent evaluation harness on k3s: sandboxed agent runs, hidden-test verification, metrics, scanners, and an LLM judge"
+readme = "README.md"
+authors = [
+    { name = "Chris", email = "chriswu.ca@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.115.1",
+    "pydantic>=2.13.4",
+    "pyyaml>=6.0.3",
+    "rich>=15.0.0",
+    "typer>=0.26.8",
+]
+
+[project.scripts]
+agent-eval = "agent_eval.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.9.16,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.15.20",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

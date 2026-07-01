@@ -1,0 +1,28 @@
+id: example-todo-api
+language: python
+tags: [fastapi, api]
+prompt: |
+  The workspace contains a small FastAPI todo API in app/main.py.
+  Implement the following feature:
+
+  1. Each todo has a `priority` field: an integer from 1 to 3, defaulting to 2.
+     Creating a todo with a priority outside 1-3 must return HTTP 422.
+  2. GET /todos accepts an optional `priority` query parameter that filters
+     the returned todos to that priority.
+  3. Add DELETE /todos/{todo_id}: returns 204 on success and 404 if the todo
+     does not exist.
+
+  Keep all existing endpoints working exactly as before. The change will be
+  verified by a hidden test suite exercising the HTTP API.
+timeouts:
+  agent_seconds: 900
+  eval_seconds: 300
+test_command: >-
+  python -m pytest /tests -q
+  --junitxml=/results/junit.xml
+  --cov=app --cov-report=json:/results/coverage.json
+judge:
+  weights:
+    spec_adherence: 0.4
+    maintainability: 0.4
+    test_quality: 0.2
