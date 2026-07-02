@@ -12,7 +12,6 @@ from pathlib import Path
 from rich.console import Console
 
 from ..metrics import ScanResults
-from ..task import Task
 
 console = Console()
 SCAN_TIMEOUT = 600
@@ -28,20 +27,22 @@ def _run(cmd: list[str], out_file: Path) -> subprocess.CompletedProcess | None:
         return None
 
 
-def run_scanners(task: Task, workspace: Path, run_dir: Path) -> ScanResults:
+def run_scanners(workspace: Path, run_dir: Path,
+                 language: str | None = "python") -> ScanResults:
     results = ScanResults()
     scans_dir = run_dir / "scans"
     scans_dir.mkdir(parents=True, exist_ok=True)
 
-    _lint(task, workspace, scans_dir, results)
+    _lint(language, workspace, scans_dir, results)
     _semgrep(workspace, scans_dir, results)
     _gitleaks(workspace, scans_dir, results)
     _trivy(workspace, scans_dir, results)
     return results
 
 
-def _lint(task: Task, workspace: Path, scans_dir: Path, results: ScanResults) -> None:
-    if task.language != "python":
+def _lint(language: str | None, workspace: Path, scans_dir: Path,
+          results: ScanResults) -> None:
+    if language != "python":
         return  # eslint etc. can be added per-language later
     proc = _run(["uvx", "ruff", "check", "--output-format", "json", "--exit-zero",
                  str(workspace)], scans_dir / "ruff.json")

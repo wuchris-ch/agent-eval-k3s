@@ -1,8 +1,16 @@
 # agent-eval-k3s
 
-Local k3s evaluation harness for running coding agents in isolated Kubernetes
-pods, then scoring their output with hidden tests, security/static scanners, and
-an optional LLM judge.
+Change-assurance and coding-agent evaluation harness. Two modes:
+
+- **`agent-eval review`** — a pre-merge change report for any git repo (AI- or
+  human-authored), built on executable graders in the style of frontier code
+  evals: scope/command/test graders, scanners over the changed files, and an
+  LLM review whose findings must survive evidence verification. No cluster,
+  no Docker, no task setup.
+- **`agent-eval run`** — a k3s benchmark harness that launches coding agents in
+  isolated pods and scores their output with hidden tests, scanners, and an
+  LLM judge; agent efficiency (tokens, turns, wall time, diff size) becomes
+  metadata on every change.
 
 The project is designed to make coding-agent results reproducible: each task
 defines the starter workspace, hidden tests, runtime image, oracle solution, and
@@ -66,12 +74,74 @@ Each trial runs a pipeline:
 
 ```sh
 uv sync
-export ANTHROPIC_API_KEY=your-anthropic-api-key
+uv run agent-eval doctor        # shows what's installed and what it unlocks
+```
 
-uv run agent-eval cluster up                      # k3d cluster + namespace + secret
-uv run agent-eval tasks validate example-todo-api # oracle must pass hidden tests
-uv run agent-eval run --task example-todo-api --agent claude-code --trials 1
+Review a change in any git repo (no cluster needed):
+
+```sh
+uv run agent-eval review                              # working tree vs main
+uv run agent-eval review --base main --head my-branch
+uv run agent-eval review --test-cmd "pytest -q" --check "ruff check ." \
+    --context @ticket.md
+uv run agent-eval review --test-cmd "pytest -q" --gen-tests   # + generated test
+```
+
+The report (terminal + `review.md`/`review.json` under
+`<repo>/.agent-eval/reviews/`) gives an overall low/medium/high risk, changed
+files by subsystem, deterministic risk signals, scanner findings, grader
+results, and a verified-findings LLM review. Exit code is 2 when risk is high
+or any blocking grader fails, so it drops into CI as a check.
+
+### Review graders
+
+The review is built on executable graders modeled on frontier code evals
+(Cognition's FrontierCode), not on a single LLM opinion pass:
+
+| Grader | Checks | Passes when |
+|---|---|---|
+| scope | policy file boundaries and diff size | diff within constraints |
+| command (`--check`) | build/lint/typecheck commands | exit code 0 |
+| classical (`--test-cmd`) | the test suite on the head side | tests pass |
+| reverse-classical | new/changed tests replayed against the base commit | they FAIL there (tests that also pass on base don't verify the new behavior) |
+| generated test (`--gen-tests`) | an LLM-written discriminating test, with one adaptive repair pass | passes on head AND fails on base |
+| prompt (LLM review) | findings, each with a verbatim diff quote | quote verified programmatically, then blocker/major findings re-confirmed by an adversarial second pass |
+
+Blocking graders (command, head tests, blocked/allowed paths, secrets) gate
+the change: a failure forces risk to high and exit code 2. Non-blocking
+failures (size limits, weak tests) add weighted risk signals. Unverifiable or
+rejected LLM findings are kept in `review.json` but never affect risk, so the
+review cannot hallucinate its way to a verdict. `--gen-tests` runs
+LLM-generated code on your machine: use it only on changes you trust, or wait
+for the sandboxed (k3s) execution mode.
+
+With `--head <ref>`, tests and checks run in a clean temporary worktree of
+that ref, so the test command must work in a fresh checkout (`uv run ...`,
+`uvx pytest`, `npx ...` style commands do).
+
+Per-repo policy lives in `<repo>/.agent-eval.yaml`:
+
+```yaml
+review:
+  test_cmd: "uv run pytest -q"
+  checks:
+    - "uv run ruff check ."
+  blocked_paths:        # blocking: changes here fail the review
+    - ".github/workflows/*"
+  allowed_paths: []     # if set, all changes must match one (blocking)
+  max_files: 30         # non-blocking size limits
+  max_lines: 800
+  require_tests_for:    # code changes here without test changes get flagged
+    - "src/*"
+```
+
+Patterns are fnmatch globs against the repo-relative path (`*` crosses `/`).
+
+Benchmark an agent in k3s (`run` creates the cluster on first use):
+
+```sh
 uv run agent-eval run --task example-todo-api --agent codex --trials 1
+uv run agent-eval run --task example-todo-api --agent claude-code --trials 1  # needs ANTHROPIC_API_KEY
 uv run agent-eval report
 ```
 

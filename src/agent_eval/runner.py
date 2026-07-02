@@ -122,7 +122,7 @@ def evaluate_workspace(task: Task, workspace: Path, *, agent: str = "external",
 
     if run_scans:
         from .evaluators.scanners import run_scanners
-        record.scans = run_scanners(task, workspace, run_dir)
+        record.scans = run_scanners(workspace, run_dir, task.language)
     if run_judge and task.judge.enabled:
         from .evaluators.judge import run_judge as judge_workspace
         record.judge = judge_workspace(task, run_dir)

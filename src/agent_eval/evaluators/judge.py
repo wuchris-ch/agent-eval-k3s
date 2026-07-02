@@ -68,7 +68,7 @@ _JUDGE_SCHEMA = {
 }
 
 
-def _pick_backend() -> str | None:
+def pick_backend() -> str | None:
     backend = os.environ.get("AGENT_EVAL_JUDGE", "auto")
     if backend in ("claude", "codex"):
         return backend
@@ -81,6 +81,21 @@ def _pick_backend() -> str | None:
 
 def _judge_model_env() -> str | None:
     return os.environ.get("AGENT_EVAL_JUDGE_MODEL")
+
+
+def structured_completion(system: str, user: str, response_model: type,
+                          schema: dict) -> tuple[object, str]:
+    """One structured LLM call through whichever backend is available.
+
+    Returns (parsed response_model instance, backend/model label). Raises
+    RuntimeError when no backend is available or the call fails."""
+    backend = pick_backend()
+    if backend is None:
+        raise RuntimeError("no LLM backend available (need ANTHROPIC_API_KEY "
+                           "or a logged-in codex CLI)")
+    if backend == "claude":
+        return _complete_claude(system, user, response_model)
+    return _complete_codex(system, user, response_model, schema)
 
 
 def _build_prompts(task: Task, diff: str) -> tuple[str, str]:
@@ -100,7 +115,7 @@ def _build_prompts(task: Task, diff: str) -> tuple[str, str]:
     return system, user
 
 
-def _judge_claude(system: str, user: str) -> tuple[JudgeResponse, str]:
+def _complete_claude(system: str, user: str, response_model: type) -> tuple[object, str]:
     import anthropic
 
     model = _judge_model_env() or CLAUDE_JUDGE_MODEL
@@ -110,17 +125,18 @@ def _judge_claude(system: str, user: str) -> tuple[JudgeResponse, str]:
         max_tokens=4096,
         system=system,
         messages=[{"role": "user", "content": user}],
-        output_format=JudgeResponse,
+        output_format=response_model,
     )
     return response.parsed_output, model
 
 
-def _judge_codex(system: str, user: str) -> tuple[JudgeResponse, str]:
+def _complete_codex(system: str, user: str, response_model: type,
+                    json_schema: dict) -> tuple[object, str]:
     env_model = _judge_model_env()
     model = env_model if env_model and not env_model.startswith("claude") else None
     with tempfile.TemporaryDirectory(prefix="agent-eval-judge-") as tmp:
         schema = Path(tmp) / "schema.json"
-        schema.write_text(json.dumps(_JUDGE_SCHEMA))
+        schema.write_text(json.dumps(json_schema))
         last_message = Path(tmp) / "last_message.json"
         cmd = ["codex", "exec", "--skip-git-repo-check", "-s", "read-only",
                "-C", tmp, "--output-schema", str(schema),
@@ -133,7 +149,7 @@ def _judge_codex(system: str, user: str) -> tuple[JudgeResponse, str]:
         if proc.returncode != 0 or not last_message.is_file():
             raise RuntimeError(f"codex exec failed ({proc.returncode}): "
                                f"{(proc.stderr or proc.stdout)[-1000:]}")
-        parsed = JudgeResponse.model_validate_json(last_message.read_text())
+        parsed = response_model.model_validate_json(last_message.read_text())
     return parsed, f"codex/{model or 'default'}"
 
 
@@ -145,7 +161,7 @@ def run_judge(task: Task, run_dir: Path) -> JudgeResult:
     if len(diff) > MAX_DIFF_CHARS:
         diff = diff[:MAX_DIFF_CHARS] + "\n... [diff truncated for judging]"
 
-    backend = _pick_backend()
+    backend = pick_backend()
     if backend is None:
         console.print("[yellow]no judge backend available (need ANTHROPIC_API_KEY "
                       "or a logged-in codex CLI); skipping judge[/yellow]")
@@ -154,10 +170,7 @@ def run_judge(task: Task, run_dir: Path) -> JudgeResult:
     system, user = _build_prompts(task, diff)
     console.print(f"judging with [bold]{backend}[/bold] backend...")
     try:
-        if backend == "claude":
-            parsed, model = _judge_claude(system, user)
-        else:
-            parsed, model = _judge_codex(system, user)
+        parsed, model = structured_completion(system, user, JudgeResponse, _JUDGE_SCHEMA)
     except Exception as e:  # judge is supplementary; never fail the run
         console.print(f"[yellow]judge failed: {e}[/yellow]")
         return JudgeResult(rationale={"_error": str(e)})

@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 
 from agent_eval.agents.claude_code import ClaudeCodeAdapter
@@ -106,3 +107,210 @@ def test_pass_at_k():
     assert pass_at_k(3, 0, 1) == 0.0
     assert abs(pass_at_k(3, 1, 1) - 1 / 3) < 1e-9
     assert pass_at_k(3, 1, 3) == 1.0
+
+
+def test_classify_subsystem():
+    from agent_eval.review import classify_subsystem
+
+    assert classify_subsystem("src/auth/login.py") == "auth/security"
+    assert classify_subsystem("tests/test_auth.py") == "tests"
+    assert classify_subsystem("app/spec/user.spec.ts") == "tests"
+    assert classify_subsystem("migrations/0002_add_priority.sql") == "data/migrations"
+    assert classify_subsystem("pyproject.toml") == "dependencies"
+    assert classify_subsystem(".github/workflows/ci.yml") == "ci/infra"
+    assert classify_subsystem("Dockerfile") == "ci/infra"
+    assert classify_subsystem("README.md") == "docs"
+    assert classify_subsystem("src/todo/service.py") == "app code"
+
+
+def test_compute_risk_levels():
+    from agent_eval.metrics import DiffStats, ScanResults
+    from agent_eval.review import ChangedFile, TestRun, compute_risk
+
+    docs_only = [ChangedFile(path="README.md", subsystem="docs", lines_added=5)]
+    signals, risk = compute_risk(docs_only, DiffStats(files_changed=1, lines_added=5),
+                                 None, None)
+    assert risk == "low"
+
+    auth_no_tests = [ChangedFile(path="src/auth/login.py", subsystem="auth/security",
+                                 lines_added=30)]
+    signals, risk = compute_risk(auth_no_tests,
+                                 DiffStats(files_changed=1, lines_added=30), None, None)
+    assert risk in ("medium", "high")
+    assert any("auth" in s for s in signals)
+    assert any("no test changes" in s for s in signals)
+
+    secrets = ScanResults(secrets_found=1)
+    _, risk = compute_risk(docs_only, DiffStats(files_changed=1), secrets, None)
+    assert risk == "high"
+
+    failing = TestRun(command="pytest", exit_code=1, passed=False)
+    _, risk = compute_risk(docs_only, DiffStats(files_changed=1), None, failing)
+    assert risk == "high"
+
+
+def test_max_risk():
+    from agent_eval.review import _max_risk
+
+    assert _max_risk("low", "medium") == "medium"
+    assert _max_risk("high", "low") == "high"
+    assert _max_risk("low", "bogus") == "low"
+
+
+def test_scope_graders():
+    from agent_eval.graders import ReviewPolicy, scope_graders
+
+    policy = ReviewPolicy(blocked_paths=[".github/workflows/*"],
+                          allowed_paths=["src/*", "tests/*"],
+                          max_files=2, max_lines=100,
+                          require_tests_for=["src/*"])
+    changed = [("src/app.py", "app code"), ("infra/main.tf", "ci/infra")]
+    results = {g.name: g for g in scope_graders(changed, 250, policy)}
+
+    assert results["scope: blocked paths"].passed is True
+    allowed = results["scope: allowed paths"]
+    assert allowed.passed is False and allowed.blocking
+    assert "infra/main.tf" in allowed.details
+    assert results["scope: at most 2 files"].passed is True
+    size = results["scope: at most 100 changed lines"]
+    assert size.passed is False and not size.blocking
+    tests_req = results["scope: tests required for covered paths"]
+    assert tests_req.passed is False
+
+    blocked = {g.name: g for g in scope_graders(
+        [(".github/workflows/ci.yml", "ci/infra")], 10,
+        ReviewPolicy(blocked_paths=[".github/workflows/*"]))}
+    hit = blocked["scope: blocked paths"]
+    assert hit.passed is False and hit.blocking
+
+
+def test_policy_loading(tmp_path):
+    from agent_eval.graders import load_policy
+
+    (tmp_path / ".agent-eval.yaml").write_text(
+        "review:\n  test_cmd: pytest -q\n  checks: ['ruff check .']\n"
+        "  max_files: 30\n")
+    policy = load_policy(tmp_path)
+    assert policy.test_cmd == "pytest -q"
+    assert policy.checks == ["ruff check ."]
+    assert policy.max_files == 30
+    assert load_policy(tmp_path / "nowhere").test_cmd is None
+
+
+def test_verify_findings():
+    from agent_eval.review import Finding, verify_findings
+
+    diff = ("--- a/src/auth.py\n+++ b/src/auth.py\n"
+            "+    return hashlib.md5(password.encode()).hexdigest()\n")
+    changed = ["src/auth.py"]
+
+    good = Finding(severity="major", file="src/auth.py",
+                   claim="weak hash",
+                   evidence="hashlib.md5(password.encode()).hexdigest()")
+    paraphrase = Finding(severity="major", file="src/auth.py",
+                         claim="weak hash", evidence="uses an md5 digest call")
+    wrong_file = Finding(severity="major", file="src/other.py",
+                         claim="weak hash",
+                         evidence="hashlib.md5(password.encode()).hexdigest()")
+    too_short = Finding(severity="nit", file="src/auth.py",
+                        claim="x", evidence="return")
+
+    verified = verify_findings([good, paraphrase, wrong_file, too_short],
+                               diff, changed)
+    assert verified[0].verified is True
+    assert verified[1].verified is False
+    assert verified[2].verified is False
+    assert verified[3].verified is False
+
+
+def test_verify_findings_nit_cap():
+    from agent_eval.review import MAX_NITS, Finding, verify_findings
+
+    diff = "+    some perfectly quotable changed line of code here\n"
+    nits = [Finding(severity="nit", file="a.py", claim=f"nit {i}",
+                    evidence="some perfectly quotable changed line of code here")
+            for i in range(MAX_NITS + 3)]
+    verified = verify_findings(nits, diff, ["a.py"])
+    assert sum(1 for f in verified if f.verified) == MAX_NITS
+
+
+def test_llm_findings_risk():
+    from agent_eval.review import Finding, LLMReview, llm_findings_risk
+
+    confirmed_blocker = Finding(severity="blocker", verified=True,
+                                verdict="confirmed")
+    rejected_blocker = Finding(severity="blocker", verified=True,
+                               verdict="rejected")
+    confirmed_major = Finding(severity="major", verified=True,
+                              verdict="confirmed")
+    unverified = Finding(severity="blocker", verified=False)
+
+    assert llm_findings_risk(LLMReview(risk="high",
+                                       findings=[confirmed_blocker])) == "high"
+    assert llm_findings_risk(LLMReview(risk="high",
+                                       findings=[rejected_blocker,
+                                                 unverified])) == "low"
+    assert llm_findings_risk(LLMReview(findings=[confirmed_major])) == "medium"
+
+
+def test_compute_risk_with_graders():
+    from agent_eval.graders import GraderResult
+    from agent_eval.metrics import DiffStats
+    from agent_eval.review import ChangedFile, compute_risk
+
+    docs_only = [ChangedFile(path="README.md", subsystem="docs", lines_added=5)]
+    stats = DiffStats(files_changed=1, lines_added=5)
+
+    blocked = GraderResult(name="check: build", category="command",
+                           blocking=True, passed=False)
+    signals, risk = compute_risk(docs_only, stats, None, None, [blocked])
+    assert risk == "high"
+    assert any("blocking grader failed" in s for s in signals)
+
+    weak_tests = GraderResult(name="new/changed tests vs base commit",
+                              category="reverse-classical", blocking=False,
+                              weight=2, passed=False,
+                              details="tests also pass on base")
+    signals, risk = compute_risk(docs_only, stats, None, None, [weak_tests])
+    assert risk == "medium"
+
+    skipped = GraderResult(name="x", category="scope", passed=None)
+    _, risk = compute_risk(docs_only, stats, None, None, [skipped])
+    assert risk == "low"
+
+
+def test_sanitize_gen_filename(tmp_path):
+    from agent_eval.review import _sanitize_gen_filename
+
+    assert _sanitize_gen_filename("tests/test_new.py", tmp_path) == "tests/test_new.py"
+    assert _sanitize_gen_filename("../evil.py", tmp_path) is None
+    assert _sanitize_gen_filename("/abs/path.py", tmp_path) is None
+    assert _sanitize_gen_filename("a;rm -rf.py", tmp_path) is None
+    (tmp_path / "test_x.py").write_text("existing")
+    assert _sanitize_gen_filename("test_x.py", tmp_path) == "agent_eval_gen_test_x.py"
+
+
+def test_collect_changes_counts_untracked_files(tmp_path):
+    from agent_eval.review import collect_changes
+
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"],
+                   cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"],
+                   cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("# demo\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True,
+                   capture_output=True)
+
+    source = tmp_path / "src" / "new_feature.py"
+    source.parent.mkdir()
+    source.write_text("def hello():\n    return 'world'\n")
+
+    files, stats, diff = collect_changes(tmp_path, "HEAD", None)
+    by_path = {f.path: f for f in files}
+
+    assert by_path["src/new_feature.py"].lines_added == 2
+    assert stats.lines_added == 2
+    assert "diff --git a/src/new_feature.py b/src/new_feature.py" in diff
+    assert "+def hello():" in diff

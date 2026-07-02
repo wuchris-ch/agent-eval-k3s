@@ -39,6 +39,15 @@ def cluster_up() -> None:
     console.print("[green]cluster ready[/green]")
 
 
+def ensure_cluster() -> None:
+    """Create the cluster on first use so `agent-eval run` works cold."""
+    if cluster_exists():
+        ensure_namespace()
+        return
+    console.print("no cluster found; creating it (first run only)...")
+    cluster_up()
+
+
 def cluster_down() -> None:
     _run(["k3d", "cluster", "delete", CLUSTER_NAME])
     console.print(f"[green]cluster {CLUSTER_NAME} deleted[/green]")
