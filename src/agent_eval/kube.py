@@ -6,11 +6,21 @@ from __future__ import annotations
 import json
 import subprocess
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
 NAMESPACE = "agent-eval"
 KUBE_CONTEXT = "k3d-agent-eval"
+
+# Conservative defaults for arbitrary-code workloads. Task images still run as
+# their declared user and retain a writable filesystem because existing agent
+# CLIs and test suites require both; the controls below remove ambient cluster
+# identity and Linux privilege without changing that task contract.
+DEFAULT_SANDBOX_RESOURCES = {
+    "requests": {"cpu": "100m", "memory": "128Mi", "ephemeral-storage": "256Mi"},
+    "limits": {"cpu": "2", "memory": "2Gi", "ephemeral-storage": "4Gi"},
+}
 
 
 class KubeError(RuntimeError):
@@ -78,23 +88,38 @@ class Pod:
                 check=False, timeout=60)
 
 
-def create_sandbox_pod(prefix: str, image: str, *, env_from_secret: str | None = None,
-                       active_deadline: int = 3600) -> Pod:
-    """Create a sleeping pod we can copy files into and exec commands in."""
-    name = f"{prefix}-{uuid.uuid4().hex[:8]}"
+def sandbox_pod_manifest(name: str, prefix: str, image: str, *,
+                         env_from_secret: str | None = None,
+                         active_deadline: int = 3600) -> dict:
+    """Return the auditable pod manifest used for agent and eval sandboxes.
+
+    The service-account token and service discovery environment are disabled,
+    while the container gets seccomp, no privilege escalation, no Linux
+    capabilities, and bounded resources. Network egress remains available
+    because coding agents must reach their model provider.
+    """
     spec: dict = {
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {"name": name, "labels": {"app": "agent-eval", "phase": prefix}},
         "spec": {
+            "automountServiceAccountToken": False,
+            "enableServiceLinks": False,
             "restartPolicy": "Never",
             "activeDeadlineSeconds": active_deadline,
+            "terminationGracePeriodSeconds": 1,
             "containers": [{
                 "name": "sandbox",
                 "image": image,
                 "imagePullPolicy": "IfNotPresent",
                 "command": ["sh", "-c", "sleep infinity"],
                 "workingDir": "/workspace",
+                "securityContext": {
+                    "allowPrivilegeEscalation": False,
+                    "capabilities": {"drop": ["ALL"]},
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
+                "resources": deepcopy(DEFAULT_SANDBOX_RESOURCES),
             }],
         },
     }
@@ -102,5 +127,16 @@ def create_sandbox_pod(prefix: str, image: str, *, env_from_secret: str | None =
         # optional: adapters with file-based auth (codex) run without the secret
         spec["spec"]["containers"][0]["envFrom"] = [
             {"secretRef": {"name": env_from_secret, "optional": True}}]
+    return spec
+
+
+def create_sandbox_pod(prefix: str, image: str, *, env_from_secret: str | None = None,
+                       active_deadline: int = 3600) -> Pod:
+    """Create a sleeping pod we can copy files into and exec commands in."""
+    name = f"{prefix}-{uuid.uuid4().hex[:8]}"
+    spec = sandbox_pod_manifest(
+        name, prefix, image, env_from_secret=env_from_secret,
+        active_deadline=active_deadline,
+    )
     kubectl("apply", "-f", "-", input=json.dumps(spec).encode(), timeout=60)
     return Pod(name)

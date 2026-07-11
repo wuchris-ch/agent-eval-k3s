@@ -6,6 +6,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.table import Table
 
 from . import cluster as cluster_mod
 from .report import markdown_report, print_run_detail, print_runs_table, print_trial_summary
@@ -115,6 +116,122 @@ def review(
         raise typer.Exit(2)  # CI-friendly: high risk / blocked fails the check
 
 
+def _metric(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.3f}"
+
+
+@app.command("benchmark-review")
+def benchmark_review(
+    manifest: Path = typer.Option(
+        ..., "--manifest", exists=True, dir_okay=False,
+        help="Gold-labeled review benchmark YAML manifest.",
+    ),
+    reviews: Path = typer.Option(
+        ..., "--reviews", file_okay=False,
+        help="Directory containing <case-id>.json reviewer outputs.",
+    ),
+    out: Path = typer.Option(
+        None, "--out", dir_okay=False,
+        help="Write item-level benchmark results as JSON.",
+    ),
+    min_precision: float = typer.Option(
+        None, "--min-precision", min=0.0, max=1.0,
+        help="Fail if aggregate precision is below this value.",
+    ),
+    min_recall: float = typer.Option(
+        None, "--min-recall", min=0.0, max=1.0,
+        help="Fail if aggregate recall is below this value.",
+    ),
+    min_critical_recall: float = typer.Option(
+        None, "--min-critical-recall", min=0.0, max=1.0,
+        help="Fail if blocker/major recall is below this value.",
+    ),
+    max_fp_per_case: float = typer.Option(
+        None, "--max-fp-per-case", min=0.0,
+        help="Fail if average false positives per case exceeds this value.",
+    ),
+    fail_on_missing: bool = typer.Option(
+        True, "--fail-on-missing/--allow-missing",
+        help="Fail the regression gate when a case has no reviewer output.",
+    ),
+) -> None:
+    """Score reviewer outputs against deterministic, gold-labeled findings."""
+    import yaml
+
+    from .review_benchmark import load_manifest, score_benchmark
+
+    try:
+        result = score_benchmark(load_manifest(manifest), reviews)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        console.print(f"[red]could not score benchmark: {exc}[/red]")
+        raise typer.Exit(1) from None
+
+    metrics = result.metrics
+    table = Table(title="AI reviewer benchmark", show_edge=False)
+    table.add_column("metric")
+    table.add_column("value", justify="right")
+    table.add_row("cases", str(metrics.case_count))
+    table.add_row("TP / FP / FN", f"{metrics.tp} / {metrics.fp} / {metrics.fn}")
+    table.add_row("precision", _metric(metrics.precision))
+    table.add_row("recall", _metric(metrics.recall))
+    table.add_row("F1", _metric(metrics.f1))
+    table.add_row("blocker + major recall", _metric(metrics.blocker_major_recall))
+    table.add_row("severity accuracy", _metric(metrics.severity_accuracy))
+    table.add_row("false positives / case", _metric(metrics.false_positives_per_case))
+    table.add_row("false positives / KLoC", _metric(metrics.false_positives_per_kloc))
+    table.add_row("clean-case accuracy", _metric(metrics.clean_case_accuracy))
+    console.print(table)
+
+    missing = [
+        case.case_id for case in result.cases
+        if case.status == "missing_prediction"
+    ]
+    if missing:
+        console.print(
+            f"[yellow]{len(missing)} missing prediction file(s) were "
+            "scored as zero findings[/yellow]"
+        )
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(result.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        console.print(f"benchmark result: {out}")
+
+    gates = [
+        ("precision", metrics.precision, min_precision, "minimum"),
+        ("recall", metrics.recall, min_recall, "minimum"),
+        (
+            "blocker + major recall",
+            metrics.blocker_major_recall,
+            min_critical_recall,
+            "minimum",
+        ),
+        (
+            "false positives / case",
+            metrics.false_positives_per_case,
+            max_fp_per_case,
+            "maximum",
+        ),
+    ]
+    failures = []
+    if missing and fail_on_missing:
+        failures.append(f"{len(missing)} benchmark case(s) have no reviewer output")
+    for name, value, threshold, direction in gates:
+        if threshold is None:
+            continue
+        failed = value is None or (
+            value < threshold if direction == "minimum" else value > threshold
+        )
+        if failed:
+            failures.append(
+                f"{name} {_metric(value)} does not meet "
+                f"{direction} {threshold:.3f}"
+            )
+    if failures:
+        for failure in failures:
+            console.print(f"[red]gate failed: {failure}[/red]")
+        raise typer.Exit(2)
+
+
 @app.command()
 def doctor() -> None:
     """Check local prerequisites and show which features each one unlocks."""
@@ -142,7 +259,6 @@ def doctor() -> None:
         ("trivy", sh.which("trivy") is not None, "dependency vuln scanning (optional)",
          "brew install trivy"),
     ]
-    from rich.table import Table
     table = Table(title="agent-eval doctor")
     for col in ("check", "status", "unlocks", "fix"):
         table.add_column(col)

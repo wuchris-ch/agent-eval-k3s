@@ -839,8 +839,11 @@ def review_change(repo: Path, base: str | None = None, head: str | None = None,
 
 
 def _persist(report: ChangeReport, out_dir: Path) -> None:
+    from .sarif import write_sarif
+
     (out_dir / "review.json").write_text(report.model_dump_json(indent=2))
     (out_dir / "review.md").write_text(markdown_review(report))
+    write_sarif(report, out_dir / "review.sarif")
 
 
 # ------------------------------------------------------------------- rendering

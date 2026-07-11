@@ -33,13 +33,28 @@ and OpenHands (pluggable agent adapters, transcript-derived cost metrics).
 - Tracks correctness, pass@k, coverage, wall time, token usage, tool calls,
   diff size, scanner findings, and judge scores in SQLite-backed run records.
 - Provides pluggable adapters for Claude Code and OpenAI Codex CLI.
+- Scores any review agent's JSON output against gold-labeled findings with
+  precision, recall, F1, blocker/major recall, false-positive rate, clean-PR
+  accuracy, and Wilson 95% intervals.
+- Emits SARIF 2.1.0 with stable finding fingerprints for GitHub/GitLab code
+  scanning, alongside the human-readable and native JSON reports.
+- Runs arbitrary-code pods with no service-account token, `RuntimeDefault`
+  seccomp, no privilege escalation, dropped Linux capabilities, and resource
+  bounds.
 
-## Resume summary
+## Resume-ready positioning (July 2026)
 
-Built a Kubernetes-backed coding-agent evaluation harness that runs autonomous
-agents in isolated k3s pods, snapshots their code changes, validates them with
-hidden tests in clean evaluation pods, and records correctness, efficiency,
-security, and LLM-judge metrics across repeated trials.
+Built an independent assurance layer for coding agents and AI pull-request
+reviewers: Kubernetes-isolated agent trials, hidden-test evaluation in a
+separate trust domain, evidence-verified review findings, deterministic
+gold-label scoring with uncertainty intervals and false-positive gates, and
+SARIF output for enterprise CI.
+
+That is intentionally different from building another PR comment bot. By 2026,
+repository context, custom instructions, agentic fixes, and multi-agent reviews
+are standard vendor features. The harder enterprise question is whether a
+reviewer is accurate, reproducible, cost-effective, and safe enough to gate a
+merge. This project supplies the independent measurement and enforcement layer.
 
 ## How it works
 
@@ -90,8 +105,10 @@ uv run agent-eval review --test-cmd "pytest -q" --gen-tests   # + generated test
 The report (terminal + `review.md`/`review.json` under
 `<repo>/.agent-eval/reviews/`) gives an overall low/medium/high risk, changed
 files by subsystem, deterministic risk signals, scanner findings, grader
-results, and a verified-findings LLM review. Exit code is 2 when risk is high
-or any blocking grader fails, so it drops into CI as a check.
+results, and a verified-findings LLM review. The same directory always includes
+`review.sarif`, with stable fingerprints and repo-relative locations suitable
+for code-scanning upload. Exit code is 2 when risk is high or any blocking
+grader fails, so it drops into CI as a check.
 
 ### Review graders
 
@@ -137,6 +154,53 @@ review:
 
 Patterns are fnmatch globs against the repo-relative path (`*` crosses `/`).
 
+### Benchmark an AI reviewer
+
+`benchmark-review` is vendor-neutral: export each reviewer run as either this
+project's `review.json` or a simple `{"findings": [...]}` JSON file. The scorer
+uses exact file/category matching and a gold line range, then computes a maximum
+one-to-one match. No LLM judges whether the LLM was correct.
+
+```yaml
+# benchmark.yaml
+cases:
+  - id: auth-bypass
+    description: Authorization check removed from the update path
+    changed_lines: 42
+    expected:
+      - id: AUTH-001
+        severity: blocker
+        category: security
+        file: src/auth.py
+        line_start: 81
+        line_end: 86
+  - id: clean-refactor
+    changed_lines: 27
+    expected: []
+```
+
+Place outputs at `<reviews>/<case-id>.json`, then score and optionally turn the
+metrics into a regression gate:
+
+```sh
+uv run agent-eval benchmark-review \
+  --manifest benchmark.yaml \
+  --reviews reviewer-outputs \
+  --out benchmark-result.json \
+  --min-precision 0.80 \
+  --min-recall 0.75 \
+  --min-critical-recall 0.90 \
+  --max-fp-per-case 0.50 \
+  --fail-on-missing
+```
+
+The item-level JSON records every matched, missed, and unmatched finding. The
+aggregate includes precision/recall/F1, blocker+major recall, severity accuracy,
+false positives per case and per KLoC, clean-case accuracy, and Wilson 95%
+intervals. Missing reviewer outputs are visible and score as zero findings.
+The CLI fails closed on missing outputs by default; use `--allow-missing` only
+for exploratory, intentionally partial runs.
+
 Benchmark an agent in k3s (`run` creates the cluster on first use):
 
 ```sh
@@ -154,6 +218,12 @@ so a ChatGPT subscription login is enough; no API key needed).
 > arbitrary code. Fine for a local harness evaluating trusted agents; treat
 > untrusted agents accordingly (restrict egress, use throwaway credentials).
 
+The pod profile removes ambient Kubernetes identity and common privilege-
+escalation paths, but it is not a complete hostile-code boundary: task images
+still use their declared user and writable filesystem, and model API access
+requires network egress. Non-root task images, short-lived credentials, and a
+domain-aware egress proxy are the next hardening steps.
+
 Eval-only mode (score code produced elsewhere):
 
 ```sh
@@ -168,6 +238,30 @@ uv run agent-eval evaluate --task example-todo-api --workspace /path/to/produced
 | Efficiency  | wall time, input/output tokens, cost USD, turns, tool calls |
 | Quality     | lint errors, semgrep findings by severity, secrets, dep vulns, diff size |
 | Judge       | 1-5 per rubric dimension + weighted score + rationale |
+
+## Enterprise roadmap
+
+The next highest-value extensions are deliberately measurable:
+
+1. Add a public, versioned corpus of faulty and clean PRs with executable hidden
+   reproducers, repeated trials, paired comparisons, latency/cost curves, and
+   cross-run stability.
+2. Bind commit SHAs, policy hashes, image digests, tool versions, results, and
+   artifact hashes into a locally verifiable in-toto/SLSA-style attestation;
+   add optional Sigstore signing only after local verification is solid.
+3. Add an OWASP Agentic Top 10 challenge pack for poisoned instructions, hidden-
+   test discovery, grader tampering, credential exfiltration, tool misuse, and
+   resource exhaustion.
+4. Add default-deny network policy through a domain-aware egress proxy and move
+   agent authentication from reusable host credentials to per-trial credentials.
+5. Compare single-reviewer and specialist-panel modes at a fixed false-positive,
+   latency, and token budget before claiming that multiple agents improve review.
+
+Design references: [NIST AI 800-2 draft evaluation guidance](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.800-2.ipd.pdf),
+[OWASP Top 10 for Agentic Applications 2026](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/),
+[Kubernetes Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/),
+[SLSA 1.2](https://slsa.dev/spec/v1.2/), and
+[GitHub SARIF integration](https://docs.github.com/en/code-security/concepts/code-scanning/sarif-files).
 
 ## Writing a task
 
