@@ -389,6 +389,47 @@ def _scanner_primary_location_hash(
     return _primary_location_line_hash(tool.casefold(), rule, path, line)
 
 
+def _disambiguate_scanner_primary_location_fingerprints(
+    results: list[dict[str, Any]],
+) -> None:
+    by_rule_and_base: dict[
+        tuple[str, str], dict[int, list[tuple[int, dict[str, Any]]]]
+    ] = {}
+    for index, result in enumerate(results):
+        primary = result["partialFingerprints"][_PRIMARY_LOCATION_FINGERPRINT]
+        fingerprint_base, _, occurrence_text = primary.rpartition(":")
+        by_rule_and_base.setdefault(
+            (result["ruleId"], fingerprint_base), {}
+        ).setdefault(
+            int(occurrence_text), []
+        ).append((index, result))
+
+    for (_, fingerprint_base), by_occurrence in by_rule_and_base.items():
+        reserved_occurrences = set(by_occurrence)
+        next_occurrence = 1
+        for requested_occurrence in sorted(by_occurrence):
+            colliding = by_occurrence[requested_occurrence]
+            if len(colliding) == 1:
+                continue
+            ordered = sorted(
+                colliding,
+                key=lambda item: (
+                    item[1]["partialFingerprints"][_INTERNAL_FINGERPRINT_NAME],
+                    item[1]["message"]["text"],
+                    item[1]["level"],
+                    item[1]["properties"].get("scannerSeverity", ""),
+                    item[0],
+                ),
+            )
+            for _, result in ordered[1:]:
+                while next_occurrence in reserved_occurrences:
+                    next_occurrence += 1
+                result["partialFingerprints"][_PRIMARY_LOCATION_FINGERPRINT] = (
+                    f"{fingerprint_base}:{next_occurrence}"
+                )
+                reserved_occurrences.add(next_occurrence)
+
+
 def _scanner_results(
     report: ChangeReport,
     known_paths: tuple[str, ...],
@@ -465,6 +506,7 @@ def _scanner_results(
         if severity is not None:
             result["properties"]["scannerSeverity"] = _semantic_text(severity)
         results.append(result)
+    _disambiguate_scanner_primary_location_fingerprints(results)
     return results
 
 

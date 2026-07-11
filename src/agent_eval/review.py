@@ -729,19 +729,115 @@ def _normalize_ws(s: str) -> str:
     return " ".join(s.split())
 
 
+def _added_head_line_runs(
+    diff: str, changed_paths: list[str]
+) -> dict[str, list[list[tuple[int, str]]]]:
+    """Return contiguous added-line runs with their head-side line numbers."""
+    known_paths = set(changed_paths)
+    runs: dict[str, list[list[tuple[int, str]]]] = {
+        path: [] for path in changed_paths
+    }
+    current_path: str | None = None
+    head_line: int | None = None
+    current_run: list[tuple[int, str]] | None = None
+
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            current_path = None
+            head_line = None
+            current_run = None
+            continue
+        if head_line is None and line.startswith("+++ "):
+            current_path = _patch_path(line[4:], known_paths)
+            current_run = None
+            continue
+
+        hunk = _HUNK_HEADER.match(line)
+        if hunk:
+            head_line = int(hunk.group("start")) if current_path else None
+            current_run = None
+            continue
+        if current_path is None or head_line is None:
+            continue
+        if line.startswith("+"):
+            if current_run is None:
+                current_run = []
+                runs[current_path].append(current_run)
+            current_run.append((head_line, line[1:]))
+            head_line += 1
+        elif line.startswith("-") or line.startswith("\\ No newline"):
+            current_run = None
+        else:
+            current_run = None
+            head_line += 1
+
+    return runs
+
+
+def _evidence_line_ranges(
+    runs: list[list[tuple[int, str]]], quote: str
+) -> list[tuple[int, int]]:
+    """Locate a normalized evidence quote within contiguous added-line runs."""
+    matches: list[tuple[int, int]] = []
+    for run in runs:
+        text = ""
+        spans: list[tuple[int, int, int]] = []
+        for line_number, content in run:
+            normalized = _normalize_ws(content)
+            if not normalized:
+                continue
+            if text:
+                text += " "
+            start = len(text)
+            text += normalized
+            spans.append((start, len(text), line_number))
+
+        offset = 0
+        while quote and (position := text.find(quote, offset)) >= 0:
+            end = position + len(quote)
+            matched_lines = [
+                line_number
+                for start, stop, line_number in spans
+                if start < end and stop > position
+            ]
+            if matched_lines:
+                location = (matched_lines[0], matched_lines[-1])
+                if location not in matches:
+                    matches.append(location)
+            offset = position + 1
+    return matches
+
+
+def _finding_path(value: str, changed_paths: set[str]) -> str | None:
+    """Resolve an exact or unambiguous shortened repository path."""
+    raw = value.strip()
+    if raw in changed_paths:
+        return raw
+    matches = [path for path in changed_paths if path.endswith(f"/{raw}")]
+    return matches[0] if len(matches) == 1 else None
+
+
 def verify_findings(findings: list[Finding], diff: str,
                     changed_paths: list[str]) -> list[Finding]:
     """Programmatic verification bar: a finding survives only if its evidence
-    is a verbatim quote from the diff and it names a changed file. Nits are
-    capped at MAX_NITS. Returns the surviving list (unverified are kept in
-    the report JSON but excluded from risk and rendering)."""
-    ndiff = _normalize_ws(diff)
+    is a verbatim quote from added lines in its named changed file. A supplied
+    line must overlap the evidence; a missing line is derived from it. Nits
+    are capped at MAX_NITS. Returns the surviving list (unverified are kept
+    in the report JSON but excluded from risk and rendering)."""
+    known_paths = set(changed_paths)
+    added_runs = _added_head_line_runs(diff, changed_paths)
     kept: list[Finding] = []
     nits = 0
     for f in findings:
         quote = _normalize_ws(f.evidence)
-        file_ok = any(p == f.file or p.endswith("/" + f.file) for p in changed_paths)
-        f.verified = len(quote) >= 12 and quote in ndiff and file_ok
+        path = _finding_path(f.file, known_paths)
+        locations = _evidence_line_ranges(added_runs.get(path, []), quote) \
+            if path and len(quote) >= 12 else []
+        if f.line is None and locations:
+            f.line = locations[0][0]
+        f.verified = bool(locations) and f.line is not None and any(
+            start <= f.line <= end for start, end in locations
+        )
         if f.verified and f.severity == "nit":
             nits += 1
             if nits > MAX_NITS:
@@ -769,8 +865,9 @@ def _build_review_prompts(report: ChangeReport, diff: str,
         "findings, risk signals) plus the diff.\n"
         "Rules for findings:\n"
         "- Every finding's `evidence` must be a verbatim contiguous quote "
-        "from the diff below. Findings whose quote cannot be located in the "
-        "diff are discarded automatically, so never paraphrase.\n"
+        "from added lines in its named file. Its `line` must be one of the "
+        "quoted added lines; use null to derive it from the evidence. Findings "
+        "whose quote cannot be located are discarded, so never paraphrase.\n"
         "- Report only problems INTRODUCED by this change, not pre-existing "
         "ones, and only what you can prove from the diff and evidence; if "
         "you cannot prove it, it is not a finding.\n"

@@ -126,6 +126,8 @@ class JudgeConfig(BaseModel):
 
 
 class Task(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: str
     prompt: str
     language: str = "python"

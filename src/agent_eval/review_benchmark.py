@@ -35,6 +35,51 @@ CaseStatus = Literal[
 _HIGH_SEVERITIES = frozenset(("blocker", "major"))
 _WILSON_Z_95 = 1.959963984540054
 _SAFE_CASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_URI_OR_DRIVE_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects ambiguous duplicate mapping keys."""
+
+    def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
+        seen: set[Any] = set()
+        for key_node, _ in node.value:
+            key = (
+                "<<"
+                if key_node.tag == "tag:yaml.org,2002:merge"
+                else self.construct_object(key_node, deep=deep)
+            )
+            try:
+                duplicate = key in seen
+                seen.add(key)
+            except TypeError as exc:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found unhashable key",
+                    key_node.start_mark,
+                ) from exc
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+        return super().construct_mapping(node, deep=deep)
+
+
+class _DuplicateJsonKeyError(ValueError):
+    """Raised when a JSON object repeats a key."""
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKeyError(f"found duplicate key {key!r}")
+        result[key] = value
+    return result
 
 
 def _normalize_file(path: str) -> str:
@@ -46,6 +91,22 @@ def _normalize_file(path: str) -> str:
     if not normalized:
         return ""
     return posixpath.normpath(normalized)
+
+
+def _validate_repository_relative_file(path: str) -> str:
+    candidate = path.strip().replace("\\", "/")
+    normalized = _normalize_file(path)
+    if (
+        candidate.startswith("/")
+        or _URI_OR_DRIVE_PREFIX.match(candidate)
+        or normalized in ("", ".")
+        or normalized.startswith("/")
+        or _URI_OR_DRIVE_PREFIX.match(normalized)
+        or normalized == ".."
+        or normalized.startswith("../")
+    ):
+        raise ValueError("must be a repository-relative path")
+    return path
 
 
 class ExpectedFinding(BaseModel):
@@ -70,6 +131,11 @@ class ExpectedFinding(BaseModel):
         if not value.strip():
             raise ValueError("must not be empty")
         return value
+
+    @field_validator("file")
+    @classmethod
+    def _require_repository_relative_file(cls, value: str) -> str:
+        return _validate_repository_relative_file(value)
 
     @model_validator(mode="after")
     def _validate_line_range(self) -> ExpectedFinding:
@@ -153,6 +219,11 @@ class PredictedFinding(BaseModel):
     file: str = ""
     line: int | None = Field(default=None, strict=True)
     confidence: float = 1.0
+
+    @field_validator("file")
+    @classmethod
+    def _require_repository_relative_file(cls, value: str) -> str:
+        return _validate_repository_relative_file(value)
 
 
 class FindingMatch(BaseModel):
@@ -278,7 +349,7 @@ def load_manifest(path: str | Path) -> BenchmarkManifest:
     """Load and validate a YAML benchmark manifest."""
 
     manifest_path = Path(path)
-    raw = yaml.safe_load(manifest_path.read_text())
+    raw = yaml.load(manifest_path.read_text(), Loader=_UniqueKeySafeLoader)
     if raw is None:
         raw = {}
     return BenchmarkManifest.model_validate(raw)
@@ -286,8 +357,8 @@ def load_manifest(path: str | Path) -> BenchmarkManifest:
 
 def _load_predictions(path: Path) -> tuple[list[PredictedFinding], str | None]:
     try:
-        raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = json.loads(path.read_text(), object_pairs_hook=_unique_json_object)
+    except (OSError, json.JSONDecodeError, _DuplicateJsonKeyError) as exc:
         raise ValueError(f"could not load prediction file {path}: {exc}") from exc
 
     if not isinstance(raw, dict):

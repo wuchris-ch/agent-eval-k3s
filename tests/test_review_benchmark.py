@@ -197,6 +197,144 @@ cases:
     assert "KeyError" not in result.output
 
 
+@pytest.mark.parametrize("duplicate_source", ["manifest", "prediction"])
+def test_benchmark_cli_rejects_duplicate_mapping_keys(
+    tmp_path, duplicate_source
+):
+    manifest = tmp_path / "benchmark.yaml"
+    line_start = (
+        "        line_start: 81\n        line_start: 12"
+        if duplicate_source == "manifest"
+        else "        line_start: 12"
+    )
+    manifest.write_text(
+        f"""
+cases:
+  - id: duplicate-key
+    expected:
+      - id: bug
+        severity: major
+        category: correctness
+        file: src/app.py
+{line_start}
+"""
+    )
+    reviews = tmp_path / "reviews"
+    reviews.mkdir()
+    prediction = (
+        '{"findings": [{"severity": "major", "category": "correctness", '
+        '"file": "src/app.py", "line": 81, "line": 12}]}'
+        if duplicate_source == "prediction"
+        else json.dumps(
+            {
+                "findings": [
+                    {
+                        "severity": "major",
+                        "category": "correctness",
+                        "file": "src/app.py",
+                        "line": 12,
+                    }
+                ]
+            }
+        )
+    )
+    (reviews / "duplicate-key.json").write_text(prediction)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark-review",
+            "--manifest",
+            str(manifest),
+            "--reviews",
+            str(reviews),
+            "--min-precision",
+            "1",
+            "--min-recall",
+            "1",
+        ],
+    )
+
+    output = " ".join(result.output.split())
+    assert result.exit_code == 1
+    assert "could not score benchmark" in output
+    assert "duplicate key" in output
+    expected_key = "'line_start'" if duplicate_source == "manifest" else "'line'"
+    assert expected_key in output
+
+
+@pytest.mark.parametrize(
+    "invalid_path",
+    [
+        "../outside/app.py",
+        "/tmp/app.py",
+        ".//tmp/app.py",
+        r"C:\repo\app.py",
+        "./C:/repo/app.py",
+        r".\C:\repo\app.py",
+        "https://example.com/app.py",
+        ".",
+    ],
+)
+@pytest.mark.parametrize("invalid_source", ["manifest", "prediction"])
+def test_benchmark_cli_rejects_non_repository_paths(
+    tmp_path, invalid_path, invalid_source
+):
+    manifest = tmp_path / "benchmark.yaml"
+    expected_path = invalid_path if invalid_source == "manifest" else "src/app.py"
+    manifest.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "id": "invalid-path",
+                        "expected": [
+                            {
+                                "id": "bug",
+                                "severity": "major",
+                                "category": "correctness",
+                                "file": expected_path,
+                                "line_start": 12,
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    prediction_path = (
+        invalid_path if invalid_source == "prediction" else "src/app.py"
+    )
+    reviews = tmp_path / "reviews"
+    _write_predictions(
+        reviews,
+        "invalid-path",
+        [
+            {
+                "severity": "major",
+                "category": "correctness",
+                "file": prediction_path,
+                "line": 12,
+            }
+        ],
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark-review",
+            "--manifest",
+            str(manifest),
+            "--reviews",
+            str(reviews),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "could not score benchmark" in result.output
+    assert "repository-relative path" in result.output
+
+
 def test_manifest_rejects_ambiguous_expected_ranges_after_path_normalization():
     with pytest.raises(ValidationError, match="ambiguous overlapping ranges"):
         BenchmarkCase(

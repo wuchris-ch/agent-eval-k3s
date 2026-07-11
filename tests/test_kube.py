@@ -76,6 +76,23 @@ def test_task_resources_default_and_override_each_phase():
     }
 
 
+def test_load_task_rejects_unknown_top_level_fields(tmp_path):
+    task_dir = tmp_path / "typo"
+    task_dir.mkdir()
+    (task_dir / "task.yaml").write_text(
+        "id: typo\n"
+        "prompt: Test task\n"
+        "test_command: pytest\n"
+        "resouces:\n"
+        "  agent:\n"
+        "    limits:\n"
+        "      memory: 9Gi\n"
+    )
+
+    with pytest.raises(ValidationError, match="resouces"):
+        load_task("typo", tmp_path)
+
+
 @pytest.mark.parametrize(
     "resources",
     [

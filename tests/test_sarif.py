@@ -261,6 +261,42 @@ def test_scanner_findings_require_rule_and_safe_path_and_map_unknown_severity():
     )
 
 
+def test_scanner_fingerprints_disambiguate_distinct_results_at_same_location():
+    common = {
+        "tool": "semgrep",
+        "rule": "python.lang.security.audit.exec-used",
+        "severity": "ERROR",
+        "path": "src/app.py",
+        "line": 9,
+    }
+    findings = [
+        {**common, "message": "User-controlled data reaches exec."},
+        {**common, "message": "Untrusted data reaches exec."},
+    ]
+
+    first = _results(_report(scans=ScanResults(findings=findings)))
+    reordered = _results(_report(scans=ScanResults(findings=findings[::-1])))
+
+    def primary_by_message(results):
+        return {
+            result["message"]["text"]:
+                result["partialFingerprints"]["primaryLocationLineHash"]
+            for result in results
+        }
+
+    fingerprints = primary_by_message(first)
+    assert fingerprints == primary_by_message(reordered)
+    assert len(set(fingerprints.values())) == 2
+    assert {
+        fingerprint.rsplit(":", 1)[1]
+        for fingerprint in fingerprints.values()
+    } == {"1", "2"}
+    assert len({
+        fingerprint.rsplit(":", 1)[0]
+        for fingerprint in fingerprints.values()
+    }) == 1
+
+
 def test_locations_are_relative_encoded_and_only_contain_positive_lines():
     encoded = Finding(
         file="/Users/reviewer/acme/src/a file.py",
