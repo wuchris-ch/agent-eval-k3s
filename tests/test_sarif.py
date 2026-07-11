@@ -63,6 +63,7 @@ def test_only_active_llm_findings_are_emitted_and_severity_is_mapped():
     unconfirmed = Finding(
         severity="blocker",
         file="src/app.py",
+        line=5,
         claim="unconfirmed",
         verified=True,
     )
@@ -96,7 +97,7 @@ def test_rule_ids_and_fingerprints_are_stable_across_line_changes():
         verified=True,
         verdict="confirmed",
     )
-    shifted = first.model_copy(update={"line": 104, "severity": "minor"})
+    shifted = first.model_copy(update={"line": 14, "severity": "minor"})
 
     first_result = _results(_report(first))[0]
     shifted_result = _results(_report(shifted))[0]
@@ -114,30 +115,51 @@ def test_rule_ids_and_fingerprints_are_stable_across_line_changes():
     assert all(character in "0123456789abcdef" for character in internal)
 
 
-def test_internal_fingerprint_distinguishes_claims_sharing_evidence():
+def test_fingerprints_distinguish_claims_sharing_evidence():
     common = {
         "severity": "major",
         "category": "security",
         "file": "src/app.py",
-        "line": 4,
         "evidence": "return user.is_admin",
         "verified": True,
         "verdict": "confirmed",
     }
 
     first, second = _results(_report(
-        Finding(claim="Authorization can be bypassed", **common),
-        Finding(claim="Audit logging can be bypassed", **common),
+        Finding(line=4, claim="Authorization can be bypassed", **common),
+        Finding(line=12, claim="Audit logging can be bypassed", **common),
     ))
 
     assert (
         first["partialFingerprints"]["primaryLocationLineHash"]
-        == second["partialFingerprints"]["primaryLocationLineHash"]
+        != second["partialFingerprints"]["primaryLocationLineHash"]
     )
     assert (
         first["partialFingerprints"]["agentEvalSemanticIdentity/v2"]
         != second["partialFingerprints"]["agentEvalSemanticIdentity/v2"]
     )
+
+
+def test_llm_findings_are_limited_to_changed_positive_lines():
+    common = {
+        "file": "src/app.py",
+        "evidence": "return user.is_admin",
+        "verified": True,
+        "verdict": "confirmed",
+    }
+
+    results = _results(_report(
+        Finding(line=20, claim="Changed line", **common),
+        Finding(line=None, claim="Missing line", **common),
+        Finding(line=0, claim="Invalid line", **common),
+        Finding(line=21, claim="Unchanged line", **common),
+    ))
+
+    assert [result["message"]["text"] for result in results] == ["Changed line"]
+    assert results[0]["locations"][0]["physicalLocation"]["region"] == {
+        "startLine": 20
+    }
+    assert results[0]["properties"]["diffScoped"] is True
 
 
 def test_scanner_findings_require_rule_and_safe_path_and_map_unknown_severity():
@@ -210,7 +232,7 @@ def test_scanner_findings_require_rule_and_safe_path_and_map_unknown_severity():
 def test_locations_are_relative_encoded_and_only_contain_positive_lines():
     encoded = Finding(
         file="/Users/reviewer/acme/src/a file.py",
-        line=0,
+        line=6,
         claim="Encoded path",
         evidence="some code",
         verified=True,
@@ -263,7 +285,7 @@ def test_locations_are_relative_encoded_and_only_contain_positive_lines():
 
     encoded_location = results[0]["locations"][0]["physicalLocation"]
     assert encoded_location["artifactLocation"]["uri"] == "src/a%20file.py"
-    assert "region" not in encoded_location
+    assert encoded_location["region"] == {"startLine": 6}
     assert results[1]["locations"][0]["physicalLocation"]["region"] == {
         "startLine": 7
     }

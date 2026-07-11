@@ -256,6 +256,7 @@ def _active_llm_results(
     if report.llm is None:
         return []
 
+    changed_ranges = _head_line_ranges(report, known_paths)
     results: list[dict[str, Any]] = []
     for finding in report.llm.findings:
         verdict = _semantic_text(finding.verdict).casefold()
@@ -266,6 +267,16 @@ def _active_llm_results(
         category = _semantic_text(finding.category).casefold() or "general"
         level = _llm_level(severity, verdict)
         rule_id = _rule_id("LLM", category, category)
+
+        path = _repo_relative_path(finding.file, report.repo, known_paths)
+        line = _positive_line(finding.line)
+        if (
+            not path
+            or line is None
+            or not _line_is_changed(path, line, changed_ranges)
+        ):
+            continue
+
         _register_rule(
             rules,
             rule_id=rule_id,
@@ -278,19 +289,15 @@ def _active_llm_results(
             },
         )
 
-        path = _repo_relative_path(finding.file, report.repo, known_paths)
-        if not path:
-            continue
         claim = _semantic_text(finding.claim) or f"Verified {category} issue."
         evidence = _semantic_text(finding.evidence)
-        primary_anchor = evidence or claim
         result: dict[str, Any] = {
             "ruleId": rule_id,
             "level": level,
             "message": {"text": claim},
             "partialFingerprints": {
                 _PRIMARY_LOCATION_FINGERPRINT: _primary_location_line_hash(
-                    primary_anchor
+                    "llm", category, path, claim, evidence
                 ),
                 _INTERNAL_FINGERPRINT_NAME: _sha256(
                     "llm", category, path, claim, evidence
@@ -312,7 +319,7 @@ def _active_llm_results(
             result["properties"]["verdictReason"] = _semantic_text(
                 finding.verdict_reason
             )
-        locations = _location(path, finding.line)
+        locations = _location(path, line)
         result["locations"] = locations
         results.append(result)
     return results
