@@ -248,6 +248,32 @@ def _register_rule(
     }
 
 
+def _number_llm_primary_location_occurrences(
+    results: list[dict[str, Any]],
+) -> None:
+    def location_key(
+        indexed_result: tuple[int, dict[str, Any]],
+    ) -> tuple[str, int, int]:
+        index, result = indexed_result
+        physical = result["locations"][0]["physicalLocation"]
+        return (
+            physical["artifactLocation"]["uri"],
+            physical["region"]["startLine"],
+            index,
+        )
+
+    occurrences: dict[str, int] = {}
+    for _, result in sorted(enumerate(results), key=location_key):
+        fingerprints = result["partialFingerprints"]
+        primary = fingerprints[_PRIMARY_LOCATION_FINGERPRINT]
+        fingerprint_base, _, _ = primary.rpartition(":")
+        occurrence = occurrences.get(fingerprint_base, 0) + 1
+        occurrences[fingerprint_base] = occurrence
+        fingerprints[_PRIMARY_LOCATION_FINGERPRINT] = (
+            f"{fingerprint_base}:{occurrence}"
+        )
+
+
 def _active_llm_results(
     report: ChangeReport,
     known_paths: tuple[str, ...],
@@ -322,6 +348,7 @@ def _active_llm_results(
         locations = _location(path, line)
         result["locations"] = locations
         results.append(result)
+    _number_llm_primary_location_occurrences(results)
     return results
 
 

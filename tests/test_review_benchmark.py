@@ -78,6 +78,125 @@ cases:
         BenchmarkCase(id="../outside")
 
 
+@pytest.mark.parametrize(
+    ("manifest_text", "findings", "invalid_field"),
+    [
+        (
+            """
+cases:
+  - id: case
+    expected:
+      - id: bug
+        severity: major
+        category: correctness
+        file: src/app.py
+        line_start: true
+""",
+            [],
+            "line_start",
+        ),
+        (
+            """
+cases:
+  - id: case
+    expected:
+      - id: bug
+        severity: major
+        category: correctness
+        file: src/app.py
+        line_start: 1
+        line_end: true
+""",
+            [],
+            "line_end",
+        ),
+        (
+            """
+cases:
+  - id: case
+    changed_lines: true
+""",
+            [],
+            "changed_lines",
+        ),
+        (
+            """
+cases:
+  - id: case
+    expected:
+      - id: bug
+        severity: major
+        category: correctness
+        file: src/app.py
+        line_start: 1
+""",
+            [
+                {
+                    "severity": "major",
+                    "category": "correctness",
+                    "file": "src/app.py",
+                    "line": True,
+                }
+            ],
+            "line",
+        ),
+    ],
+)
+def test_benchmark_cli_rejects_boolean_line_values(
+    tmp_path, manifest_text, findings, invalid_field
+):
+    manifest = tmp_path / "benchmark.yaml"
+    manifest.write_text(manifest_text)
+    reviews = tmp_path / "reviews"
+    _write_predictions(reviews, "case", findings)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark-review",
+            "--manifest",
+            str(manifest),
+            "--reviews",
+            str(reviews),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "could not score benchmark" in result.output
+    assert invalid_field in result.output
+
+
+def test_benchmark_cli_reports_missing_line_start_without_traceback(tmp_path):
+    manifest = tmp_path / "benchmark.yaml"
+    manifest.write_text(
+        """
+cases:
+  - id: missing-line-start
+    expected:
+      - id: bug
+        severity: major
+        category: correctness
+        file: src/app.py
+"""
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark-review",
+            "--manifest",
+            str(manifest),
+            "--reviews",
+            str(tmp_path / "reviews"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "could not score benchmark" in result.output
+    assert "line_start" in result.output
+    assert "KeyError" not in result.output
+
+
 def test_manifest_rejects_ambiguous_expected_ranges_after_path_normalization():
     with pytest.raises(ValidationError, match="ambiguous overlapping ranges"):
         BenchmarkCase(

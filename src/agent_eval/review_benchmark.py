@@ -57,10 +57,11 @@ class ExpectedFinding(BaseModel):
     severity: Severity
     category: str
     file: str
-    line_start: int = Field(ge=1)
+    line_start: int = Field(ge=1, strict=True)
     line_end: int = Field(
-        default_factory=lambda validated_data: validated_data["line_start"],
+        default_factory=lambda validated_data: validated_data.get("line_start", 1),
         ge=1,
+        strict=True,
     )
 
     @field_validator("id", "category", "file")
@@ -84,7 +85,7 @@ class BenchmarkCase(BaseModel):
 
     id: str
     description: str | None = None
-    changed_lines: int | None = Field(default=None, ge=0)
+    changed_lines: int | None = Field(default=None, ge=0, strict=True)
     expected_findings: list[ExpectedFinding] = Field(
         default_factory=list,
         validation_alias=AliasChoices(
@@ -150,7 +151,7 @@ class PredictedFinding(BaseModel):
     severity: str
     category: str = ""
     file: str = ""
-    line: int | None = None
+    line: int | None = Field(default=None, strict=True)
     confidence: float = 1.0
 
 

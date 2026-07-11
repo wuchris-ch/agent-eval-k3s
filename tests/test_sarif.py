@@ -140,6 +140,38 @@ def test_fingerprints_distinguish_claims_sharing_evidence():
     )
 
 
+def test_identical_llm_fingerprints_count_location_ordered_occurrences():
+    common = {
+        "severity": "major",
+        "category": "security",
+        "file": "src/app.py",
+        "claim": "Authorization can be bypassed",
+        "evidence": "return user.is_admin",
+        "verified": True,
+        "verdict": "confirmed",
+    }
+    later = Finding(line=12, **common)
+    earlier = Finding(line=4, **common)
+    rejected = Finding(line=2, **{**common, "verdict": "rejected"})
+    unchanged = Finding(line=21, **common)
+
+    first = _results(_report(later, rejected, unchanged, earlier))
+    reordered = _results(_report(earlier, later))
+
+    def fingerprints_by_line(results):
+        return {
+            result["locations"][0]["physicalLocation"]["region"]["startLine"]:
+                result["partialFingerprints"]["primaryLocationLineHash"]
+            for result in results
+        }
+
+    fingerprints = fingerprints_by_line(first)
+    assert fingerprints == fingerprints_by_line(reordered)
+    assert fingerprints[4].endswith(":1")
+    assert fingerprints[12].endswith(":2")
+    assert fingerprints[4].rsplit(":", 1)[0] == fingerprints[12].rsplit(":", 1)[0]
+
+
 def test_llm_findings_are_limited_to_changed_positive_lines():
     common = {
         "file": "src/app.py",
