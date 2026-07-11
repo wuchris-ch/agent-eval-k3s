@@ -1,7 +1,8 @@
 """Run pipeline: (agent phase) -> snapshot/diff -> eval phase -> scans -> judge.
 
-Eval phase runs in a fresh pod so the coding agent cannot have poisoned the
-test environment; hidden tests only ever exist in the eval pod."""
+Eval starts in a fresh pod so state from the agent pod cannot persist into it.
+Produced code still executes in the eval pod with access to its test inputs and
+result paths."""
 
 from __future__ import annotations
 
@@ -16,11 +17,19 @@ from rich.console import Console
 
 from .cluster import SECRET_NAME, build_and_import_image
 from .evaluators.tests import TestResults, parse_coverage, parse_junit
-from .kube import create_sandbox_pod, ensure_namespace
+from .kube import KubeError, Pod, create_sandbox_pod, ensure_namespace
 from .metrics import DiffStats, RunRecord, now_iso, save_run
 from .task import Task
 
 console = Console()
+
+
+def _sandbox_infra_error(phase: str, pod: Pod,
+                         command_exit_code: int | None = None) -> str | None:
+    evidence = pod.infrastructure_failure(command_exit_code)
+    if evidence is None:
+        return None
+    return f"{phase} sandbox infrastructure failure: {evidence}"
 
 
 def new_run_id(task: Task, agent: str) -> str:
@@ -43,30 +52,56 @@ def run_eval_phase(task: Task, workspace: Path, run_dir: Path) -> TestResults:
     """Copy a produced workspace + hidden tests into a fresh pod, run the task's
     test command, and pull back /results for parsing."""
     ensure_namespace()
-    pod = create_sandbox_pod("eval", task.image_tag,
-                             active_deadline=task.timeouts.eval_seconds + 900)
+    pod = create_sandbox_pod(
+        "eval",
+        task.image_tag,
+        active_deadline=task.timeouts.eval_seconds + 900,
+        resources=task.resources.eval.as_kubernetes(),
+    )
     try:
-        pod.wait_ready()
-        pod.copy_dir_to(workspace, "/workspace")
-        pod.copy_dir_to(task.tests_dir, "/tests")
-        pod.exec("mkdir -p /results", timeout=30)
-
-        console.print("running hidden tests in eval pod...")
         try:
-            proc = pod.exec(f"cd /workspace && {task.test_command}",
-                            timeout=task.timeouts.eval_seconds)
-            output = proc.stdout.decode(errors="replace") + proc.stderr.decode(errors="replace")
-        except subprocess.TimeoutExpired:
-            (run_dir / "eval-output.txt").write_text("TIMEOUT")
-            return TestResults(infra_error=f"test command timed out after "
-                                           f"{task.timeouts.eval_seconds}s")
-        (run_dir / "eval-output.txt").write_text(output)
+            pod.wait_ready()
+            pod.copy_dir_to(workspace, "/workspace")
+            pod.copy_dir_to(task.tests_dir, "/tests")
+            pod.exec("mkdir -p /results", timeout=30)
 
-        results_dir = run_dir / "results"
-        pod.copy_dir_from("/results", results_dir)
-        test_results = parse_junit(results_dir / "junit.xml")
-        test_results.coverage_percent = parse_coverage(results_dir / "coverage.json")
-        return test_results
+            console.print("running hidden tests in eval pod...")
+            try:
+                proc = pod.exec(
+                    f"cd /workspace && {task.test_command}",
+                    timeout=task.timeouts.eval_seconds,
+                )
+                output = (
+                    proc.stdout.decode(errors="replace")
+                    + proc.stderr.decode(errors="replace")
+                )
+            except subprocess.TimeoutExpired:
+                error = _sandbox_infra_error("eval", pod)
+                if error is None:
+                    error = (
+                        f"test command timed out after {task.timeouts.eval_seconds}s"
+                    )
+                (run_dir / "eval-output.txt").write_text(f"TIMEOUT\n{error}\n")
+                return TestResults(infra_error=error)
+            (run_dir / "eval-output.txt").write_text(output)
+
+            error = _sandbox_infra_error("eval", pod, proc.returncode)
+            if error is not None:
+                return TestResults(infra_error=error)
+
+            results_dir = run_dir / "results"
+            pod.copy_dir_from("/results", results_dir)
+            test_results = parse_junit(results_dir / "junit.xml")
+            test_results.coverage_percent = parse_coverage(
+                results_dir / "coverage.json"
+            )
+            return test_results
+        except (KubeError, subprocess.TimeoutExpired):
+            error = _sandbox_infra_error("eval", pod)
+            if error is None:
+                raise
+            (run_dir / "eval-output.txt").write_text(f"{error}\n")
+            return TestResults(infra_error=error)
     finally:
         pod.delete()
 
@@ -118,6 +153,8 @@ def evaluate_workspace(task: Task, workspace: Path, *, agent: str = "external",
 
     ensure_image(task)
     record.correctness = run_eval_phase(task, workspace, run_dir)
+    if record.efficiency.infra_error and record.correctness.infra_error is None:
+        record.correctness.infra_error = record.efficiency.infra_error
     record.diff = compute_diff(task.workspace_dir, workspace, run_dir)
 
     if run_scans:
@@ -142,44 +179,71 @@ def run_agent_trial(task: Task, adapter, *, trial: int = 1, model: str | None = 
     run_dir.mkdir(parents=True, exist_ok=True)
 
     ensure_namespace()
-    pod = create_sandbox_pod("agent", task.image_tag, env_from_secret=SECRET_NAME,
-                             active_deadline=task.timeouts.agent_seconds + 900)
+    pod = create_sandbox_pod(
+        "agent",
+        task.image_tag,
+        env_from_secret=SECRET_NAME,
+        active_deadline=task.timeouts.agent_seconds + 900,
+        resources=task.resources.agent.as_kubernetes(),
+    )
     produced = run_dir / "workspace"
+    snapshot_available = False
     try:
-        pod.wait_ready()
-        with tempfile.TemporaryDirectory() as tmp:
-            from .agents import PROMPT_PATH
-            prompt_dir = Path(tmp)
-            (prompt_dir / Path(PROMPT_PATH).name).write_text(task.prompt)
-            pod.copy_dir_to(prompt_dir, str(Path(PROMPT_PATH).parent))
-        if hasattr(adapter, "prepare"):
-            adapter.prepare(pod)
-
-        console.print(f"running [bold]{adapter.name}[/bold] in sandbox pod "
-                      f"(timeout {task.timeouts.agent_seconds}s)...")
-        start = time.monotonic()
-        timed_out = False
         try:
-            proc = pod.exec(adapter.build_command(model),
-                            timeout=task.timeouts.agent_seconds, env=adapter.env)
-            (run_dir / "transcript.jsonl").write_bytes(proc.stdout)
-            (run_dir / "agent-stderr.log").write_bytes(proc.stderr)
-            record.efficiency = adapter.parse_transcript(run_dir / "transcript.jsonl")
-            record.efficiency.agent_exit_code = proc.returncode
-        except subprocess.TimeoutExpired as e:
-            timed_out = True
-            (run_dir / "transcript.jsonl").write_bytes(e.stdout or b"")
-            (run_dir / "agent-stderr.log").write_bytes(
-                (e.stderr or b"") + b"\nAGENT TIMED OUT")
-            record.efficiency = adapter.parse_transcript(run_dir / "transcript.jsonl")
-        record.efficiency.wall_time_s = round(time.monotonic() - start, 1)
-        if timed_out:
-            console.print("[yellow]agent timed out; evaluating partial work[/yellow]")
+            pod.wait_ready()
+            with tempfile.TemporaryDirectory() as tmp:
+                from .agents import PROMPT_PATH
+                prompt_dir = Path(tmp)
+                (prompt_dir / Path(PROMPT_PATH).name).write_text(task.prompt)
+                pod.copy_dir_to(prompt_dir, str(Path(PROMPT_PATH).parent))
+            if hasattr(adapter, "prepare"):
+                adapter.prepare(pod)
 
-        # snapshot whatever the agent produced (the sleep pod is still alive)
-        pod.copy_dir_from("/workspace", produced)
+            console.print(f"running [bold]{adapter.name}[/bold] in sandbox pod "
+                          f"(timeout {task.timeouts.agent_seconds}s)...")
+            start = time.monotonic()
+            timed_out = False
+            try:
+                proc = pod.exec(adapter.build_command(model),
+                                timeout=task.timeouts.agent_seconds, env=adapter.env)
+                (run_dir / "transcript.jsonl").write_bytes(proc.stdout)
+                (run_dir / "agent-stderr.log").write_bytes(proc.stderr)
+                record.efficiency = adapter.parse_transcript(
+                    run_dir / "transcript.jsonl"
+                )
+                record.efficiency.agent_exit_code = proc.returncode
+                record.efficiency.infra_error = _sandbox_infra_error(
+                    "agent", pod, proc.returncode
+                )
+            except subprocess.TimeoutExpired as e:
+                timed_out = True
+                (run_dir / "transcript.jsonl").write_bytes(e.stdout or b"")
+                (run_dir / "agent-stderr.log").write_bytes(
+                    (e.stderr or b"") + b"\nAGENT TIMED OUT")
+                record.efficiency = adapter.parse_transcript(
+                    run_dir / "transcript.jsonl"
+                )
+                record.efficiency.infra_error = _sandbox_infra_error("agent", pod)
+            record.efficiency.wall_time_s = round(time.monotonic() - start, 1)
+            if timed_out:
+                console.print("[yellow]agent timed out; evaluating partial work[/yellow]")
+
+            pod.copy_dir_from("/workspace", produced)
+            snapshot_available = True
+        except (KubeError, subprocess.TimeoutExpired):
+            error = _sandbox_infra_error("agent", pod)
+            if error is None:
+                raise
+            record.efficiency.infra_error = error
     finally:
         pod.delete()
+
+    if not snapshot_available:
+        error = record.efficiency.infra_error or "agent workspace snapshot unavailable"
+        record.correctness = TestResults(infra_error=error)
+        record.finished_at = now_iso()
+        save_run(record)
+        return record
 
     return evaluate_workspace(task, produced, record=record,
                               run_scans=run_scans, run_judge=run_judge)

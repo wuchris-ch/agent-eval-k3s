@@ -200,7 +200,10 @@ def test_policy_loading(tmp_path):
 def test_verify_findings():
     from agent_eval.review import Finding, verify_findings
 
-    diff = ("--- a/src/auth.py\n+++ b/src/auth.py\n"
+    diff = ("diff --git a/src/auth.py b/src/auth.py\n"
+            "--- a/src/auth.py\n+++ b/src/auth.py\n"
+            "@@ -1 +1,2 @@\n"
+            " def authenticate(password):\n"
             "+    return hashlib.md5(password.encode()).hexdigest()\n")
     changed = ["src/auth.py"]
 
@@ -212,21 +215,134 @@ def test_verify_findings():
     wrong_file = Finding(severity="major", file="src/other.py",
                          claim="weak hash",
                          evidence="hashlib.md5(password.encode()).hexdigest()")
+    diff_prefixed = Finding(
+        severity="major",
+        file="a/src/auth.py",
+        claim="weak hash",
+        evidence="hashlib.md5(password.encode()).hexdigest()",
+    )
     too_short = Finding(severity="nit", file="src/auth.py",
                         claim="x", evidence="return")
 
-    verified = verify_findings([good, paraphrase, wrong_file, too_short],
+    verified = verify_findings([good, paraphrase, wrong_file, diff_prefixed, too_short],
                                diff, changed)
     assert verified[0].verified is True
     assert verified[1].verified is False
     assert verified[2].verified is False
     assert verified[3].verified is False
+    assert verified[4].verified is False
+    assert verified[0].line == 2
+
+
+def test_verify_findings_binds_evidence_to_declared_file():
+    from agent_eval.review import Finding, verify_findings
+
+    diff = """\
+diff --git a/src/auth.py b/src/auth.py
+--- a/src/auth.py
++++ b/src/auth.py
+@@ -9,0 +10 @@
++return user.is_admin or user.is_owner
+diff --git a/src/billing.py b/src/billing.py
+--- a/src/billing.py
++++ b/src/billing.py
+@@ -19,0 +20 @@
++return invoice.total_without_discount
+"""
+    finding = Finding(
+        severity="major",
+        file="src/billing.py",
+        line=20,
+        claim="authorization can be bypassed",
+        evidence="return user.is_admin or user.is_owner",
+    )
+
+    verified = verify_findings(
+        [finding], diff, ["src/auth.py", "src/billing.py"]
+    )
+
+    assert verified[0].verified is False
+
+
+def test_verify_findings_prefers_exact_paths_that_start_with_diff_prefixes():
+    from agent_eval.review import Finding, verify_findings
+
+    diff = """\
+diff --git a/a/foo.py b/a/foo.py
+--- a/a/foo.py
++++ b/a/foo.py
+@@ -0,0 +1 @@
++return nested_file_result
+diff --git a/foo.py b/foo.py
+--- a/foo.py
++++ b/foo.py
+@@ -0,0 +1 @@
++return root_file_result
+"""
+    wrong_file = Finding(
+        severity="major",
+        file="a/foo.py",
+        line=1,
+        claim="wrong file",
+        evidence="return root_file_result",
+    )
+    exact_file = Finding(
+        severity="major",
+        file="a/foo.py",
+        line=1,
+        claim="exact file",
+        evidence="return nested_file_result",
+    )
+
+    verified = verify_findings(
+        [wrong_file, exact_file], diff, ["a/foo.py", "foo.py"]
+    )
+
+    assert verified[0].verified is False
+    assert verified[1].verified is True
+
+
+def test_verify_findings_validates_and_derives_lines_across_hunks():
+    from agent_eval.review import Finding, verify_findings
+
+    diff = """\
+diff --git a/src/billing.py b/src/billing.py
+--- a/src/billing.py
++++ b/src/billing.py
+@@ -9,0 +10 @@
++return invoice.total_without_discount
+@@ -99,0 +100 @@
++return invoice.total_with_tax
+"""
+    wrong_hunk = Finding(
+        severity="major",
+        file="src/billing.py",
+        line=100,
+        claim="discount is omitted",
+        evidence="return invoice.total_without_discount",
+    )
+    missing_line = Finding(
+        severity="major",
+        file="src/billing.py",
+        claim="tax is included",
+        evidence="return invoice.total_with_tax",
+    )
+
+    verified = verify_findings(
+        [wrong_hunk, missing_line], diff, ["src/billing.py"]
+    )
+
+    assert verified[0].verified is False
+    assert verified[1].verified is True
+    assert verified[1].line == 100
 
 
 def test_verify_findings_nit_cap():
     from agent_eval.review import MAX_NITS, Finding, verify_findings
 
-    diff = "+    some perfectly quotable changed line of code here\n"
+    diff = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+    some perfectly quotable changed line of code here\n")
     nits = [Finding(severity="nit", file="a.py", claim=f"nit {i}",
                     evidence="some perfectly quotable changed line of code here")
             for i in range(MAX_NITS + 3)]
@@ -314,3 +430,42 @@ def test_collect_changes_counts_untracked_files(tmp_path):
     assert stats.lines_added == 2
     assert "diff --git a/src/new_feature.py b/src/new_feature.py" in diff
     assert "+def hello():" in diff
+
+
+def test_collect_changes_preserves_renamed_head_paths(tmp_path):
+    from agent_eval.review import collect_changes, snapshot_changed_files
+
+    for index, destination in enumerate(("src/new.py", "lib/moved.py")):
+        repo = tmp_path / f"repo-{index}"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"],
+                       cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"],
+                       cwd=repo, check=True)
+        source = repo / "src" / "old.py"
+        source.parent.mkdir()
+        source.write_text("".join(f"value_{line} = {line}\n" for line in range(100)))
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=repo,
+                       check=True, capture_output=True)
+
+        target = repo / destination
+        target.parent.mkdir(exist_ok=True)
+        subprocess.run(["git", "mv", "src/old.py", destination], cwd=repo,
+                       check=True)
+        with target.open("a") as handle:
+            handle.write("danger = eval(user_input)\n")
+
+        files, stats, _ = collect_changes(repo, "HEAD", None)
+
+        assert len(files) == 1
+        assert files[0].path == destination
+        assert files[0].status == "R"
+        assert files[0].head_line_ranges == [(101, 101)]
+        assert stats.lines_added == 1
+        snapshot = repo / "snapshot"
+        assert snapshot_changed_files(repo, files, None, snapshot) == 1
+        assert (snapshot / destination).read_text().endswith(
+            "danger = eval(user_input)\n"
+        )

@@ -11,5 +11,6 @@ wheels/
 
 # eval artifacts
 runs/
+graphify-out/
 .pytest_cache/
 .ruff_cache/

@@ -20,6 +20,7 @@ findings that survived verification, never through unsupported opinion.
 
 from __future__ import annotations
 
+import ast
 import difflib
 import fnmatch
 import re
@@ -54,6 +55,7 @@ class ChangedFile(BaseModel):
     lines_added: int = 0
     lines_removed: int = 0
     subsystem: str = "app code"
+    head_line_ranges: list[tuple[int, int]] = Field(default_factory=list)
 
 
 class TestRun(BaseModel):
@@ -264,6 +266,112 @@ def classify_subsystem(path: str) -> str:
 _EXCLUDE_PATHSPECS = ("--", ".", ":(exclude).agent-eval",
                       ":(exclude)**/__pycache__/**", ":(exclude)**/*.pyc",
                       ":(exclude)**/node_modules/**", ":(exclude)**/.venv/**")
+_HUNK_HEADER = re.compile(
+    r"^@@ -\d+(?:,\d+)? \+(?P<start>\d+)(?:,\d+)? @@"
+)
+
+
+def _patch_path(value: str, changed_paths: set[str]) -> str | None:
+    raw = value.strip()
+    if raw == "/dev/null":
+        return None
+    if raw.startswith('"'):
+        try:
+            raw = ast.literal_eval(raw)
+        except (SyntaxError, ValueError):
+            return None
+    if raw.startswith(("a/", "b/")):
+        raw = raw[2:]
+    if raw in changed_paths:
+        return raw
+    matches = [path for path in changed_paths if path.endswith(f"/{raw}")]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _parse_head_line_ranges(
+    diff_text: str, changed_paths: list[str]
+) -> dict[str, list[tuple[int, int]]]:
+    known_paths = set(changed_paths)
+    ranges: dict[str, list[list[int]]] = {path: [] for path in changed_paths}
+    current_path: str | None = None
+    head_line: int | None = None
+
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            current_path = None
+            head_line = None
+            continue
+        if head_line is None and line.startswith("+++ "):
+            current_path = _patch_path(line[4:], known_paths)
+            head_line = None
+            continue
+
+        hunk = _HUNK_HEADER.match(line)
+        if hunk:
+            head_line = int(hunk.group("start")) if current_path else None
+            continue
+        if current_path is None or head_line is None:
+            continue
+        if line.startswith("+"):
+            path_ranges = ranges[current_path]
+            if path_ranges and path_ranges[-1][1] + 1 == head_line:
+                path_ranges[-1][1] = head_line
+            else:
+                path_ranges.append([head_line, head_line])
+            head_line += 1
+        elif line.startswith("-") or line.startswith("\\ No newline"):
+            continue
+        else:
+            head_line += 1
+
+    return {
+        path: [(start, end) for start, end in path_ranges]
+        for path, path_ranges in ranges.items()
+    }
+
+
+def _parse_name_status(output: str) -> dict[str, str]:
+    fields = output.split("\0")
+    status: dict[str, str] = {}
+    index = 0
+    while index < len(fields):
+        marker = fields[index]
+        index += 1
+        if not marker or index >= len(fields):
+            continue
+        path = fields[index]
+        index += 1
+        if marker[:1] in ("R", "C"):
+            if index >= len(fields):
+                break
+            path = fields[index]
+            index += 1
+        status[path] = marker[:1]
+    return status
+
+
+def _parse_numstat(output: str) -> list[tuple[int, int, str]]:
+    fields = output.split("\0")
+    parsed: list[tuple[int, int, str]] = []
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if not entry:
+            continue
+        parts = entry.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        path = parts[2]
+        if not path:
+            if index + 1 >= len(fields):
+                break
+            path = fields[index + 1]
+            index += 2
+        added = int(parts[0]) if parts[0] != "-" else 0
+        removed = int(parts[1]) if parts[1] != "-" else 0
+        parsed.append((added, removed, path))
+    return parsed
 
 
 def collect_changes(repo: Path, base: str, head: str | None,
@@ -274,23 +382,15 @@ def collect_changes(repo: Path, base: str, head: str | None,
         else [anchor, *_EXCLUDE_PATHSPECS]
     diff_text = _git(repo, "diff", "-M", *diff_args)
 
-    status: dict[str, str] = {}
-    for line in _git(repo, "diff", "--name-status", "-M", *diff_args).splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 2:
-            status[parts[-1]] = parts[0][:1]
+    status = _parse_name_status(
+        _git(repo, "diff", "--name-status", "-z", "-M", *diff_args)
+    )
 
     files: list[ChangedFile] = []
     stats = DiffStats()
-    for line in _git(repo, "diff", "--numstat", "-M", *diff_args).splitlines():
-        parts = line.split("\t")
-        if len(parts) != 3:
-            continue
-        added = int(parts[0]) if parts[0] != "-" else 0
-        removed = int(parts[1]) if parts[1] != "-" else 0
-        path = parts[2]
-        if " => " in path:  # rename syntax a/{old => new}/b
-            path = path.split(" => ")[-1].replace("}", "").replace("{", "")
+    for added, removed, path in _parse_numstat(
+        _git(repo, "diff", "--numstat", "-z", "-M", *diff_args)
+    ):
         files.append(ChangedFile(path=path, status=status.get(path, "M"),
                                  lines_added=added, lines_removed=removed,
                                  subsystem=classify_subsystem(path)))
@@ -319,6 +419,12 @@ def collect_changes(repo: Path, base: str, head: str | None,
                         [], lines, fromfile="/dev/null", tofile=f"b/{path}"))
                     diff_text += f"\ndiff --git a/{path} b/{path}\nnew file mode 100644\n{body}"
 
+    head_line_ranges = _parse_head_line_ranges(
+        diff_text, [changed.path for changed in files]
+    )
+    for changed in files:
+        changed.head_line_ranges = head_line_ranges.get(changed.path, [])
+
     return files, stats, diff_text
 
 
@@ -338,6 +444,56 @@ def snapshot_changed_files(repo: Path, files: list[ChangedFile],
         target.write_text(content)
         copied += 1
     return copied
+
+
+def _scope_scans_to_changed_lines(
+    scans: ScanResults, files: list[ChangedFile]
+) -> None:
+    ranges = {changed.path: changed.head_line_ranges for changed in files}
+    scoped_findings: list[dict] = []
+    for finding in scans.findings:
+        if not isinstance(finding, dict):
+            continue
+        raw_path = str(finding.get("path") or "").replace("\\", "/").strip("/")
+        if raw_path in ranges:
+            path = raw_path
+        else:
+            matches = {
+                changed_path
+                for changed_path in ranges
+                if raw_path.endswith(f"/{changed_path}")
+                or changed_path.endswith(f"/{raw_path}")
+            }
+            if len(matches) != 1:
+                continue
+            path = next(iter(matches))
+        line = finding.get("line")
+        if (
+            isinstance(line, bool)
+            or not isinstance(line, int)
+            or not any(start <= line <= end for start, end in ranges[path])
+        ):
+            continue
+        finding["path"] = path
+        scoped_findings.append(finding)
+
+    scans.findings = scoped_findings
+    semgrep_severities = [
+        str(finding.get("severity") or "").upper()
+        for finding in scoped_findings
+        if str(finding.get("tool") or "").casefold() == "semgrep"
+    ]
+    if scans.sec_findings_high is not None:
+        scans.sec_findings_high = semgrep_severities.count("ERROR")
+    if scans.sec_findings_medium is not None:
+        scans.sec_findings_medium = semgrep_severities.count("WARNING")
+    if scans.sec_findings_low is not None:
+        scans.sec_findings_low = semgrep_severities.count("INFO")
+    if scans.secrets_found is not None:
+        scans.secrets_found = sum(
+            str(finding.get("tool") or "").casefold() == "gitleaks"
+            for finding in scoped_findings
+        )
 
 
 # ---------------------------------------------------------------- risk signals
@@ -573,19 +729,115 @@ def _normalize_ws(s: str) -> str:
     return " ".join(s.split())
 
 
+def _added_head_line_runs(
+    diff: str, changed_paths: list[str]
+) -> dict[str, list[list[tuple[int, str]]]]:
+    """Return contiguous added-line runs with their head-side line numbers."""
+    known_paths = set(changed_paths)
+    runs: dict[str, list[list[tuple[int, str]]]] = {
+        path: [] for path in changed_paths
+    }
+    current_path: str | None = None
+    head_line: int | None = None
+    current_run: list[tuple[int, str]] | None = None
+
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            current_path = None
+            head_line = None
+            current_run = None
+            continue
+        if head_line is None and line.startswith("+++ "):
+            current_path = _patch_path(line[4:], known_paths)
+            current_run = None
+            continue
+
+        hunk = _HUNK_HEADER.match(line)
+        if hunk:
+            head_line = int(hunk.group("start")) if current_path else None
+            current_run = None
+            continue
+        if current_path is None or head_line is None:
+            continue
+        if line.startswith("+"):
+            if current_run is None:
+                current_run = []
+                runs[current_path].append(current_run)
+            current_run.append((head_line, line[1:]))
+            head_line += 1
+        elif line.startswith("-") or line.startswith("\\ No newline"):
+            current_run = None
+        else:
+            current_run = None
+            head_line += 1
+
+    return runs
+
+
+def _evidence_line_ranges(
+    runs: list[list[tuple[int, str]]], quote: str
+) -> list[tuple[int, int]]:
+    """Locate a normalized evidence quote within contiguous added-line runs."""
+    matches: list[tuple[int, int]] = []
+    for run in runs:
+        text = ""
+        spans: list[tuple[int, int, int]] = []
+        for line_number, content in run:
+            normalized = _normalize_ws(content)
+            if not normalized:
+                continue
+            if text:
+                text += " "
+            start = len(text)
+            text += normalized
+            spans.append((start, len(text), line_number))
+
+        offset = 0
+        while quote and (position := text.find(quote, offset)) >= 0:
+            end = position + len(quote)
+            matched_lines = [
+                line_number
+                for start, stop, line_number in spans
+                if start < end and stop > position
+            ]
+            if matched_lines:
+                location = (matched_lines[0], matched_lines[-1])
+                if location not in matches:
+                    matches.append(location)
+            offset = position + 1
+    return matches
+
+
+def _finding_path(value: str, changed_paths: set[str]) -> str | None:
+    """Resolve an exact or unambiguous shortened repository path."""
+    raw = value.strip()
+    if raw in changed_paths:
+        return raw
+    matches = [path for path in changed_paths if path.endswith(f"/{raw}")]
+    return matches[0] if len(matches) == 1 else None
+
+
 def verify_findings(findings: list[Finding], diff: str,
                     changed_paths: list[str]) -> list[Finding]:
     """Programmatic verification bar: a finding survives only if its evidence
-    is a verbatim quote from the diff and it names a changed file. Nits are
-    capped at MAX_NITS. Returns the surviving list (unverified are kept in
-    the report JSON but excluded from risk and rendering)."""
-    ndiff = _normalize_ws(diff)
+    is a verbatim quote from added lines in its named changed file. A supplied
+    line must overlap the evidence; a missing line is derived from it. Nits
+    are capped at MAX_NITS. Returns the surviving list (unverified are kept
+    in the report JSON but excluded from risk and rendering)."""
+    known_paths = set(changed_paths)
+    added_runs = _added_head_line_runs(diff, changed_paths)
     kept: list[Finding] = []
     nits = 0
     for f in findings:
         quote = _normalize_ws(f.evidence)
-        file_ok = any(p == f.file or p.endswith("/" + f.file) for p in changed_paths)
-        f.verified = len(quote) >= 12 and quote in ndiff and file_ok
+        path = _finding_path(f.file, known_paths)
+        locations = _evidence_line_ranges(added_runs.get(path, []), quote) \
+            if path and len(quote) >= 12 else []
+        if f.line is None and locations:
+            f.line = locations[0][0]
+        f.verified = bool(locations) and f.line is not None and any(
+            start <= f.line <= end for start, end in locations
+        )
         if f.verified and f.severity == "nit":
             nits += 1
             if nits > MAX_NITS:
@@ -613,8 +865,9 @@ def _build_review_prompts(report: ChangeReport, diff: str,
         "findings, risk signals) plus the diff.\n"
         "Rules for findings:\n"
         "- Every finding's `evidence` must be a verbatim contiguous quote "
-        "from the diff below. Findings whose quote cannot be located in the "
-        "diff are discarded automatically, so never paraphrase.\n"
+        "from added lines in its named file. Its `line` must be one of the "
+        "quoted added lines; use null to derive it from the evidence. Findings "
+        "whose quote cannot be located are discarded, so never paraphrase.\n"
         "- Report only problems INTRODUCED by this change, not pre-existing "
         "ones, and only what you can prove from the diff and evidence; if "
         "you cannot prove it, it is not a finding.\n"
@@ -787,6 +1040,7 @@ def review_change(repo: Path, base: str | None = None, head: str | None = None,
                 for finding in report.scans.findings:
                     if isinstance(finding.get("path"), str):
                         finding["path"] = finding["path"].removeprefix(prefix)
+                _scope_scans_to_changed_lines(report.scans, files)
 
     head_tests_pass: bool | None = None
     with head_workspace(repo, head) as ws:
@@ -839,8 +1093,11 @@ def review_change(repo: Path, base: str | None = None, head: str | None = None,
 
 
 def _persist(report: ChangeReport, out_dir: Path) -> None:
+    from .sarif import write_sarif
+
     (out_dir / "review.json").write_text(report.model_dump_json(indent=2))
     (out_dir / "review.md").write_text(markdown_review(report))
+    write_sarif(report, out_dir / "review.sarif")
 
 
 # ------------------------------------------------------------------- rendering

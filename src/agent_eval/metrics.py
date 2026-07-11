@@ -24,6 +24,7 @@ class AgentMetrics(BaseModel):
     tool_calls: int | None = None
     model: str | None = None
     agent_exit_code: int | None = None
+    infra_error: str | None = None
 
 
 class DiffStats(BaseModel):
