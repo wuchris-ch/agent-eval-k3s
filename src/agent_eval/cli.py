@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import typer
@@ -152,13 +153,22 @@ def benchmark_review(
     ),
     fail_on_missing: bool = typer.Option(
         True, "--fail-on-missing/--allow-missing",
-        help="Fail the regression gate when a case has no reviewer output.",
+        help="Fail the regression gate when a case has no complete reviewer output.",
     ),
 ) -> None:
     """Score reviewer outputs against deterministic, gold-labeled findings."""
     import yaml
 
     from .review_benchmark import load_manifest, score_benchmark
+
+    for option, threshold in (
+        ("--min-precision", min_precision),
+        ("--min-recall", min_recall),
+        ("--min-critical-recall", min_critical_recall),
+        ("--max-fp-per-case", max_fp_per_case),
+    ):
+        if threshold is not None and not math.isfinite(threshold):
+            raise typer.BadParameter("must be finite", param_hint=option)
 
     try:
         result = score_benchmark(load_manifest(manifest), reviews)
@@ -182,14 +192,14 @@ def benchmark_review(
     table.add_row("clean-case accuracy", _metric(metrics.clean_case_accuracy))
     console.print(table)
 
-    missing = [
+    unavailable = [
         case.case_id for case in result.cases
-        if case.status == "missing_prediction"
+        if case.status != "scored"
     ]
-    if missing:
+    if unavailable:
         console.print(
-            f"[yellow]{len(missing)} missing prediction file(s) were "
-            "scored as zero findings[/yellow]"
+            f"[yellow]{len(unavailable)} missing or incomplete reviewer "
+            "output(s) were scored as zero findings[/yellow]"
         )
     if out:
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -213,8 +223,11 @@ def benchmark_review(
         ),
     ]
     failures = []
-    if missing and fail_on_missing:
-        failures.append(f"{len(missing)} benchmark case(s) have no reviewer output")
+    if unavailable and fail_on_missing:
+        failures.append(
+            f"{len(unavailable)} benchmark case(s) have no reviewer output "
+            "or an incomplete findings payload"
+        )
     for name, value, threshold, direction in gates:
         if threshold is None:
             continue

@@ -26,8 +26,8 @@ and OpenHands (pluggable agent adapters, transcript-derived cost metrics).
 
 - Runs agent attempts in disposable k3d/k3s pods, separate from the host
   checkout.
-- Re-evaluates produced code in a fresh pod so the agent cannot tamper with the
-  hidden test environment.
+- Starts evaluation in a fresh pod so filesystem changes from the agent phase
+  cannot carry over. Produced code is not isolated from the in-pod grader.
 - Supports both full agent runs and eval-only scoring for workspaces produced
   elsewhere.
 - Tracks correctness, pass@k, coverage, wall time, token usage, tool calls,
@@ -36,17 +36,18 @@ and OpenHands (pluggable agent adapters, transcript-derived cost metrics).
 - Scores any review agent's JSON output against gold-labeled findings with
   precision, recall, F1, blocker/major recall, false-positive rate, clean-PR
   accuracy, and Wilson 95% intervals.
-- Emits SARIF 2.1.0 with stable finding fingerprints for GitHub/GitLab code
-  scanning, alongside the human-readable and native JSON reports.
+- Emits SARIF 2.1.0 with GitHub's supported location fingerprint and stable
+  severity-independent rule identity, alongside human-readable and native JSON
+  reports. GitLab continuity follows its third-party SARIF path/line behavior.
 - Runs arbitrary-code pods with no service-account token, `RuntimeDefault`
-  seccomp, no privilege escalation, dropped Linux capabilities, and resource
-  bounds.
+  seccomp, no privilege escalation, dropped Linux capabilities, and
+  task-configurable resource bounds.
 
 ## Resume-ready positioning (July 2026)
 
 Built an independent assurance layer for coding agents and AI pull-request
-reviewers: Kubernetes-isolated agent trials, hidden-test evaluation in a
-separate trust domain, evidence-verified review findings, deterministic
+reviewers: Kubernetes-isolated agent trials, fresh-pod phase isolation for
+hidden-test evaluation, evidence-verified review findings, deterministic
 gold-label scoring with uncertainty intervals and false-positive gates, and
 SARIF output for enterprise CI.
 
@@ -68,7 +69,9 @@ Each trial runs a pipeline:
    starter state.
 3. **Eval phase** — a *fresh* pod gets the produced workspace plus the hidden
    tests; the task's test command runs and junit/coverage results are parsed.
-   The fresh pod guarantees the agent could not have poisoned the test env.
+   Agent-phase filesystem mutations cannot persist into this pod. Produced code
+   can still read `/tests` and forge or modify artifacts under `/results`, so
+   this is phase isolation rather than a separate grader trust boundary.
 4. **Scan phase** — host-side ruff, semgrep, gitleaks, and trivy over the
    produced workspace (each degrades gracefully if not installed).
 5. **Judge phase** — the Claude API scores the diff against the task prompt on
@@ -106,9 +109,10 @@ The report (terminal + `review.md`/`review.json` under
 `<repo>/.agent-eval/reviews/`) gives an overall low/medium/high risk, changed
 files by subsystem, deterministic risk signals, scanner findings, grader
 results, and a verified-findings LLM review. The same directory always includes
-`review.sarif`, with stable fingerprints and repo-relative locations suitable
-for code-scanning upload. Exit code is 2 when risk is high or any blocking
-grader fails, so it drops into CI as a check.
+`review.sarif`, an explicitly PR-diff-scoped export with GitHub's supported
+location fingerprint and repo-relative locations suitable for code-scanning
+upload. Exit code is 2 when risk is high or any blocking grader fails, so it
+drops into CI as a check.
 
 ### Review graders
 
@@ -197,9 +201,10 @@ uv run agent-eval benchmark-review \
 The item-level JSON records every matched, missed, and unmatched finding. The
 aggregate includes precision/recall/F1, blocker+major recall, severity accuracy,
 false positives per case and per KLoC, clean-case accuracy, and Wilson 95%
-intervals. Missing reviewer outputs are visible and score as zero findings.
-The CLI fails closed on missing outputs by default; use `--allow-missing` only
-for exploratory, intentionally partial runs.
+intervals. Missing files and absent or null findings payloads are visible,
+score as zero findings, and cannot earn clean-case credit. The CLI fails closed
+on incomplete outputs by default; use `--allow-missing` only for exploratory,
+intentionally partial runs.
 
 Benchmark an agent in k3s (`run` creates the cluster on first use):
 
@@ -221,8 +226,10 @@ so a ChatGPT subscription login is enough; no API key needed).
 The pod profile removes ambient Kubernetes identity and common privilege-
 escalation paths, but it is not a complete hostile-code boundary: task images
 still use their declared user and writable filesystem, and model API access
-requires network egress. Non-root task images, short-lived credentials, and a
-domain-aware egress proxy are the next hardening steps.
+requires network egress. The eval pod also does not protect hidden tests or
+in-container result artifacts from the produced code being evaluated. Non-root
+task images, protected out-of-process result collection, short-lived
+credentials, and a domain-aware egress proxy are the next hardening steps.
 
 Eval-only mode (score code produced elsewhere):
 
@@ -267,7 +274,7 @@ Design references: [NIST AI 800-2 draft evaluation guidance](https://nvlpubs.nis
 
 ```
 tasks/<task-id>/
-├── task.yaml               # id, prompt, timeouts, test_command, judge weights
+├── task.yaml               # prompt, timeouts, resources, test command, rubric
 ├── environment/
 │   ├── Dockerfile          # toolchain + agent CLIs + COPY workspace /workspace
 │   └── workspace/          # starter code the agent sees
@@ -279,6 +286,21 @@ Conventions:
 - `test_command` runs with cwd `/workspace`; hidden tests are at `/tests`; write
   junit XML to `/results/junit.xml` and (optionally) pytest-cov JSON to
   `/results/coverage.json`.
+- Agent and eval pod resources are independently configurable. Omitting this
+  block uses the documented defaults:
+
+  ```yaml
+  resources:
+    agent:
+      requests: {cpu: "100m", memory: "128Mi", ephemeral-storage: "256Mi"}
+      limits: {cpu: "2", memory: "2Gi", ephemeral-storage: "4Gi"}
+    eval:
+      requests: {cpu: "100m", memory: "128Mi", ephemeral-storage: "256Mi"}
+      limits: {cpu: "2", memory: "2Gi", ephemeral-storage: "4Gi"}
+  ```
+
+  Partial request or limit maps inherit these defaults. Quantities must be
+  positive, and each request must not exceed its corresponding limit.
 - The environment image must include the agent CLIs you want to evaluate
   (the claude-code adapter expects `claude` on PATH) and `tar`.
 - Hidden tests should exercise only the public interface the prompt promises,

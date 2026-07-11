@@ -27,10 +27,25 @@ from pydantic import (
 )
 
 Severity = Literal["blocker", "major", "minor", "nit"]
-CaseStatus = Literal["scored", "missing_prediction"]
+CaseStatus = Literal[
+    "scored",
+    "missing_prediction",
+    "incomplete_prediction",
+]
 _HIGH_SEVERITIES = frozenset(("blocker", "major"))
 _WILSON_Z_95 = 1.959963984540054
 _SAFE_CASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _normalize_file(path: str) -> str:
+    """Normalize separators and redundant relative path components."""
+
+    normalized = path.strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if not normalized:
+        return ""
+    return posixpath.normpath(normalized)
 
 
 class ExpectedFinding(BaseModel):
@@ -69,7 +84,7 @@ class BenchmarkCase(BaseModel):
 
     id: str
     description: str | None = None
-    changed_lines: int = Field(default=0, ge=0)
+    changed_lines: int | None = Field(default=None, ge=0)
     expected_findings: list[ExpectedFinding] = Field(
         default_factory=list,
         validation_alias=AliasChoices(
@@ -92,10 +107,23 @@ class BenchmarkCase(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_unique_finding_ids(self) -> BenchmarkCase:
+    def _validate_expected_findings(self) -> BenchmarkCase:
         finding_ids = [finding.id for finding in self.expected_findings]
         if len(finding_ids) != len(set(finding_ids)):
             raise ValueError(f"case {self.id!r} contains duplicate finding ids")
+
+        for index, finding in enumerate(self.expected_findings):
+            for other in self.expected_findings[index + 1 :]:
+                if (
+                    _normalize_file(finding.file) == _normalize_file(other.file)
+                    and finding.category == other.category
+                    and finding.line_start <= other.line_end
+                    and other.line_start <= finding.line_end
+                ):
+                    raise ValueError(
+                        f"case {self.id!r} contains ambiguous overlapping ranges "
+                        f"for findings {finding.id!r} and {other.id!r}"
+                    )
         return self
 
 
@@ -119,7 +147,7 @@ class PredictedFinding(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    severity: str = "minor"
+    severity: str
     category: str = ""
     file: str = ""
     line: int | None = None
@@ -159,7 +187,7 @@ class CaseResult(BaseModel):
 
     case_id: str
     description: str | None = None
-    changed_lines: int
+    changed_lines: int | None
     prediction_file: str
     status: CaseStatus
     note: str | None = None
@@ -199,7 +227,7 @@ class AggregateMetrics(BaseModel):
     case_count: int
     expected_finding_count: int
     prediction_count: int
-    changed_lines: int
+    changed_lines: int | None
     true_positives: int
     false_positives: int
     false_negatives: int
@@ -255,18 +283,7 @@ def load_manifest(path: str | Path) -> BenchmarkManifest:
     return BenchmarkManifest.model_validate(raw)
 
 
-def _normalize_file(path: str) -> str:
-    """Normalize separators and redundant relative path components."""
-
-    normalized = path.strip().replace("\\", "/")
-    while normalized.startswith("./"):
-        normalized = normalized[2:]
-    if not normalized:
-        return ""
-    return posixpath.normpath(normalized)
-
-
-def _load_predictions(path: Path) -> list[PredictedFinding]:
+def _load_predictions(path: Path) -> tuple[list[PredictedFinding], str | None]:
     try:
         raw = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -278,12 +295,14 @@ def _load_predictions(path: Path) -> list[PredictedFinding]:
     native = "llm" in raw
     container = raw.get("llm") if native else raw
     if container is None and native:
-        return []
+        return [], "native report field 'llm' is null"
     if not isinstance(container, dict):
         location = "llm" if native else "root"
         raise ValueError(f"prediction file {path} field {location!r} must be an object")
 
-    items = container.get("findings", [])
+    items = container.get("findings")
+    if items is None:
+        return [], "findings payload is missing or null"
     if not isinstance(items, list):
         raise ValueError(f"prediction file {path} field 'findings' must be a list")
 
@@ -301,7 +320,7 @@ def _load_predictions(path: Path) -> list[PredictedFinding]:
         if normalized_item.get("confidence") is None:
             normalized_item["confidence"] = 1.0
         predictions.append(PredictedFinding.model_validate(normalized_item))
-    return predictions
+    return predictions, None
 
 
 def _prediction_sort_key(
@@ -499,7 +518,12 @@ def _aggregate(cases: list[CaseResult]) -> AggregateMetrics:
     case_count = len(cases)
     expected_count = sum(case.expected_count for case in cases)
     prediction_count = sum(case.prediction_count for case in cases)
-    changed_lines = sum(case.changed_lines for case in cases)
+    has_complete_exposure = all(case.changed_lines is not None for case in cases)
+    changed_lines = (
+        sum(case.changed_lines or 0 for case in cases)
+        if has_complete_exposure
+        else None
+    )
     true_positives = sum(case.true_positives for case in cases)
     false_positives = sum(case.false_positives for case in cases)
     false_negatives = sum(case.false_negatives for case in cases)
@@ -522,7 +546,8 @@ def _aggregate(cases: list[CaseResult]) -> AggregateMetrics:
 
     clean_cases = [case for case in cases if case.expected_count == 0]
     clean_cases_correct = sum(
-        case.prediction_count == 0 for case in clean_cases
+        case.status == "scored" and case.prediction_count == 0
+        for case in clean_cases
     )
 
     return AggregateMetrics(
@@ -545,7 +570,9 @@ def _aggregate(cases: list[CaseResult]) -> AggregateMetrics:
         severity_accuracy_denominator=true_positives,
         false_positives_per_case=_rate(false_positives, case_count),
         false_positives_per_kloc=(
-            false_positives * 1000 / changed_lines if changed_lines else None
+            false_positives * 1000 / changed_lines
+            if changed_lines is not None and changed_lines > 0
+            else None
         ),
         clean_case_accuracy=_rate(clean_cases_correct, len(clean_cases)),
         clean_case_denominator=len(clean_cases),
@@ -568,9 +595,13 @@ def score_benchmark(
     for case in manifest.cases:
         prediction_file = reviews_path / f"{case.id}.json"
         if prediction_file.is_file():
-            predictions = _load_predictions(prediction_file)
-            status: CaseStatus = "scored"
-            note = None
+            predictions, incomplete_reason = _load_predictions(prediction_file)
+            if incomplete_reason is None:
+                status: CaseStatus = "scored"
+                note = None
+            else:
+                status = "incomplete_prediction"
+                note = f"{incomplete_reason}; scored as zero findings"
         else:
             predictions = []
             status = "missing_prediction"

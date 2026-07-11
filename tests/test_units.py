@@ -314,3 +314,42 @@ def test_collect_changes_counts_untracked_files(tmp_path):
     assert stats.lines_added == 2
     assert "diff --git a/src/new_feature.py b/src/new_feature.py" in diff
     assert "+def hello():" in diff
+
+
+def test_collect_changes_preserves_renamed_head_paths(tmp_path):
+    from agent_eval.review import collect_changes, snapshot_changed_files
+
+    for index, destination in enumerate(("src/new.py", "lib/moved.py")):
+        repo = tmp_path / f"repo-{index}"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"],
+                       cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"],
+                       cwd=repo, check=True)
+        source = repo / "src" / "old.py"
+        source.parent.mkdir()
+        source.write_text("".join(f"value_{line} = {line}\n" for line in range(100)))
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=repo,
+                       check=True, capture_output=True)
+
+        target = repo / destination
+        target.parent.mkdir(exist_ok=True)
+        subprocess.run(["git", "mv", "src/old.py", destination], cwd=repo,
+                       check=True)
+        with target.open("a") as handle:
+            handle.write("danger = eval(user_input)\n")
+
+        files, stats, _ = collect_changes(repo, "HEAD", None)
+
+        assert len(files) == 1
+        assert files[0].path == destination
+        assert files[0].status == "R"
+        assert files[0].head_line_ranges == [(101, 101)]
+        assert stats.lines_added == 1
+        snapshot = repo / "snapshot"
+        assert snapshot_changed_files(repo, files, None, snapshot) == 1
+        assert (snapshot / destination).read_text().endswith(
+            "danger = eval(user_input)\n"
+        )

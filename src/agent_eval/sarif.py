@@ -3,7 +3,7 @@
 The serializer deliberately emits repository-relative artifact URIs.  A report
 can contain paths copied from scanner output, including absolute paths from a
 temporary checkout; paths that cannot be related safely to the reviewed
-repository are therefore not emitted as locations.
+repository are therefore omitted from the output.
 """
 
 from __future__ import annotations
@@ -23,10 +23,13 @@ SARIF_SCHEMA = (
     "https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/"
     "sarif-schema-2.1.0.json"
 )
-_FINGERPRINT_NAME = "agentEvalFinding/v1"
+_INTERNAL_FINGERPRINT_NAME = "agentEvalSemanticIdentity/v2"
+_PRIMARY_LOCATION_FINGERPRINT = "primaryLocationLineHash"
 _LEVEL_RANK = {"none": 0, "note": 1, "warning": 2, "error": 3}
 _WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[/\\]")
 _URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+_PRIMARY_LOCATION_HASH = re.compile(r"^[0-9a-f]{16}:[1-9][0-9]*$")
+_SEMANTIC_LOCATION_HASH = re.compile(r"^[0-9a-f]{64}:[1-9][0-9]*$")
 
 
 def _semantic_text(value: Any) -> str:
@@ -41,6 +44,10 @@ def _sha256(*parts: Any) -> str:
         list(parts), ensure_ascii=False, separators=(",", ":"), sort_keys=True
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _primary_location_line_hash(*parts: Any) -> str:
+    return f"{_sha256('primary-location-line', *parts)[:16]}:1"
 
 
 def _slug(value: Any, *, fallback: str, limit: int = 48) -> str:
@@ -80,12 +87,17 @@ def _known_relative_paths(report: ChangeReport) -> tuple[str, ...]:
     return tuple(sorted(paths, key=lambda item: (-len(item), item)))
 
 
-def _matching_known_suffix(raw_path: str, known_paths: Iterable[str]) -> str | None:
+def _matching_known_path(raw_path: str, known_paths: Iterable[str]) -> str | None:
     normalized = raw_path.replace("\\", "/").rstrip("/")
-    for known in known_paths:
-        if normalized == known or normalized.endswith(f"/{known}"):
-            return known
-    return None
+    known = tuple(known_paths)
+    if normalized in known:
+        return normalized
+    matches = {
+        path
+        for path in known
+        if normalized.endswith(f"/{path}") or path.endswith(f"/{normalized}")
+    }
+    return next(iter(matches)) if len(matches) == 1 else None
 
 
 def _repo_relative_path(
@@ -93,15 +105,20 @@ def _repo_relative_path(
 ) -> str | None:
     """Return a safe repository-relative path, or ``None`` when uncertain."""
     raw = str(value or "").strip()
-    relative = _safe_relative_path(raw)
-    if relative:
-        return relative
 
     if raw.lower().startswith("file://"):
         parsed = urlsplit(raw)
         if parsed.scheme.lower() != "file" or parsed.netloc not in ("", "localhost"):
             return None
         raw = unquote(parsed.path)
+    elif _URI_SCHEME.match(raw) and not _WINDOWS_ABSOLUTE.match(raw):
+        return None
+    if raw.startswith("~"):
+        return None
+
+    relative = _safe_relative_path(raw)
+    if relative:
+        return _matching_known_path(relative, known_paths)
 
     raw_normalized = raw.replace("\\", "/")
     repo_normalized = str(repo or "").strip().replace("\\", "/").rstrip("/")
@@ -110,7 +127,7 @@ def _repo_relative_path(
     ):
         relative = _safe_relative_path(raw_normalized[len(repo_normalized) + 1 :])
         if relative:
-            return relative
+            return _matching_known_path(relative, known_paths)
 
     if raw.startswith("/") and repo:
         try:
@@ -118,13 +135,13 @@ def _repo_relative_path(
             root = Path(repo).resolve(strict=False)
             relative = _safe_relative_path(candidate.relative_to(root).as_posix())
             if relative:
-                return relative
+                return _matching_known_path(relative, known_paths)
         except (OSError, RuntimeError, ValueError):
             pass
 
-    # Scanner paths often name a temporary checkout.  A suffix is safe only
-    # when it exactly matches a path already known to the change report.
-    return _matching_known_suffix(raw_normalized, known_paths)
+    if not raw.startswith("/") and not _WINDOWS_ABSOLUTE.match(raw):
+        return None
+    return _matching_known_path(raw_normalized, known_paths)
 
 
 def _artifact_uri(path: str) -> str:
@@ -148,7 +165,6 @@ def _location(path: str | None, line: Any) -> list[dict[str, Any]] | None:
     physical: dict[str, Any] = {
         "artifactLocation": {
             "uri": _artifact_uri(path),
-            "uriBaseId": "%SRCROOT%",
         }
     }
     start_line = _positive_line(line)
@@ -157,10 +173,11 @@ def _location(path: str | None, line: Any) -> list[dict[str, Any]] | None:
     return [{"physicalLocation": physical}]
 
 
-def _llm_level(severity: Any) -> str:
+def _llm_level(severity: Any, verdict: Any) -> str:
     normalized = _semantic_text(severity).casefold()
     if normalized in ("blocker", "major"):
-        return "error"
+        return "error" if _semantic_text(verdict).casefold() == "confirmed" \
+            else "warning"
     if normalized == "minor":
         return "warning"
     if normalized == "nit":
@@ -247,44 +264,44 @@ def _active_llm_results(
 
         severity = _semantic_text(finding.severity).casefold() or "unknown"
         category = _semantic_text(finding.category).casefold() or "general"
-        level = _llm_level(severity)
-        rule_id = _rule_id(
-            "LLM",
-            f"{category}-{severity}",
-            category,
-            severity,
-        )
+        level = _llm_level(severity, verdict)
+        rule_id = _rule_id("LLM", category, category)
         _register_rule(
             rules,
             rule_id=rule_id,
-            name=f"LLM {category} {severity}",
-            description=f"Verified {severity} {category} finding",
+            name=f"LLM {category} finding",
+            description=f"Evidence-verified {category} finding",
             level=level,
             properties={
                 "source": "llm",
                 "category": category,
-                "severity": severity,
             },
         )
 
         path = _repo_relative_path(finding.file, report.repo, known_paths)
+        if not path:
+            continue
         claim = _semantic_text(finding.claim) or f"Verified {category} issue."
         evidence = _semantic_text(finding.evidence)
-        semantic_anchor = evidence or claim
+        primary_anchor = evidence or claim
         result: dict[str, Any] = {
             "ruleId": rule_id,
             "level": level,
             "message": {"text": claim},
             "partialFingerprints": {
-                _FINGERPRINT_NAME: _sha256(
-                    "llm", category, path or "", semantic_anchor
-                )
+                _PRIMARY_LOCATION_FINGERPRINT: _primary_location_line_hash(
+                    primary_anchor
+                ),
+                _INTERNAL_FINGERPRINT_NAME: _sha256(
+                    "llm", category, path, claim, evidence
+                ),
             },
             "properties": {
                 "source": "llm",
                 "category": category,
                 "severity": severity,
                 "verified": True,
+                "diffScoped": True,
             },
         }
         if evidence:
@@ -296,10 +313,46 @@ def _active_llm_results(
                 finding.verdict_reason
             )
         locations = _location(path, finding.line)
-        if locations:
-            result["locations"] = locations
+        result["locations"] = locations
         results.append(result)
     return results
+
+
+def _head_line_ranges(
+    report: ChangeReport, known_paths: tuple[str, ...]
+) -> dict[str, tuple[tuple[int, int], ...]]:
+    ranges: dict[str, tuple[tuple[int, int], ...]] = {}
+    for changed in report.files:
+        path = _repo_relative_path(changed.path, report.repo, known_paths)
+        if not path:
+            continue
+        valid_ranges = []
+        for start, end in changed.head_line_ranges:
+            if (
+                isinstance(start, int)
+                and not isinstance(start, bool)
+                and isinstance(end, int)
+                and not isinstance(end, bool)
+                and 0 < start <= end
+            ):
+                valid_ranges.append((start, end))
+        ranges[path] = tuple(valid_ranges)
+    return ranges
+
+
+def _line_is_changed(
+    path: str, line: int, changed_ranges: dict[str, tuple[tuple[int, int], ...]]
+) -> bool:
+    return any(start <= line <= end for start, end in changed_ranges.get(path, ()))
+
+
+def _scanner_primary_location_hash(
+    finding: dict[str, Any], tool: str, rule: str, path: str, line: int
+) -> str:
+    supplied = _semantic_text(finding.get("primary_location_line_hash")).casefold()
+    if _PRIMARY_LOCATION_HASH.fullmatch(supplied):
+        return supplied
+    return _primary_location_line_hash(tool.casefold(), rule, path, line)
 
 
 def _scanner_results(
@@ -310,6 +363,7 @@ def _scanner_results(
     if report.scans is None:
         return []
 
+    changed_ranges = _head_line_ranges(report, known_paths)
     results: list[dict[str, Any]] = []
     for finding in report.scans.findings:
         if not isinstance(finding, dict):
@@ -326,6 +380,20 @@ def _scanner_results(
         level = _scanner_level(finding.get("severity"))
         message = _scanner_message(finding, tool, rule)
         line = _positive_line(finding.get("line"))
+        if line is None or not _line_is_changed(path, line, changed_ranges):
+            continue
+        primary_hash = _scanner_primary_location_hash(
+            finding, tool, rule, path, line
+        )
+        semantic_location_hash = _semantic_text(
+            finding.get("semantic_location_hash")
+        ).casefold()
+        semantic_anchored = bool(
+            _SEMANTIC_LOCATION_HASH.fullmatch(semantic_location_hash)
+        )
+        semantic_anchor = (
+            semantic_location_hash if semantic_anchored else primary_hash
+        )
         rule_id = _rule_id("SCANNER", f"{tool}-{rule}", tool.casefold(), rule)
         _register_rule(
             rules,
@@ -341,12 +409,23 @@ def _scanner_results(
             "level": level,
             "message": {"text": message},
             "partialFingerprints": {
-                _FINGERPRINT_NAME: _sha256(
-                    "scanner", tool.casefold(), rule, path, message, line or 0
-                )
+                _PRIMARY_LOCATION_FINGERPRINT: primary_hash,
+                _INTERNAL_FINGERPRINT_NAME: _sha256(
+                    "scanner",
+                    tool.casefold(),
+                    rule,
+                    path,
+                    semantic_anchor,
+                    message,
+                    0 if semantic_anchored else line,
+                ),
             },
             "locations": _location(path, line),
-            "properties": {"source": "scanner", "tool": tool},
+            "properties": {
+                "source": "scanner",
+                "tool": tool,
+                "diffScoped": True,
+            },
         }
         severity = finding.get("severity")
         if severity is not None:
@@ -368,12 +447,13 @@ def to_sarif(report: ChangeReport) -> dict[str, Any]:
         result["ruleIndex"] = rule_indexes[result["ruleId"]]
 
     invocation = {
-        "executionSuccessful": not report.blocked,
+        "executionSuccessful": True,
         "properties": {
             "base": report.base,
             "head": report.head,
             "overallRisk": report.risk,
             "blocked": report.blocked,
+            "analysisScope": "pr-diff",
         },
     }
     return {

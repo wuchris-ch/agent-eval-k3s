@@ -62,7 +62,7 @@ cases:
     manifest = load_manifest(path)
 
     assert manifest.cases[0].description == "catches a boundary bug"
-    assert manifest.cases[0].changed_lines == 0
+    assert manifest.cases[0].changed_lines is None
     assert manifest.cases[0].expected_findings[0].line_end == 12
     assert manifest.cases[1].expected_findings == []
 
@@ -78,24 +78,54 @@ cases:
         BenchmarkCase(id="../outside")
 
 
-def test_maximum_matching_duplicate_predictions_and_order_independence(tmp_path):
+def test_manifest_rejects_ambiguous_expected_ranges_after_path_normalization():
+    with pytest.raises(ValidationError, match="ambiguous overlapping ranges"):
+        BenchmarkCase(
+            id="ambiguous",
+            expected_findings=[
+                _expected(
+                    "first",
+                    file="src/service.py",
+                    line_start=15,
+                    line_end=20,
+                ),
+                _expected(
+                    "second",
+                    file=".\\src\\service.py",
+                    line_start=20,
+                    line_end=25,
+                ),
+            ],
+        )
+
+    valid = BenchmarkCase(
+        id="unambiguous",
+        expected_findings=[
+            _expected("first", line_start=15, line_end=19),
+            _expected("second", line_start=20, line_end=25),
+        ],
+    )
+
+    assert len(valid.expected_findings) == 2
+
+
+def test_duplicate_predictions_and_order_independence(tmp_path):
     manifest = BenchmarkManifest(
         cases=[
             BenchmarkCase(
                 id="overlap",
                 expected_findings=[
                     _expected(
-                        "broad",
-                        severity="major",
-                        file="src/service.py",
-                        line_start=15,
-                        line_end=20,
-                    ),
-                    _expected(
-                        "narrow",
+                        "first",
                         severity="minor",
                         file="src/service.py",
                         line_start=15,
+                    ),
+                    _expected(
+                        "second",
+                        severity="major",
+                        file="src/service.py",
+                        line_start=20,
                     ),
                 ],
             )
@@ -136,7 +166,7 @@ def test_maximum_matching_duplicate_predictions_and_order_independence(tmp_path)
         1,
         0,
     )
-    assert {match.expected_id for match in case.matches} == {"broad", "narrow"}
+    assert {match.expected_id for match in case.matches} == {"first", "second"}
     assert all(match.severity_correct for match in case.matches)
     assert result_a.metrics.model_dump() == result_b.metrics.model_dump()
 
@@ -164,7 +194,7 @@ def test_metric_math_clean_cases_and_wilson_intervals(tmp_path):
                     ),
                 ],
             ),
-            BenchmarkCase(id="clean"),
+            BenchmarkCase(id="clean", changed_lines=0),
         ]
     )
     reviews = tmp_path / "reviews"
@@ -240,6 +270,69 @@ def test_missing_prediction_is_zero_findings_with_status(tmp_path):
     assert metrics.recall == 0.0
     assert metrics.recall_denominator == 1
     assert metrics.f1 == 0.0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"findings": None},
+        {"llm": None},
+        {"llm": {}},
+    ],
+)
+def test_incomplete_findings_payload_is_not_a_completed_clean_review(tmp_path, payload):
+    manifest = BenchmarkManifest(cases=[BenchmarkCase(id="clean", changed_lines=1)])
+    reviews = tmp_path / "reviews"
+    reviews.mkdir()
+    (reviews / "clean.json").write_text(json.dumps(payload))
+
+    result = score_benchmark(manifest, reviews)
+    case = result.cases[0]
+
+    assert case.status == "incomplete_prediction"
+    assert case.note is not None
+    assert case.prediction_count == 0
+    assert result.metrics.clean_case_denominator == 1
+    assert result.metrics.clean_cases_correct == 0
+    assert result.metrics.clean_case_accuracy == 0.0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "findings": [
+                {
+                    "category": "correctness",
+                    "file": "src/app.py",
+                    "line": 10,
+                }
+            ]
+        },
+        {
+            "llm": {
+                "findings": [
+                    {
+                        "category": "correctness",
+                        "file": "src/app.py",
+                        "line": 10,
+                        "verified": True,
+                        "verdict": "confirmed",
+                    }
+                ]
+            }
+        },
+    ],
+)
+def test_prediction_severity_is_required(tmp_path, payload):
+    manifest = BenchmarkManifest(cases=[BenchmarkCase(id="missing-severity")])
+    reviews = tmp_path / "reviews"
+    reviews.mkdir()
+    (reviews / "missing-severity.json").write_text(json.dumps(payload))
+
+    with pytest.raises(ValidationError, match="severity"):
+        score_benchmark(manifest, reviews)
 
 
 def test_native_change_report_filters_inactive_findings(tmp_path):
@@ -357,6 +450,35 @@ def test_zero_denominators_are_explicit_for_empty_benchmarks(tmp_path):
     assert metrics.recall_wilson_95 is None
 
 
+def test_fp_per_kloc_requires_changed_lines_for_every_case(tmp_path):
+    manifest = BenchmarkManifest(
+        cases=[
+            BenchmarkCase(id="measured", changed_lines=100),
+            BenchmarkCase(id="unknown"),
+        ]
+    )
+    reviews = tmp_path / "reviews"
+    _write_predictions(
+        reviews,
+        "measured",
+        [
+            {
+                "severity": "minor",
+                "category": "correctness",
+                "file": "src/app.py",
+                "line": 1,
+            }
+        ],
+    )
+    _write_predictions(reviews, "unknown", [])
+
+    metrics = score_benchmark(manifest, reviews).metrics
+
+    assert metrics.false_positives == 1
+    assert metrics.changed_lines is None
+    assert metrics.false_positives_per_kloc is None
+
+
 def test_benchmark_cli_writes_item_results_and_enforces_regression_gates(tmp_path):
     manifest = tmp_path / "benchmark.yaml"
     manifest.write_text(
@@ -447,3 +569,60 @@ def test_benchmark_cli_fails_closed_on_missing_outputs(tmp_path):
     assert failed.exit_code == 2
     assert "no reviewer output" in failed.output
     assert allowed.exit_code == 0
+
+
+def test_benchmark_cli_fails_closed_on_incomplete_outputs(tmp_path):
+    manifest = tmp_path / "benchmark.yaml"
+    manifest.write_text("cases:\n  - id: incomplete-clean-control\n")
+    reviews = tmp_path / "reviews"
+    reviews.mkdir()
+    (reviews / "incomplete-clean-control.json").write_text(json.dumps({"llm": None}))
+    runner = CliRunner()
+    args = [
+        "benchmark-review",
+        "--manifest",
+        str(manifest),
+        "--reviews",
+        str(reviews),
+    ]
+
+    failed = runner.invoke(app, args)
+    allowed = runner.invoke(app, [*args, "--allow-missing"])
+
+    assert failed.exit_code == 2
+    assert "incomplete" in failed.output
+    assert "findings payload" in failed.output
+    assert allowed.exit_code == 0
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--min-precision",
+        "--min-recall",
+        "--min-critical-recall",
+        "--max-fp-per-case",
+    ],
+)
+def test_benchmark_cli_rejects_nonfinite_thresholds(tmp_path, option):
+    manifest = tmp_path / "benchmark.yaml"
+    manifest.write_text("cases:\n  - id: clean\n")
+    reviews = tmp_path / "reviews"
+    _write_predictions(reviews, "clean", [])
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark-review",
+            "--manifest",
+            str(manifest),
+            "--reviews",
+            str(reviews),
+            option,
+            "nan",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert f"Invalid value for {option}" in result.output
+    assert "must be finite" in result.output
