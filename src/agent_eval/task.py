@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .assurance import ChallengeSpec
 from .outcome import AcceptancePolicy
+
 DEFAULT_TASKS_ROOT = Path(__file__).resolve().parents[2] / "tasks"
 
 DEFAULT_SANDBOX_RESOURCES = {
@@ -26,6 +27,7 @@ _QUANTITY_RE = re.compile(
     r"^(?P<number>(?:\d+(?:\.\d*)?|\.\d+))"
     r"(?P<suffix>m|[kMGTPE]|[KMGTPE]i|[eE][+-]?\d+)?$"
 )
+_TASK_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _DECIMAL_SUFFIXES = {
     "m": Decimal("0.001"),
     "k": Decimal("1000"),
@@ -136,6 +138,8 @@ class JudgeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
+    backend: Literal["claude", "codex"] | None = None
+    model: str | None = None
     weights: dict[str, float] = Field(
         default={"spec_adherence": 0.4, "maintainability": 0.4, "test_quality": 0.2}
     )
@@ -146,6 +150,13 @@ class JudgeConfig(BaseModel):
             not name.strip() or weight <= 0 for name, weight in self.weights.items()
         ):
             raise ValueError("judge weights must have names and positive values")
+        if (self.backend is None) != (self.model is None):
+            raise ValueError("judge backend and model must be configured together")
+        if self.model is not None and (
+            len(self.model) > 256
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+~-]*", self.model) is None
+        ):
+            raise ValueError("judge model must be an exact model identifier")
         return self
 
 
@@ -220,6 +231,16 @@ class Task(BaseModel):
     challenges: list[ChallengeSpec] = Field(default_factory=list)
     path: Path
 
+    @field_validator("id")
+    @classmethod
+    def _safe_task_id(cls, value: str) -> str:
+        if not _TASK_ID_RE.fullmatch(value):
+            raise ValueError(
+                "task id must be a lowercase DNS-style path segment with at "
+                "most 63 characters"
+            )
+        return value
+
     @field_validator("prompt")
     @classmethod
     def _prompt_nonempty(cls, v: str) -> str:
@@ -274,7 +295,7 @@ class Task(BaseModel):
         return self.path / "solution"
 
     def validate_layout(self) -> list[str]:
-        problems = []
+        problems = self.execution_root_errors()
         if not (self.environment_dir / "Dockerfile").is_file():
             problems.append("missing environment/Dockerfile")
         if not self.workspace_dir.is_dir():
@@ -283,17 +304,60 @@ class Task(BaseModel):
             problems.append("missing or empty tests/ directory")
         return problems
 
+    def execution_root_errors(self) -> list[str]:
+        """Reject task roots/files that escape through a symlinked boundary."""
+
+        root = self.path.resolve()
+        problems: list[str] = []
+        if self.path.is_symlink():
+            problems.append("task directory must not be a symlink")
+        targets = {
+            "task manifest": self.path / "task.yaml",
+            "environment": self.environment_dir,
+            "starter workspace": self.workspace_dir,
+            "hidden tests": self.tests_dir,
+            "environment Dockerfile": self.environment_dir / "Dockerfile",
+        }
+        if self.solution_dir.exists() or self.solution_dir.is_symlink():
+            targets["oracle solution"] = self.solution_dir
+        for label, path in targets.items():
+            if path.is_symlink():
+                problems.append(f"{label} must not be a symlink")
+                continue
+            if not path.exists():
+                continue
+            try:
+                path.resolve(strict=True).relative_to(root)
+            except (OSError, ValueError):
+                problems.append(f"{label} must stay beneath the task directory")
+        return problems
+
 
 def load_task(task_id: str, tasks_root: Path = DEFAULT_TASKS_ROOT) -> Task:
-    task_dir = tasks_root / task_id
+    if not _TASK_ID_RE.fullmatch(task_id):
+        raise ValueError(
+            "task id must be a lowercase DNS-style path segment with at most "
+            "63 characters"
+        )
+    root = tasks_root.resolve()
+    task_dir = root / task_id
+    if task_dir.is_symlink():
+        raise ValueError("task directory must not be a symlink")
     yaml_path = task_dir / "task.yaml"
+    if yaml_path.is_symlink():
+        raise ValueError("task manifest must not be a symlink")
     if not yaml_path.is_file():
         raise FileNotFoundError(f"no task.yaml at {yaml_path}")
     data = yaml.safe_load(yaml_path.read_text())
     data["path"] = task_dir
     task = Task.model_validate(data)
     if task.id != task_id:
-        raise ValueError(f"task.yaml id {task.id!r} does not match directory {task_id!r}")
+        raise ValueError(
+            f"task.yaml id {task.id!r} does not match directory {task_id!r}"
+        )
+    root_errors = task.execution_root_errors()
+    if root_errors:
+        raise ValueError(f"task execution roots are unsafe: {', '.join(root_errors)}")
     return task
 
 

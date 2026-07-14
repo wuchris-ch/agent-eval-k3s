@@ -23,6 +23,57 @@ def test_load_example_task():
     assert abs(sum(task.judge.weights.values()) - 1.0) < 1e-9
 
 
+@pytest.mark.parametrize(
+    "task_id",
+    ["../example-todo-api", "nested/task", "Uppercase", "trailing-", "a" * 64],
+)
+def test_load_task_rejects_unsafe_path_ids(tmp_path, task_id):
+    with pytest.raises(ValueError, match="DNS-style path segment"):
+        load_task(task_id, tmp_path)
+
+
+def test_load_task_rejects_symlinked_task_directory(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "task.yaml").write_text(
+        "id: linked-task\nprompt: Test\ntest_command: pytest\n"
+    )
+    (tmp_path / "linked-task").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        load_task("linked-task", tmp_path)
+
+
+def test_load_task_rejects_symlinked_manifest(tmp_path):
+    task_dir = tmp_path / "linked-manifest"
+    task_dir.mkdir()
+    manifest = tmp_path / "outside.yaml"
+    manifest.write_text("id: linked-manifest\nprompt: Test\ntest_command: pytest\n")
+    (task_dir / "task.yaml").symlink_to(manifest)
+
+    with pytest.raises(ValueError, match="manifest must not be a symlink"):
+        load_task("linked-manifest", tmp_path)
+
+
+def test_load_task_rejects_symlinked_workspace_root(tmp_path):
+    task_dir = tmp_path / "linked-workspace"
+    environment = task_dir / "environment"
+    tests_dir = task_dir / "tests"
+    environment.mkdir(parents=True)
+    tests_dir.mkdir()
+    (task_dir / "task.yaml").write_text(
+        "id: linked-workspace\nprompt: Test\ntest_command: pytest\n"
+    )
+    (environment / "Dockerfile").write_text("FROM scratch\n")
+    outside = tmp_path / "outside-workspace"
+    outside.mkdir()
+    (outside / "host-secret").write_text("must not be copied\n")
+    (environment / "workspace").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="starter workspace must not be a symlink"):
+        load_task("linked-workspace", tmp_path)
+
+
 def test_task_image_tag_changes_with_build_context(tmp_path):
     from agent_eval.task import load_task
 
@@ -261,6 +312,46 @@ def test_codex_transcript_parsing(tmp_path):
     assert m.turns == 1
     assert (m.tokens_in, m.tokens_out) == (900, 200)
     assert m.cost_usd is None
+
+
+def test_codex_missing_usage_remains_unobserved(tmp_path):
+    from agent_eval.agents.codex import CodexAdapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    events = [
+        {
+            "type": "turn.completed",
+            "usage": {"input_tokens": 900, "output_tokens": 200},
+        },
+        {"type": "turn.completed"},
+    ]
+    transcript.write_text("\n".join(json.dumps(e) for e in events))
+
+    metrics = CodexAdapter().parse_transcript(transcript)
+
+    assert metrics.turns == 2
+    assert metrics.tokens_in is None
+    assert metrics.tokens_out is None
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"input_tokens": -1, "output_tokens": 1},
+        {"input_tokens": True, "output_tokens": 1},
+        {"input_tokens": "1", "output_tokens": 1},
+        {"input_tokens": 1, "output_tokens": -1},
+        [],
+    ],
+)
+def test_codex_rejects_invalid_usage(tmp_path, usage):
+    from agent_eval.agents.codex import CodexAdapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(json.dumps({"type": "turn.completed", "usage": usage}))
+
+    with pytest.raises(ValueError, match="invalid .*accounting"):
+        CodexAdapter().parse_transcript(transcript)
 
 
 def test_codex_command_shape():

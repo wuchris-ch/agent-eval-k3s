@@ -41,6 +41,11 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _DRIVE_OR_URI_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _CHUNK_SIZE = 1024 * 1024
+MAX_ATTESTATION_STATEMENT_BYTES = 16 * 1024 * 1024
+MAX_ATTESTATION_SUBJECTS = 10_000
+MAX_ARTIFACT_FILES = 50_000
+MAX_JSON_DEPTH = 100
+MAX_SIDECAR_BYTES = 1024
 
 
 class AttestationError(ValueError):
@@ -97,6 +102,8 @@ class VerificationResult(BaseModel):
     subjects_checked: int = 0
     task_checked: bool = False
     harness_checked: bool = False
+    predicate: dict[str, Any] | None = None
+    subject_digests: dict[str, str] = Field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -105,8 +112,11 @@ class _TreeScan:
     unsafe: tuple[tuple[str, str], ...]
 
 
-def _json_value(value: Any, *, location: str = "value") -> Any:
+def _json_value(value: Any, *, location: str = "value", depth: int = 0) -> Any:
     """Return a deterministic JSON-compatible copy or raise AttestationError."""
+
+    if depth > MAX_JSON_DEPTH:
+        raise AttestationError(f"{location} exceeds the maximum JSON depth")
 
     if isinstance(value, BaseModel):
         value = value.model_dump(mode="json")
@@ -130,11 +140,19 @@ def _json_value(value: Any, *, location: str = "value") -> Any:
         for key, item in value.items():
             if not isinstance(key, str):
                 raise AttestationError(f"{location} contains a non-string key")
-            normalized[key] = _json_value(item, location=f"{location}.{key}")
+            normalized[key] = _json_value(
+                item,
+                location=f"{location}.{key}",
+                depth=depth + 1,
+            )
         return normalized
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [
-            _json_value(item, location=f"{location}[{index}]")
+            _json_value(
+                item,
+                location=f"{location}[{index}]",
+                depth=depth + 1,
+            )
             for index, item in enumerate(value)
         ]
     raise AttestationError(
@@ -213,6 +231,55 @@ def sha256_file(path: str | Path) -> str:
         os.close(fd)
 
 
+def _read_regular_file(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int = MAX_ATTESTATION_STATEMENT_BYTES,
+) -> bytes:
+    """Read one stable regular file without following its final symlink."""
+
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+
+    before = os.lstat(path)
+    if stat.S_ISLNK(before.st_mode):
+        raise AttestationError(f"{label} must not be a symlink")
+    if not stat.S_ISREG(before.st_mode):
+        raise AttestationError(f"{label} must be a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise AttestationError(f"{label} must be a regular file")
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            raise AttestationError(f"{label} changed while it was opened")
+        if opened.st_size > max_bytes:
+            raise AttestationError(f"{label} exceeds {max_bytes} bytes")
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := os.read(fd, min(_CHUNK_SIZE, max_bytes - size + 1)):
+            size += len(chunk)
+            if size > max_bytes:
+                raise AttestationError(f"{label} exceeds {max_bytes} bytes")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def read_regular_file(
+    path: str | Path,
+    *,
+    label: str = "file",
+    max_bytes: int = MAX_ATTESTATION_STATEMENT_BYTES,
+) -> bytes:
+    """Return a no-follow snapshot of one stable regular file."""
+
+    return _read_regular_file(Path(path), label=label, max_bytes=max_bytes)
+
+
 def _directory_root(path: str | Path, *, label: str) -> Path:
     try:
         root = Path(path).expanduser().resolve(strict=True)
@@ -282,13 +349,21 @@ def _open_regular_beneath(root: Path, name: str) -> int:
         os.close(root_fd)
 
 
-def _read_regular_beneath(root: Path, name: str) -> bytes:
+def _read_regular_beneath(
+    root: Path,
+    name: str,
+    *,
+    max_bytes: int = MAX_ATTESTATION_STATEMENT_BYTES,
+) -> bytes:
     fd = _open_regular_beneath(root, name)
     try:
-        chunks: list[bytes] = []
-        while chunk := os.read(fd, _CHUNK_SIZE):
-            chunks.append(chunk)
-        return b"".join(chunks)
+        data = bytearray()
+        while len(data) <= max_bytes:
+            chunk = os.read(fd, min(_CHUNK_SIZE, max_bytes + 1 - len(data)))
+            if not chunk:
+                return bytes(data)
+            data.extend(chunk)
+        raise AttestationError(f"artifact exceeds {max_bytes} bytes: {name}")
     finally:
         os.close(fd)
 
@@ -303,10 +378,26 @@ def _hash_regular_beneath(root: Path, name: str) -> str:
 
 def _tree_records(root: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    visited_entries = 0
 
-    def visit(directory: Path, prefix: PurePosixPath | None = None) -> None:
+    def visit(
+        directory: Path,
+        prefix: PurePosixPath | None = None,
+        depth: int = 0,
+    ) -> None:
+        nonlocal visited_entries
+        if depth > MAX_JSON_DEPTH:
+            raise AttestationError("task tree exceeds the maximum depth")
         with os.scandir(directory) as entries:
-            ordered = sorted(entries, key=lambda entry: os.fsencode(entry.name))
+            ordered = []
+            for entry in entries:
+                visited_entries += 1
+                if visited_entries > MAX_ARTIFACT_FILES:
+                    raise AttestationError(
+                        f"task tree exceeds {MAX_ARTIFACT_FILES} entries"
+                    )
+                ordered.append(entry)
+            ordered.sort(key=lambda entry: os.fsencode(entry.name))
         for entry in ordered:
             relative = (
                 PurePosixPath(entry.name) if prefix is None else prefix / entry.name
@@ -325,7 +416,7 @@ def _tree_records(root: Path) -> list[dict[str, Any]]:
                 )
             elif stat.S_ISDIR(metadata.st_mode):
                 records.append({"mode": mode, "path": name, "type": "directory"})
-                visit(Path(entry.path), relative)
+                visit(Path(entry.path), relative, depth + 1)
             elif stat.S_ISREG(metadata.st_mode):
                 records.append(
                     {
@@ -566,6 +657,7 @@ def build_statement(
     models: Mapping[str, str | None] | None = None,
     tool_versions: Mapping[str, str | None] | None = None,
     outcome: Mapping[str, Any] | None = None,
+    governance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build an in-toto Statement v1-shaped unsigned provenance document."""
 
@@ -607,6 +699,9 @@ def build_statement(
     normalized_outcome = _json_value(outcome or {}, location="outcome")
     if not isinstance(normalized_outcome, dict):
         raise AttestationError("outcome must be a JSON object")
+    normalized_governance = _json_value(governance or {}, location="governance")
+    if not isinstance(normalized_governance, dict):
+        raise AttestationError("governance must be a JSON object")
 
     resolved_task_id = _task_identity(task_directory, task_id)
     manifest_digest = _hash_regular_beneath(task_directory, "task.yaml")
@@ -648,6 +743,7 @@ def build_statement(
             "models": _version_map(models, label="model"),
             "tools": _version_map(tool_versions, label="tool"),
             "outcome": normalized_outcome,
+            "governance": normalized_governance,
         },
     }
 
@@ -710,11 +806,35 @@ def _lexical_relative(root: Path, path: Path) -> str | None:
 def _scan_artifact_tree(root: Path, excluded: set[str]) -> _TreeScan:
     files: set[str] = set()
     unsafe: list[tuple[str, str]] = []
+    visited_entries = 0
+    stopped = False
 
-    def visit(directory: Path, prefix: PurePosixPath | None = None) -> None:
+    def visit(
+        directory: Path,
+        prefix: PurePosixPath | None = None,
+        depth: int = 0,
+    ) -> None:
+        nonlocal stopped, visited_entries
+        if stopped:
+            return
+        if depth > MAX_JSON_DEPTH:
+            relative = prefix.as_posix() if prefix else "."
+            unsafe.append((relative, "artifact tree exceeds the maximum depth"))
+            stopped = True
+            return
         try:
             with os.scandir(directory) as entries:
-                ordered = sorted(entries, key=lambda entry: os.fsencode(entry.name))
+                ordered = []
+                for entry in entries:
+                    visited_entries += 1
+                    if visited_entries > MAX_ARTIFACT_FILES:
+                        unsafe.append(
+                            (".", f"artifact tree exceeds {MAX_ARTIFACT_FILES} entries")
+                        )
+                        stopped = True
+                        return
+                    ordered.append(entry)
+                ordered.sort(key=lambda entry: os.fsencode(entry.name))
         except OSError as exc:
             relative = prefix.as_posix() if prefix else "."
             unsafe.append((relative, f"directory could not be read: {exc}"))
@@ -735,7 +855,7 @@ def _scan_artifact_tree(root: Path, excluded: set[str]) -> _TreeScan:
             if stat.S_ISLNK(metadata.st_mode):
                 unsafe.append((safe_name, "symlinks are not attestable run artifacts"))
             elif stat.S_ISDIR(metadata.st_mode):
-                visit(Path(entry.path), relative)
+                visit(Path(entry.path), relative, depth + 1)
             elif stat.S_ISREG(metadata.st_mode):
                 files.add(safe_name)
             else:
@@ -761,6 +881,7 @@ def create_attestation(
     models: Mapping[str, str | None] | None = None,
     tool_versions: Mapping[str, str | None] | None = None,
     outcome: Mapping[str, Any] | None = None,
+    governance: Mapping[str, Any] | None = None,
     sidecar_path: str | Path | None = None,
 ) -> AttestationBundle:
     """Build and write an unsigned local provenance bundle.
@@ -835,6 +956,7 @@ def create_attestation(
         models=models,
         tool_versions=tool_versions,
         outcome=outcome,
+        governance=governance,
     )
     return write_attestation(statement, output, sidecar_path=sidecar)
 
@@ -873,12 +995,24 @@ def _verify_sidecar(
 ) -> tuple[str, bool]:
     actual = _sha256_bytes(statement_data)
     try:
-        raw = sidecar.read_bytes()
+        raw = _read_regular_file(
+            sidecar,
+            label="statement digest sidecar",
+            max_bytes=MAX_SIDECAR_BYTES,
+        )
     except FileNotFoundError:
         _failure(
             failures,
             "sidecar_missing",
             "statement digest sidecar is missing",
+            path=str(sidecar),
+        )
+        return actual, False
+    except AttestationError as exc:
+        _failure(
+            failures,
+            "sidecar_unsafe",
+            str(exc),
             path=str(sidecar),
         )
         return actual, False
@@ -962,6 +1096,14 @@ def _verify_predicate_shape(
             raise AttestationError("outcome must be an object")
     except AttestationError as exc:
         _failure(failures, "outcome_invalid", str(exc))
+    governance = predicate.get("governance")
+    if governance is not None:
+        try:
+            normalized_governance = _json_value(governance, location="governance")
+            if not isinstance(normalized_governance, dict):
+                raise AttestationError("governance must be an object")
+        except AttestationError as exc:
+            _failure(failures, "governance_invalid", str(exc))
     image = predicate.get("image")
     if not isinstance(image, Mapping) or not isinstance(image.get("tag"), str):
         _failure(failures, "image_invalid", "image tag and digest are required")
@@ -978,15 +1120,23 @@ def _verify_subjects(
     subjects: Any,
     root: Path,
     failures: list[VerificationFailure],
-) -> tuple[set[str], int, int]:
+) -> tuple[set[str], int, int, dict[str, str]]:
     if not isinstance(subjects, list):
         _failure(
             failures,
             "subjects_invalid",
             "statement subject must be an array",
         )
-        return set(), 0, 0
+        return set(), 0, 0, {}
+    if len(subjects) > MAX_ATTESTATION_SUBJECTS:
+        _failure(
+            failures,
+            "subjects_too_many",
+            f"statement exceeds {MAX_ATTESTATION_SUBJECTS} subjects",
+        )
+        return set(), len(subjects), 0, {}
     names: set[str] = set()
+    subject_digests: dict[str, str] = {}
     checked = 0
     for index, subject in enumerate(subjects):
         if not isinstance(subject, Mapping):
@@ -1026,6 +1176,7 @@ def _verify_subjects(
                 path=name,
             )
             continue
+        subject_digests[name] = expected
         try:
             actual = _hash_regular_beneath(root, name)
         except FileNotFoundError:
@@ -1055,7 +1206,7 @@ def _verify_subjects(
                 expected=expected,
                 actual=actual,
             )
-    return names, len(subjects), checked
+    return names, len(subjects), checked, subject_digests
 
 
 def _verify_task(
@@ -1256,7 +1407,7 @@ def _verify_harness(
     return True
 
 
-def verify_attestation(
+def _verify_attestation(
     statement_path: str | Path,
     *,
     artifact_root: str | Path,
@@ -1275,7 +1426,17 @@ def verify_attestation(
         else default_sidecar_path(statement_file)
     )
     try:
-        statement_data = statement_file.read_bytes()
+        statement_data = _read_regular_file(
+            statement_file, label="attestation statement"
+        )
+    except AttestationError as exc:
+        _failure(
+            failures,
+            "statement_unsafe",
+            str(exc),
+            path=str(statement_file),
+        )
+        return VerificationResult(ok=False, failures=failures)
     except OSError as exc:
         _failure(
             failures,
@@ -1290,7 +1451,12 @@ def verify_attestation(
     )
     try:
         statement = json.loads(statement_data)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        RecursionError,
+        MemoryError,
+    ) as exc:
         _failure(
             failures,
             "statement_json_invalid",
@@ -1356,9 +1522,10 @@ def verify_attestation(
         task_directory = None
 
     names: set[str] = set()
+    subject_digests: dict[str, str] = {}
     declared = checked = 0
     if artifact_directory is not None:
-        names, declared, checked = _verify_subjects(
+        names, declared, checked, subject_digests = _verify_subjects(
             statement.get("subject"), artifact_directory, failures
         )
 
@@ -1402,4 +1569,42 @@ def verify_attestation(
         subjects_checked=checked,
         task_checked=task_checked,
         harness_checked=harness_checked,
+        predicate=dict(predicate) if predicate is not None else None,
+        subject_digests=subject_digests,
     )
+
+
+def verify_attestation(
+    statement_path: str | Path,
+    *,
+    artifact_root: str | Path,
+    task_root: str | Path,
+    harness_repo: str | Path | None = None,
+    sidecar_path: str | Path | None = None,
+    require_complete_artifact_set: bool = True,
+) -> VerificationResult:
+    """Verify local evidence behind a resource-safe structured boundary."""
+
+    try:
+        return _verify_attestation(
+            statement_path,
+            artifact_root=artifact_root,
+            task_root=task_root,
+            harness_repo=harness_repo,
+            sidecar_path=sidecar_path,
+            require_complete_artifact_set=require_complete_artifact_set,
+        )
+    except (RecursionError, MemoryError) as exc:
+        return VerificationResult(
+            ok=False,
+            failures=[
+                VerificationFailure(
+                    code="verification_resource_limit",
+                    message=(
+                        "attestation verification exceeded a safe resource limit: "
+                        f"{type(exc).__name__}"
+                    ),
+                    path=str(statement_path),
+                )
+            ],
+        )

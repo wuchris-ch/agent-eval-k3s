@@ -18,9 +18,14 @@ rubric. Each trial launches a fresh sandbox, captures the agent transcript,
 evaluates the produced workspace in a second clean pod, and persists metrics for
 comparison across runs.
 
-Inspired by the good parts of Terminal-Bench/Harbor (task-as-directory format,
-sandbox-per-run), SWE-bench (pass/fail grounded in executable tests, pass@k),
-and OpenHands (pluggable agent adapters, transcript-derived cost metrics).
+Inspired by [Harbor](https://github.com/harbor-framework/harbor/tree/d8c3140be1a0d7f4d2cb164fc7011dce40d3f0d8)
+and [Terminal-Bench](https://github.com/harbor-framework/terminal-bench/tree/d28711d0da2675d0bb1d56de45ae5df6082438a3)
+(task-as-directory format and sandbox-per-run),
+[SWE-bench](https://github.com/princeton-nlp/SWE-bench/tree/f7bbbb2ccdf479001d6467c9e34af59e44a840f9)
+(executable pass/fail evidence and pass@k), and
+[OpenHands](https://github.com/OpenHands/OpenHands/tree/5f9906fbdac3b30af7afa582af8845064dd43fc6)
+(pluggable agent adapters and transcript-derived metrics). The links pin the
+upstream revisions reviewed on July 14, 2026.
 
 ## Highlights
 
@@ -37,6 +42,13 @@ and OpenHands (pluggable agent adapters, transcript-derived cost metrics).
 - Produces an explicit `accepted`, `rejected`, or `infra_error` outcome from a
   fail-closed, task-level evidence policy. Correctness and acceptance are kept
   separate so a test pass cannot hide a missing scanner or budget violation.
+- Optionally admits runs through a strict, versioned governance request and
+  policy before the cluster, credentials, or model are touched. Admission
+  checks the tenant, project, task, network mode, data and retention classes,
+  timeouts, trials, budgets, and one exact approved adapter/model registration.
+- Gives each governed run a content-minimized, hash-chained lifecycle audit with
+  trace correlation. The local chain is tamper-evident, not signed or
+  independently authenticated.
 - Provides pluggable adapters for Claude Code and OpenAI Codex CLI.
 - Scores any review agent's JSON output against gold-labeled findings with
   precision, recall, F1, blocker/major recall, false-positive rate, clean-PR
@@ -60,9 +72,13 @@ and OpenHands (pluggable agent adapters, transcript-derived cost metrics).
   cleanup.
 - For runs with complete provenance, writes a canonical, unsigned in-toto
   Statement v1-shaped attestation binding task inputs, image digest, Git state,
-  models, tools, outcomes, and artifact hashes. `verify-run` recomputes artifact,
-  task-tree, and exact harness Git evidence; it does not live-recheck the
-  recorded model, tool, image, or outcome.
+  models, tools, outcomes, governance evidence, and artifact hashes.
+  `verify-run` hashes every subject through no-follow file-descriptor reads,
+  then parses digest-matching byte snapshots of semantic artifacts. It
+  cross-checks task, image, harness, agent and judge identity, governance, and
+  audit evidence across the unsigned statement, `results.json`, SQLite, and
+  policy replay, and recomputes the terminal outcome. It does not rerun
+  providers, tools, pods, images, or external registries.
 - Caps combined stdout and stderr captured from each sandbox shell command at
   16 MiB and records cap breaches as infrastructure errors instead of buffering
   without a bound.
@@ -88,9 +104,23 @@ merge. This project supplies the independent measurement and enforcement layer.
 
 Each trial runs a pipeline:
 
-1. **Agent phase** — a non-root pod is created from the
-   environment-build-context-addressed
-   image. The starter workspace is copied to an ephemeral volume, while hidden
+For a governed run, a side-effect-free preflight happens first. The CLI requires
+both `--governance-request` and `--governance-policy`, validates their exact
+schemas, and compares the requested task, adapter, and exact model with the
+runtime values. A denial stops before cluster setup, image work, credential
+loading, or a model call. An allowed preflight supplies the strictest applicable
+token and cost ceilings. The harness then force-builds once from a private copy
+of the admitted task, creates a distinct execution decision bound to the
+resulting single-platform manifest digest, a content-derived run reference, and
+the explicit Linux platform. That final decision is cryptographically linked to
+the preflight. Only then may the harness create the cluster or import that exact
+image. Every trial reuses the same decision and three-part image identity. The
+execution decision starts the correlated local audit chain before any
+credential loading or model call.
+
+1. **Agent phase** — a non-root pod is created from the ordinary
+   environment-context-addressed image or the governed content-derived image.
+   The starter workspace is copied to an ephemeral volume, while hidden
    tests remain absent. The selected adapter receives a unique per-trial
    credential Secret. In proxy mode its NetworkPolicy permits only the proxy's
    ClusterIP and port, with no direct DNS or Internet path; the proxy resolves
@@ -108,13 +138,15 @@ Each trial runs a pipeline:
    this is phase isolation rather than a separate grader trust boundary.
 4. **Scan phase** — host-side ruff, semgrep, gitleaks, and trivy inspect the
    produced workspace. Missing or failed tools remain explicit; a task that
-   requires that evidence rejects fail-closed.
-5. **Judge phase** — the automatically selected Claude or Codex backend scores
-   the diff against the task prompt on the task's rubric (spec adherence,
-   maintainability, test quality). The model receives only the prompt, rubric
-   dimensions, and diff. Before that call, gitleaks screens a temporary copy of
-   the produced workspace plus the exact diff, task text, and dimension names;
-   it must complete successfully with zero detected secrets.
+   requires that evidence is rejected when it is missing.
+5. **Judge phase** — when enabled, a task-pinned backend/model pair takes
+   precedence; ordinary unpinned tasks may auto-select Claude or Codex.
+   Governed judging requires the exact task pin and approved
+   `judge:<backend>` registry identity. The judge scores the diff against the
+   task prompt on its rubric (spec adherence, maintainability, test quality).
+   Before that call, gitleaks screens a temporary copy of the produced
+   workspace plus the exact diff, task text, and dimension names; it must
+   complete successfully with zero detected secrets.
 6. **Outcome** — the task's acceptance policy evaluates correctness, coverage,
    required scanner availability, findings, judge completeness, time, tokens,
    cost, and any adversarial challenge assertions. Missing configured evidence
@@ -158,13 +190,32 @@ from a `Dockerfile`, a script of steps like "start from python:3.12, install
 pytest, copy these files in". Reusing one built image digest gives each trial
 the same filesystem. In this repo, each task's
 `environment/Dockerfile` bakes the language toolchain, the agent CLIs, and
-the starter workspace into one image. The harness records the resulting digest
-and uses an `environment/` build-context hash in its tag, so cross-machine
-rebuild differences are visible in recorded evidence. A node preflight checks
-that every running k3d server and worker resolves the tag to the same image ID as
-the host. Pods must also report that host digest at runtime. A full agent trial
-records both phases and treats any host/agent/eval mismatch as infrastructure.
-An eval-only run promotes the verified eval pod digest to primary provenance.
+the starter workspace into one image.
+
+An ordinary run uses an `environment/` build-context hash in its tag. It records
+the Docker image ID and checks that every running k3d server and worker resolves
+the tag to that same ID before scheduling.
+
+A governed run uses a stricter identity. It invokes BuildKit for exactly one
+Docker-server Linux platform, loads the result, and reads the OCI/Docker
+**manifest** descriptor from the build metadata. It rejects a multi-platform
+index and a configuration digest because neither identifies the one runnable
+platform image admitted by policy. It then derives the permanent local
+reference from the full manifest digest, for example
+`agent-eval/example-todo-api:governed-<64 hex characters>`, and removes the
+random build reference. The final decision binds all three values:
+
+```text
+content-derived reference + single-platform manifest digest + Linux platform
+```
+
+The harness imports that exact reference into every k3d node. Governed agent
+and evaluator pods use `imagePullPolicy: Never`, so a missing local image fails
+instead of falling back to a registry. After each pod starts, the harness asks
+the node runtime which repository manifest backs the container's configuration
+ID and compares it with the admitted manifest. Any host, node, agent, or
+evaluator mismatch becomes infrastructure evidence. An eval-only run promotes
+the verified evaluator-pod image ID to primary provenance.
 
 Both checked-in tasks pin the Python base-image digest, direct Python package
 versions, Claude Code 2.1.208, and Codex 0.144.4. The two CLI downloads have
@@ -226,7 +277,7 @@ so `kubectl` and these pod specs do not need a special local-cluster dialect.
 
 **k3d** goes one step further: it runs k3s *inside Docker containers*. Each
 "node" of your cluster is just a Docker container running the k3s binary. So
-the full stack on this Mac is:
+the full stack on a Mac is:
 
 ```
 macOS
@@ -239,19 +290,25 @@ macOS
 Why bother with the middle layers instead of plain `docker run`? Because the
 declarative API gives you `wait --for=condition=Ready`, `activeDeadlineSeconds`,
 labels, NetworkPolicy, and namespaced cleanup for free. The current image build
-and import path is intentionally k3d-specific; remote-cluster scheduling would
-need a registry-backed image path and explicit concurrency controls.
+and import path is intentionally k3d-specific. Production remote-cluster
+scheduling would need a trusted registry, immutable manifest promotion,
+admission checks, garbage collection, and explicit concurrency controls.
 
 One consequence of nodes-in-Docker: the cluster has its **own image store**
 (containerd inside the node containers), separate from your host Docker
 daemon. An image you `docker build` on the host is invisible to the cluster
-until you copy it across with `k3d image import`. That is exactly what
-`build_and_import_image()` in `src/agent_eval/cluster.py` does after a build.
-For a reused host image, the harness skips import only when every running server
-and worker resolves the tag to the host image ID; otherwise it imports and
-verifies the image before scheduling. Pods use `imagePullPolicy: IfNotPresent`,
-which uses the node-local image when present but may try a registry pull when it is absent.
-`IfNotPresent` is not a no-network guarantee.
+until you copy it across with `k3d image import`. The ordinary local path uses
+`build_and_import_image()` in `src/agent_eval/cluster.py`. The governed path
+separates the host build from import so it can create the digest-bound execution
+decision between those two operations.
+For a reused ordinary image, the harness skips import only when every running
+server and worker resolves the tag to the host image ID; otherwise it imports
+and verifies the image before scheduling. Ordinary agent and evaluator sandbox
+pods use `imagePullPolicy: IfNotPresent`, which may try a registry when the
+image is absent and is therefore not a no-network guarantee. Governed agent and
+evaluator sandboxes use `Never` after the harness verifies that every node
+already has the admitted manifest. The per-trial proxy still uses
+`IfNotPresent` with its digest-pinned image.
 
 ### Layer 4: how the harness actually drives the cluster
 
@@ -335,14 +392,18 @@ complete hostile-code boundary.
 Tying it together, `run_agent_trial()` in `src/agent_eval/runner.py` is this
 sequence:
 
-1. Reuse a local environment-context-addressed image or `docker build` it. Skip
-   import only when every running k3d server and worker resolves its tag to the
-   host image ID; otherwise run `k3d image import` and verify every node before
-   scheduling.
+1. For an ordinary run, reuse a local environment-context-addressed image or
+   `docker build` it. For a governed run, validate preflight, copy the admitted
+   task privately, build one Linux manifest, create the linked execution
+   decision for its content reference, manifest digest, and platform, then
+   import and verify that identity on every node. Skip ordinary-run import only
+   when every running k3d server and worker resolves its tag to the host image
+   ID.
 2. Create a per-trial credential Secret and, in proxy mode, an allowlisted
    proxy; then apply an **agent pod** spec (sleep-infinity, non-root, read-only
    root filesystem, resource bounds, deadline = agent timeout + 900s grace) and
-   wait for readiness.
+   wait for readiness. Governed agent pods require the pre-imported image with
+   pull policy `Never`.
 3. tar-pipe the starter workspace and prompt in; execute the agent CLI headless,
    capturing stdout as a JSONL transcript. Tokens, turns, model identity, and
    cost come from adapter parsing and stay `null` when the transcript does not
@@ -352,8 +413,9 @@ sequence:
    an infrastructure error and can leave the old pod until manual cleanup.
 5. Apply a network-isolated **eval pod**; tar-pipe in the produced workspace and
    hidden tests; execute the task's test command; tar-pipe `/results`
-   (junit XML, coverage) back out; then make up to two deletion attempts. A final
-   deletion failure changes the result to infrastructure error.
+   (junit XML, coverage) back out; then make up to two deletion attempts.
+   Governed evaluator pods also require the pre-imported image with pull policy
+   `Never`. A final deletion failure changes the result to infrastructure error.
 6. Host-side: diff vs. starter, scanners, LLM judge, challenge assertions,
    acceptance outcome, persistence, and local provenance attestation. These
    host processes and their outbound calls are outside pod NetworkPolicy.
@@ -599,6 +661,127 @@ uv run agent-eval report --task example-todo-api
 uv run agent-eval verify-run --run <run-id>
 ```
 
+### Governed run
+
+The checked-in [request](examples/governance/request.yaml) and
+[policy](examples/governance/policy.yaml) form one runnable governance example:
+
+```sh
+uv run agent-eval run --task example-todo-api --agent claude-code \
+  --model claude-sonnet-4-5-20250929 --trials 1 --gate \
+  --governance-request examples/governance/request.yaml \
+  --governance-policy examples/governance/policy.yaml
+```
+
+Anthropic's official model-lifecycle table listed the pinned
+`claude-sonnet-4-5-20250929` ID as active on July 14, 2026, with tentative
+retirement not sooner than September 29, 2026. Recheck the
+[current lifecycle table](https://platform.claude.com/docs/en/about-claude/model-deprecations)
+before using the example as a long-lived policy.
+
+Both governance flags are required together. Unknown or duplicate YAML keys
+fail validation. The request names one tenant, project, task, adapter, and exact
+model plus its data classification, retention class, and optional budget
+ceilings. The policy supplies allowlists, runtime ceilings, broker and network
+requirements, approved proxy-domain suffixes, exact digest-pinned proxy images,
+required scanner and judge phases, and an exact registry for both coding and
+judge models. The task pins the judge backend and model as one pair. Models are
+never matched by a prefix or wildcard. Enabling a governed judge also requires
+the scan phase because gitleaks must screen its outbound input.
+Data classes are `public`, `internal`, `confidential`, or
+`restricted`; retention classes are `ephemeral`, `standard`, or `regulated`;
+network modes are `proxy` or `open`; and registry status is `approved`,
+`deprecated`, or `blocked`. Empty allowlists deny everything.
+
+The coding model is checked twice: before execution against the exact registry
+entry, and afterward against identity reported by the adapter's event stream.
+Claude Code supplies that identity in its initialization event. The checked-in
+Codex 0.144.4 `exec --json` event schema does not expose the runtime model, so a
+governed Codex coding trial currently fails closed with missing model evidence.
+The judge is independently admitted through a `judge:<backend>` registry entry,
+and the observed Anthropic response model must exactly match the task pin.
+Governed Codex judging is denied until its runtime model can be observed rather
+than inferred from the requested command. A missing or different identity
+becomes infrastructure evidence instead of silently accepting provider
+fallback.
+
+The preflight runs before cluster setup, image work, credential loading, or a
+model call. Invalid governance configuration exits with code 2. A preflight
+denial exits with code 3 after preserving request, bundle, and decision evidence
+under `runs/admissions/`, and creates no trial run. An allowed preflight records
+the task-tree and normalized execution-specification digests, including whether
+scanners and the judge are enabled. The runner copies that exact task into a
+private build snapshot, verifies both digests, and force-builds it without
+trusting a same-tag entry. A separate execution decision binds the
+content-derived reference, single-platform manifest digest, Linux platform,
+preflight decision ID, and preflight digest. Continuity validation requires
+every other admitted input to remain exactly equal after schema normalization.
+Only after that final decision may the harness create the cluster or
+import the image. Each trial gets another verified private snapshot, and every
+agent, test, diff, judge, and attestation input comes from it. It is rehashed
+before the terminal outcome and removed after persistence. Effective token and
+cost limits are the minimum of the policy, request, and registered coding-model
+limits; the runtime then applies any stricter task acceptance limit. With the
+example files, those calculations are:
+
+```text
+tokens: min(policy 100000, request 60000, model 80000) = 60000
+cost:   min(policy $5.00, request $2.50, model $3.00)   = $2.50
+```
+
+These are per-trial outcome gates over coding-agent usage the adapter actually
+reports. Judge token and cost usage is not yet included, the gates do not
+interrupt an in-flight provider generation, and they do not reserve one
+aggregate budget across multiple trials. A production control plane would need
+provider limits plus an atomic ledger covering both agent and judge spend.
+Missing required coding-agent token or cost evidence causes a fail-closed
+rejection. Judge registry entries intentionally express identity and data-class
+approval without unenforceable local spend fields. `data_classification` and
+`retention_class` are
+validated and recorded policy labels; this local harness does not itself
+encrypt data, delete it on a retention schedule, or enforce a remote data-loss
+prevention system. Tenant, project, and actor are assertions supplied by the
+request, and `asserted_actor` is recorded with identity assurance
+`asserted-unverified`. A trusted gateway would need to authenticate the caller
+and bind all three values to that identity.
+Because the v1 policy always has a cost ceiling, the current Codex subscription
+stream cannot produce an accepted governed run until a trusted accounting
+integration supplies per-trial cost evidence; the checked-in example uses
+Claude Code, whose stream reports cost.
+
+Every allowed governed run writes `governance-request.json`,
+`policy-bundle.json`, `preflight-decision.json`, the final digest-bound
+`policy-decision.json`, and a content-minimized `audit.jsonl` under its run
+directory. Verification replays both decisions from that exact policy and
+registry snapshot and checks their cryptographic link. Lifecycle events carry
+IDs, statuses, counts, digests, and timing, not prompts, completions,
+transcripts, stdout, stderr, credentials, or source content. Each event hashes
+the previous event, and the run records one trace ID, event count, and final
+hash:
+
+```sh
+uv run agent-eval audit verify --run <run-id>
+uv run agent-eval verify-run --run <run-id>
+```
+
+The first command checks audit schema, ordering, correlation, canonical JSON,
+and the full hash chain from one bounded byte snapshot. The second verifies
+attested subject hashes, rereads semantic artifacts into bounded byte snapshots,
+and parses each only after its SHA-256 matches the attested digest. It
+cross-checks model, judge, image, task, harness, governance, audit, and event
+semantics against SQLite, replays both policy decisions, and recomputes the
+outcome from recorded evidence and effective acceptance rules. This catches
+replacement between subject verification and semantic parsing, but is not a
+general concurrent-filesystem snapshot. It does not provide authentication, a
+signature, trusted time, WORM storage,
+exactly-once request processing, or protection from a privileged user who
+rewrites the entire chain and unsigned bundle. The idempotency key is evidence
+for a future control plane, not a uniqueness lock in this local CLI.
+
+The sample policy leaves `require_broker_credentials` false so it can be used
+locally. For a production gate, set it to true and configure
+`AGENT_EVAL_CREDENTIAL_COMMAND` to mint scoped, expiring trial credentials.
+
 Agent adapters: `claude-code` and `codex`. The fallback credential source is
 `ANTHROPIC_API_KEY` for Claude Code or `~/.codex/auth.json` for Codex. The value
 is staged through a unique per-trial Kubernetes Secret, then deletion gets up
@@ -630,6 +813,13 @@ the agent pod can connect only to the Squid pod on port 3128 and has no direct
 DNS path; Squid resolves and applies explicit provider DNS suffixes. `open` is
 an explicit compatibility opt-out. Host-side scanners and model calls are not
 governed by these policies.
+
+The governed preflight assumes the allowed task catalog is trusted: its
+`Dockerfile` is still built by the host Docker daemon. The private snapshot and
+digest binding prevent tag-cache substitution, but they do not make an
+untrusted Docker build harmless or reproducible. A production service should
+build untrusted task definitions in an isolated, hermetic builder and promote
+the resulting signed digest through a trusted image registry.
 
 This is still not a hostile-code-proof grader. The trusted pytest bootstrap
 protects runner startup from common workspace shadowing, but submitted code and
@@ -670,15 +860,18 @@ egress. This prevents a single attractive score from hiding missing evidence.
 | Correctness | hidden tests passed/total, resolved, pass@k across trials, coverage |
 | Efficiency  | wall time, input/output tokens, cost USD, turns, tool calls; transcript-derived fields may be `null` |
 | Quality     | lint errors, semgrep findings by severity, secrets, dep vulns, diff size |
-| Judge       | 1-5 per rubric dimension + weighted score + rationale |
+| Judge       | backend, observed model, 1-5 per rubric dimension, weighted score, rationale |
 | Assurance   | challenge checks, scanner availability/error state, credential mode, proxy violations |
+| Governance  | decision/reason codes, asserted tenant/project/actor, data/retention classes, exact registry match, effective limits, policy/request/registry digests |
 | Outcome     | accepted/rejected/infra_error, every check, observed value, requirement, reasons |
-| Provenance  | task manifest and full task-tree hash, harness Git state, runtime image digest, nullable tool/model identities, artifact hashes |
+| Provenance  | task manifest and full task-tree hash, harness Git state, image reference/manifest/platform evidence, nullable tool/model identities, audit trace/final hash, artifact hashes |
 
 Claude Code's stream can provide tokens, turns, and total cost. Codex JSONL can
 provide tokens, turns, and tool calls, but subscription usage has no per-request
 price in that stream, so Codex `cost_usd` remains `null` rather than being
-estimated.
+estimated. The checked-in Codex JSONL schema also lacks runtime model identity,
+which is preserved as unknown and makes an exact-identity governed run fail
+closed.
 
 `compare` groups coding runs by adapter and recorded model. It reports sample
 size, resolved rate with Wilson 95% intervals, pass@k, infrastructure-failure
@@ -698,7 +891,7 @@ passed.
 
 ## Enterprise assurance implemented
 
-Six enterprise assurance paths are implemented and testable:
+Seven enterprise assurance paths are implemented and testable:
 
 1. `benchmarks/reviewer-corpus/v1` contains faulty and clean PR fixtures, exact
    gold labels, SHA-256-bound artifacts, executable base/head reproducers, two
@@ -709,14 +902,19 @@ Six enterprise assurance paths are implemented and testable:
    the fixtures.
 2. A coding-agent run with complete provenance writes an unsigned in-toto
    Statement v1-shaped `attestation.json` plus a digest sidecar. `verify-run`
-   verifies canonical statement bytes, the sidecar, the complete run-artifact
-   set, task manifest and full task tree, and the exact current harness commit
-   plus staged and unstaged binary diffs and non-ignored untracked file content,
-   modes, and symlink targets. It validates the recorded
-   image/model/tool/outcome field shapes but does not reproduce or live-recheck
-   those facts. This is local integrity, not signer identity,
-   trusted time, remote transparency, or SLSA compliance. Anyone able to rewrite
-   both the unsigned statement and its sidecar can fabricate a new bundle.
+   verifies canonical statement bytes, the sidecar, and the complete
+   run-artifact set through no-follow file-descriptor reads. Semantic artifacts
+   are reread into bounded, digest-checked snapshots before parsing. It verifies
+   the governed audit chain when present, task manifest and full task tree, and
+   the exact current harness commit plus staged and unstaged binary diffs and
+   non-ignored untracked file content, modes, and symlink targets. It then
+   requires recorded governance, audit, image, model, judge, tool, and outcome
+   values to agree semantically across the attestation, JSON result, SQLite row,
+   policy replay, and local task/harness evidence, then recomputes the terminal
+   outcome. It does not rerun providers, tools, or images. This is local
+   integrity, not signer identity, trusted time, remote transparency, or SLSA
+   compliance. Anyone able to rewrite both the unsigned statement and its
+   sidecar can fabricate a new bundle.
 3. `tasks/owasp-agentic-safety` covers poisoned repository instructions, hidden
    test discovery, grader tampering, disallowed egress, tool misuse, and resource
    exhaustion with typed, item-level challenge outcomes.
@@ -735,6 +933,16 @@ Six enterprise assurance paths are implemented and testable:
    configurable fail-closed scanner gates, secret-screened external model calls,
    evidence-verified findings, and SARIF output. Confirmed blocker/major findings
    and high-risk deterministic evidence fail the CI-friendly review command.
+7. Optional governed runs validate a versioned request and policy before any
+   cluster, credential, or model action. Admission always requires an exact
+   approved coding-agent identity and, when judging is enabled, an exact
+   approved judge identity. It enforces allowlists, classifications,
+   retention labels, broker/network rules, timeouts, trials, and per-trial
+   coding-agent budget outcome gates. The final decision also binds the
+   content-derived reference, platform manifest digest, and Linux platform.
+   Allowed runs persist the request, both linked decisions, digests, and a
+   content-minimized trace-correlated audit hash chain, all bound into the
+   unsigned attestation.
 
 The checked-in GitHub Actions job pins action revisions and uv, then runs lint,
 unit tests, corpus validation, and the fixture reviewer experiment. It does not
@@ -750,7 +958,64 @@ identity only after the unsigned verifier is stable; snapshot apt repositories
 and lock transitive Python dependencies; and replace mutable Semgrep registry,
 Gitleaks, Trivy binary, and vulnerability-database inputs with immutable ones.
 
-Design references: [NIST AI 800-2 draft evaluation guidance](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.800-2.ipd.pdf),
+### Research and design influences
+
+The July 14, 2026 design review adapted patterns rather than copying
+implementations:
+
+- The pinned [Harbor](https://github.com/harbor-framework/harbor/tree/d8c3140be1a0d7f4d2cb164fc7011dce40d3f0d8),
+  [Terminal-Bench](https://github.com/harbor-framework/terminal-bench/tree/d28711d0da2675d0bb1d56de45ae5df6082438a3),
+  [SWE-bench](https://github.com/princeton-nlp/SWE-bench/tree/f7bbbb2ccdf479001d6467c9e34af59e44a840f9),
+  and [OpenHands](https://github.com/OpenHands/OpenHands/tree/5f9906fbdac3b30af7afa582af8845064dd43fc6)
+  revisions informed task packaging, per-run isolation, executable outcomes,
+  repeated trials, and adapter boundaries.
+- [Inspect AI](https://github.com/UKGovernmentBEIS/inspect_ai) informed the
+  emphasis on typed, versioned evaluation records and inspectable lifecycle
+  evidence.
+- [OpenAI Agents SDK tracing](https://github.com/openai/openai-agents-python/blob/main/docs/tracing.md),
+  [OPA decision logs](https://www.openpolicyagent.org/docs/management-decision-logs),
+  and [OpenTelemetry semantic conventions](https://opentelemetry.io/docs/specs/semconv/)
+  informed trace/span correlation, policy revision and decision evidence,
+  content minimization, and the future exporter boundary. This repository does
+  not claim OpenTelemetry or OPA wire compatibility.
+- [Sigstore blob signing](https://docs.sigstore.dev/cosign/signing/signing_with_blobs/)
+  is the intended upgrade path from local tamper evidence to independently
+  verifiable signatures. Signing is not implemented here.
+- The [in-toto Statement v1 specification](https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md)
+  defines digest-bound subjects. This project uses that statement shape but no
+  authenticated envelope, so it claims local integrity only.
+- Anthropic's [Messages API reference](https://platform.claude.com/docs/en/api/messages/create)
+  exposes the model that completed a response. Governed Claude judging compares
+  that observed response field with the exact admitted judge identity.
+- [NIST AI 800-3](https://www.nist.gov/publications/expanding-ai-evaluation-toolbox-statistical-models)
+  reinforces separating scores on a fixed benchmark from uncertainty and
+  claims about generalized performance.
+- [OpenAI's coding-evaluation audit](https://openai.com/index/separating-signal-from-noise-coding-evaluations/)
+  and [Anthropic's infrastructure-noise analysis](https://www.anthropic.com/engineering/infrastructure-noise)
+  reinforce benchmark hygiene, reproducible environments, and keeping
+  infrastructure failures separate from agent correctness.
+- Anthropic's [sabotage evaluations](https://www.anthropic.com/research/sabotage-evaluations)
+  and [overt-saboteur auditing work](https://alignment.anthropic.com/2026/auditing-overt-saboteur/)
+  informed the adversarial challenge and trace-auditing direction. The current
+  local controls are not a complete frontier-model control protocol.
+- Docker's [Buildx build reference](https://docs.docker.com/reference/cli/docker/buildx/build/)
+  documents single-platform `--load`, explicit `--platform`, and the manifest
+  descriptor written by `--metadata-file`; Docker's
+  [digest guide](https://docs.docker.com/dhi/core-concepts/digests/) distinguishes
+  a multi-platform index from each platform manifest. Those primitives informed
+  the governed three-part image identity.
+- Kubernetes' [image documentation](https://kubernetes.io/docs/concepts/containers/images/)
+  defines `Never` as exclusively using a local image and notes that every node
+  must have the same pre-pulled image. This informed the import-before-schedule
+  and all-node manifest checks.
+- The checked-in Codex version's official
+  [`exec --json` event types](https://github.com/openai/codex/blob/rust-v0.144.4/codex-rs/exec/src/exec_events.rs)
+  expose usage and lifecycle events but no runtime model field. That verified
+  limitation is why governed Codex model identity currently fails closed rather
+  than trusting the requested `-m` argument.
+
+Additional security and interoperability references:
+[NIST AI 800-2 draft evaluation guidance](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.800-2.ipd.pdf),
 [OWASP Top 10 for Agentic Applications 2026](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/),
 [Kubernetes Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/),
 [SLSA 1.2](https://slsa.dev/spec/v1.2/), and
@@ -774,6 +1039,43 @@ Think of this project as three related quality-control machines:
 The shared idea is simple: **do not trust a confident answer when you can ask
 for evidence and measure it.**
 
+### A governed run in one picture
+
+```mermaid
+flowchart LR
+    A["Request: who, task, model, limits"] --> B{"Preflight policy allows it?"}
+    B -->|No| C["Stop before build or cluster"]
+    B -->|Yes| D["Copy task; build and lock one Linux image"]
+    D --> E["Import exact image; sandboxes never pull"]
+    E --> F["Agent pod edits code"]
+    F --> G["Capture workspace; delete agent pod"]
+    G --> H["Fresh evaluator pod runs hidden tests"]
+    H --> I["Scanners and approved judge add evidence"]
+    I --> J["Outcome + minimized audit + unsigned attestation"]
+```
+
+In the example, the request asks to run `example-todo-api` with one exact
+Claude model for internal data. The two decisions answer seven simple questions
+before allowing execution:
+
+1. Are the asserted tenant, project, and task allowed?
+2. Does the runtime task, agent, and exact coding model match the request?
+3. Are both the coding adapter/model and judge backend/model registered as
+   `approved` for `internal` data?
+4. Are the top-level data class, retention label, broker state, proxy-domain
+   suffixes, and digest-pinned proxy image allowed?
+5. Are the trial count, timeouts, scanner phase, and judge phase allowed?
+6. Did the private build produce one reference, one platform manifest digest,
+   and one Linux platform linked to the preflight?
+7. What are the lowest token and cost ceilings across policy, request, and
+   coding model, before applying any stricter task contract?
+
+The tenant, project, and actor values are only what the request claims. This CLI
+does not authenticate them. The audit is intentionally content-minimized: its
+closed event schema records that stages started or completed, their status and
+small measurements, and cryptographic links between events. It does not
+duplicate the prompt, source, transcript, or command output.
+
 ### Machine 1: give a coding agent an exam
 
 Imagine the task says:
@@ -782,20 +1084,26 @@ Imagine the task says:
 
 The harness does this:
 
-1. It creates a temporary Kubernetes pod containing the starter project.
-2. Claude Code or Codex reads the prompt and edits the project inside that pod.
-3. The harness saves the resulting workspace, transcript, time, and whatever
+1. If governance files were supplied, a preflight admits or denies the exact
+   request before image work or cluster setup.
+2. After an allowed preflight, it privately builds once, binds the image
+   reference, platform manifest digest, and Linux platform into a final
+   decision, and only then prepares the cluster.
+3. It creates a temporary Kubernetes pod containing the starter project.
+4. Claude Code or Codex reads the prompt and edits the project inside that pod.
+5. The harness saves the resulting workspace, transcript, time, and whatever
    token, cost, turn, tool-use, and model metadata the adapter actually exposes.
-4. It makes up to two attempts to delete the agent pod. A final cleanup failure becomes
-   infrastructure evidence before a fresh evaluation pod starts.
-5. It copies in the produced code and hidden tests, then runs the test command.
-6. It also runs security and quality scanners and records all results.
-7. It converts the evidence into an explicit acceptance outcome. Passing tests
+6. It makes up to two attempts to delete the agent pod. A final cleanup failure
+   becomes infrastructure evidence before a fresh evaluation pod starts.
+7. It copies in the produced code and hidden tests, then runs the test command.
+8. It also runs security and quality scanners and records all results.
+9. It converts the evidence into an explicit acceptance outcome. Passing tests
    alone are not enough when a configured scanner, budget, or challenge fails.
-8. It saves an itemized scorecard and, when provenance is complete, an unsigned
-   attestation. The verifier can later detect run-artifact, task-tree, or exact
-   harness Git-state changes. It does not rerun the model, tools, image, or
-   outcome decision.
+10. It saves an itemized scorecard and, when provenance is complete, an unsigned
+   attestation. A governed run also saves its decision and tamper-evident audit
+   chain. The verifier can later detect run-artifact, task-tree, exact harness
+   Git-state, audit-chain, or cross-record semantic changes and recomputes the
+   outcome from saved evidence. It does not rerun the model, tools, or image.
 
 Why use a fresh second pod? Suppose the agent changed an installed test tool or
 left a background process running. Those agent-phase changes disappear with the
@@ -812,6 +1120,26 @@ raise the bar, but protected out-of-process grading remains the stronger future
 boundary.
 
 ### How to read a coding-agent result
+
+The evaluator keeps four kinds of evidence separate:
+
+- **Correctness:** hidden-test command exit, passed/failed/error counts, and
+  coverage.
+- **Safety and quality:** required scanner availability and findings plus typed
+  adversarial challenges.
+- **Efficiency:** wall time, input/output tokens, cost, turns, tool calls, and
+  diff size when the adapter reports them.
+- **Qualitative review:** a weighted judge score and rationale. The numeric
+  score gates task acceptance only when `min_judge_score` is configured.
+  Separately, governed judging requires a complete score from the approved
+  backend and exact observed model; missing or mismatched identity is an
+  infrastructure error.
+
+Each configured acceptance rule becomes an itemized pass/fail check. Missing
+evidence never turns into a zero or a clean scan, and a required missing value
+fails closed. Missing task-acceptance evidence produces a rejection. Missing
+governed identity, image, audit, or required judge-observation evidence produces
+an infrastructure error because the harness cannot prove what executed.
 
 The words are intentionally separate:
 
@@ -951,6 +1279,8 @@ are ephemeral volumes, and the sandbox UID is non-root.
 | `review_benchmark.py` | gold-label matching and reviewer metrics |
 | `review_experiment.py` | repeated single/panel trials, budgets, pairing, and stability |
 | `outcome.py` | fail-closed task acceptance contract |
+| `governance.py` | strict request/policy schemas, exact model admission, limits, and decision evidence |
+| `audit.py` | content-minimized lifecycle events and local hash-chain verification |
 | `assurance.py` | adversarial challenge assertions and item-level evidence |
 | `credentials.py` | adapter-scoped fallback or broker-minted trial credentials |
 | `attestation.py` | canonical local provenance creation and verification |
@@ -989,6 +1319,10 @@ tasks/<task-id>/
 ```
 
 Conventions:
+- `<task-id>` and the matching `task.yaml` `id` must be the same lowercase
+  DNS-style label: letters, digits, and internal hyphens only, with at most 63
+  characters. This keeps task paths, image tags, and policy matching
+  unambiguous.
 - `test_command` runs with cwd `/workspace`; hidden tests are at `/tests`; write
   junit XML to `/results/junit.xml` and (optionally) pytest-cov JSON to
   `/results/coverage.json`. Ordinary `pytest` or `python -m pytest` commands are
@@ -1035,12 +1369,17 @@ on stdout, plus a transcript parser producing `AgentMetrics`. Register it in
 ## Configuration
 
 - `AGENT_EVAL_JUDGE` — judge backend: `claude`, `codex`, or `auto` (default).
-  Auto selects Claude when `ANTHROPIC_API_KEY` is set; otherwise it selects
+  For an ordinary task without a judge pin, auto selects Claude when
+  `ANTHROPIC_API_KEY` is set; otherwise it selects
   Codex only when the `codex` binary exists and either `OPENAI_API_KEY` or a
   Codex auth file is present. With neither, model judging/review is skipped.
-- `AGENT_EVAL_JUDGE_MODEL` — judge model override (claude backend defaults to
-  `claude-sonnet-5`; codex backend uses your codex default unless this is set
-  to a non-claude model)
+  A task-level `judge.backend` and `judge.model` pair takes precedence.
+- `AGENT_EVAL_JUDGE_MODEL` — judge model override for tasks without a pinned
+  judge identity. The Claude backend defaults to
+  `claude-sonnet-4-5-20250929`; Codex uses its configured default unless this is
+  set to a non-Claude model. Governed runs require a task-pinned exact judge
+  identity and matching approved `judge:<backend>` registry entry. Governed
+  Codex judging is denied until the runtime model is observable.
 - `--model` on `run` — model override passed to the coding agent
 - `AGENT_EVAL_CREDENTIAL_COMMAND` — argv-style broker command invoked once per
   trial with `AGENT_EVAL_AGENT` set. Its stdout schema is:

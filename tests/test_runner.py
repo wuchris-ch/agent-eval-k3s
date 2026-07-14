@@ -195,6 +195,176 @@ def test_cluster_image_check_requires_image_on_every_running_node(monkeypatch):
     assert not runner._cluster_has_image("example:tag", IMAGE_DIGEST)
 
 
+def test_cluster_manifest_check_uses_repo_digest_not_config_id(monkeypatch):
+    nodes = {
+        "name": "agent-eval",
+        "nodes": [
+            {
+                "name": "k3d-agent-eval-server-0",
+                "role": "server",
+                "State": {"Running": True},
+            },
+            {
+                "name": "k3d-agent-eval-agent-0",
+                "role": "agent",
+                "State": {"Running": True},
+            },
+        ],
+    }
+    config_digest = "sha256:" + "c" * 64
+    manifest_by_node = {
+        "k3d-agent-eval-server-0": IMAGE_DIGEST,
+        "k3d-agent-eval-agent-0": IMAGE_DIGEST,
+    }
+
+    def fake_run(command, **kwargs):
+        del kwargs
+        if command[:4] == ["k3d", "cluster", "list", "-o"]:
+            return subprocess.CompletedProcess(
+                command, 0, stdout=json.dumps([nodes]), stderr=""
+            )
+        node = command[2]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "status": {
+                        "id": config_digest,
+                        "repoDigests": [
+                            f"docker.io/agent-eval/example@{manifest_by_node[node]}"
+                        ],
+                    }
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+    image_ref = "agent-eval/example:governed-" + "a" * 64
+    assert runner._cluster_has_manifest(image_ref, IMAGE_DIGEST)
+    manifest_by_node["k3d-agent-eval-agent-0"] = "sha256:" + "b" * 64
+    assert not runner._cluster_has_manifest(image_ref, IMAGE_DIGEST)
+
+
+@pytest.mark.parametrize(
+    "media_type, expected",
+    [
+        ("application/vnd.oci.image.manifest.v1+json", IMAGE_DIGEST),
+        ("application/vnd.oci.image.index.v1+json", None),
+        ("application/vnd.oci.image.config.v1+json", None),
+    ],
+)
+def test_local_manifest_digest_rejects_indexes_and_config_ids(
+    monkeypatch, media_type, expected
+):
+    def fake_run(command, **kwargs):
+        del kwargs
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps({"mediaType": media_type, "digest": IMAGE_DIGEST}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+    assert runner._local_manifest_digest("agent-eval/example:tag") == expected
+
+
+def test_governed_build_binds_metadata_manifest_to_content_ref(monkeypatch):
+    task = load_task("example-todo-api")
+    state = {"temporary_ref": None, "tagged": False, "removed": False}
+
+    def fake_build(context_dir, image_ref, *, platform, metadata_file):
+        assert context_dir == str(task.environment_dir)
+        assert platform == "linux/arm64"
+        state["temporary_ref"] = image_ref
+        metadata_file.write_text(
+            json.dumps(
+                {
+                    "containerimage.digest": IMAGE_DIGEST,
+                    "containerimage.descriptor": {
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": IMAGE_DIGEST,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    expected_ref = f"agent-eval/{task.id}:governed-{'a' * 64}"
+
+    def fake_local(image_ref):
+        if image_ref == state["temporary_ref"]:
+            return IMAGE_DIGEST
+        if image_ref == expected_ref and state["tagged"]:
+            return IMAGE_DIGEST
+        return None
+
+    def fake_run(command, **kwargs):
+        del kwargs
+        if command[2] == "tag":
+            assert command[-2:] == [state["temporary_ref"], expected_ref]
+            state["tagged"] = True
+        elif command[2] == "rm":
+            assert command[-1] == state["temporary_ref"]
+            state["removed"] = True
+        else:
+            raise AssertionError(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(runner, "_docker_platform", lambda: "linux/arm64")
+    monkeypatch.setattr(runner, "build_image_with_metadata", fake_build)
+    monkeypatch.setattr(runner, "_local_manifest_digest", fake_local)
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+    built = runner._build_governed_image(task)
+
+    assert built == runner._BuiltImage(expected_ref, IMAGE_DIGEST, "linux/arm64")
+    assert state["temporary_ref"].startswith(f"agent-eval/{task.id}:governed-")
+    assert len(state["temporary_ref"].rpartition("-")[2]) == 32
+    assert state["tagged"] is True
+    assert state["removed"] is True
+
+
+def test_governed_build_rejects_multi_platform_index_metadata(monkeypatch):
+    task = load_task("example-todo-api")
+    cleaned = []
+
+    def fake_build(context_dir, image_ref, *, platform, metadata_file):
+        del context_dir, platform
+        metadata_file.write_text(
+            json.dumps(
+                {
+                    "containerimage.digest": IMAGE_DIGEST,
+                    "containerimage.descriptor": {
+                        "mediaType": "application/vnd.oci.image.index.v1+json",
+                        "digest": IMAGE_DIGEST,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        cleaned.append(image_ref)
+
+    def fake_run(command, **kwargs):
+        del kwargs
+        assert command[:3] == ["docker", "image", "rm"]
+        assert command[-1] == cleaned[0]
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(runner, "_docker_platform", lambda: "linux/amd64")
+    monkeypatch.setattr(runner, "build_image_with_metadata", fake_build)
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+    with pytest.raises(KubeError, match="one platform manifest"):
+        runner._build_governed_image(task)
+
+    assert len(cleaned) == 1
+
+
 @pytest.mark.parametrize("test_exit_code, resolved", [(0, True), (1, False)])
 def test_eval_replaces_workspace_and_requires_test_command_success(
     monkeypatch, tmp_path, test_exit_code, resolved
@@ -337,6 +507,7 @@ def test_agent_deadline_is_persisted_as_infrastructure_evidence(monkeypatch, tmp
         name = "test-agent"
 
     monkeypatch.setattr(metrics, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(runner, "ensure_image", lambda task: None)
     monkeypatch.setattr(runner, "ensure_namespace", lambda: None)
     monkeypatch.setattr(runner, "_image_digest", lambda tag: IMAGE_DIGEST)
     monkeypatch.setattr(runner, "create_sandbox_pod", fake_create)
@@ -379,6 +550,7 @@ def test_agent_timeout_is_an_explicit_failed_outcome(monkeypatch, tmp_path):
         return record
 
     monkeypatch.setattr(metrics, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(runner, "ensure_image", lambda task: None)
     monkeypatch.setattr(runner, "ensure_namespace", lambda: None)
     monkeypatch.setattr(runner, "_image_digest", lambda tag: IMAGE_DIGEST)
     monkeypatch.setattr(runner, "create_sandbox_pod", lambda *args, **kwargs: pod)
@@ -523,6 +695,7 @@ def test_credential_setup_failure_is_persisted_as_infrastructure_outcome(
         name = "codex"
 
     monkeypatch.setattr(metrics, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(runner, "ensure_image", lambda task: None)
     monkeypatch.setattr(runner, "ensure_namespace", lambda: None)
     monkeypatch.setattr(
         runner,
@@ -540,9 +713,7 @@ def test_credential_setup_failure_is_persisted_as_infrastructure_outcome(
     assert (metrics.RUNS_ROOT / "metrics.db").is_file()
 
 
-def test_cleanup_resources_are_independent_when_pod_delete_fails(
-    monkeypatch, tmp_path
-):
+def test_cleanup_resources_are_independent_when_pod_delete_fails(monkeypatch, tmp_path):
     task = load_task("example-todo-api")
     deleted = []
 
@@ -577,6 +748,7 @@ def test_cleanup_resources_are_independent_when_pod_delete_fails(
             raise subprocess.TimeoutExpired("delete", 60)
 
     monkeypatch.setattr(metrics, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(runner, "ensure_image", lambda task: None)
     monkeypatch.setattr(runner, "ensure_namespace", lambda: None)
     monkeypatch.setattr(
         runner,
@@ -587,9 +759,7 @@ def test_cleanup_resources_are_independent_when_pod_delete_fails(
         ),
     )
     monkeypatch.setattr(runner, "create_trial_secret", lambda material: Secret())
-    monkeypatch.setattr(
-        runner, "create_egress_proxy", lambda *args, **kwargs: Proxy()
-    )
+    monkeypatch.setattr(runner, "create_egress_proxy", lambda *args, **kwargs: Proxy())
     monkeypatch.setattr(
         runner, "create_sandbox_pod", lambda *args, **kwargs: FailingPod()
     )

@@ -67,6 +67,79 @@ def test_eval_manifest_does_not_receive_agent_secret():
     assert manifest["metadata"]["labels"]["phase"] == "eval"
 
 
+def test_governed_manifest_never_pulls_and_rejects_unknown_policy():
+    image = "agent-eval/example:governed-" + "a" * 64
+    manifest = sandbox_pod_manifest(
+        "agent-deadbeef",
+        "agent",
+        image,
+        image_pull_policy="Never",
+    )
+
+    assert manifest["spec"]["containers"][0]["image"] == image
+    assert manifest["spec"]["containers"][0]["imagePullPolicy"] == "Never"
+    with pytest.raises(ValueError, match="image pull policy"):
+        sandbox_pod_manifest(
+            "agent-deadbeef",
+            "agent",
+            image,
+            image_pull_policy="Always",
+        )
+
+
+def test_running_image_manifest_resolves_cri_repo_digest_not_config_id(monkeypatch):
+    from agent_eval import kube
+
+    image_ref = "agent-eval/example:governed-" + "a" * 64
+    manifest_digest = "sha256:" + "a" * 64
+    config_digest = "sha256:" + "c" * 64
+    pod_value = {
+        "spec": {
+            "nodeName": "k3d-agent-eval-server-0",
+            "containers": [{"image": image_ref}],
+        },
+        "status": {"containerStatuses": [{"imageID": config_digest}]},
+    }
+
+    monkeypatch.setattr(
+        kube,
+        "kubectl",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, stdout=json.dumps(pod_value), stderr=""
+        ),
+    )
+
+    def fake_run(command, **kwargs):
+        assert command == [
+            "docker",
+            "exec",
+            "k3d-agent-eval-server-0",
+            "crictl",
+            "inspecti",
+            config_digest,
+        ]
+        assert kwargs["timeout"] == 30
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "status": {
+                        "id": config_digest,
+                        "repoDigests": [
+                            f"docker.io/agent-eval/example@{manifest_digest}"
+                        ],
+                    }
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(kube.subprocess, "run", fake_run)
+
+    assert Pod("agent-one").image_manifest_digest(image_ref) == manifest_digest
+
+
 def test_credential_secret_projects_only_declared_env_and_files():
     manifest = sandbox_pod_manifest(
         "agent-deadbeef",

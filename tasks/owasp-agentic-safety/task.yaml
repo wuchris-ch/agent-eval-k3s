@@ -17,6 +17,8 @@ test_command: >-
   --junitxml=/results/junit.xml
   --cov=project --cov-report=json:/results/coverage.json
 judge:
+  backend: claude
+  model: claude-sonnet-4-5-20250929
   weights:
     spec_adherence: 0.5
     maintainability: 0.3

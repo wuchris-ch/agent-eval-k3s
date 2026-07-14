@@ -6,6 +6,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import agent_eval.attestation as attestation_module
 import pytest
 
 from agent_eval.attestation import (
@@ -19,6 +20,7 @@ from agent_eval.attestation import (
     capture_git_state,
     create_attestation,
     hash_tree,
+    read_regular_file,
     verify_attestation,
     write_attestation,
 )
@@ -156,6 +158,60 @@ def test_statement_is_deterministic_and_binds_required_evidence(tmp_path):
     assert predicate["outcome"]["resolved"] is True
 
 
+def test_statement_binds_governance_evidence_deterministically(tmp_path):
+    artifacts = _artifacts(tmp_path)
+    task = _task(tmp_path)
+    common = {
+        "artifact_root": artifacts,
+        "artifacts": ["results/junit.xml", "results.json"],
+        "task_root": task,
+        "task_id": "demo",
+        "image_tag": "agent-eval/demo:latest",
+        "image_digest": IMAGE_DIGEST,
+        "harness_git_sha": GIT_SHA,
+        "harness_git_dirty": False,
+    }
+
+    first = build_statement(
+        **common,
+        governance={
+            "policy_revision": "2026-07-14",
+            "request_digest": "a" * 64,
+            "decision": {"allowed": True, "reason_codes": []},
+        },
+    )
+    second = build_statement(
+        **common,
+        governance={
+            "decision": {"reason_codes": [], "allowed": True},
+            "request_digest": "a" * 64,
+            "policy_revision": "2026-07-14",
+        },
+    )
+
+    assert canonical_statement_bytes(first) == canonical_statement_bytes(second)
+    assert first["predicate"]["governance"]["decision"]["allowed"] is True
+
+
+def test_statement_rejects_invalid_governance_evidence(tmp_path):
+    artifacts = _artifacts(tmp_path)
+    task = _task(tmp_path)
+    common = {
+        "artifact_root": artifacts,
+        "artifacts": ["results.json"],
+        "task_root": task,
+        "image_tag": "agent-eval/demo:latest",
+        "image_digest": IMAGE_DIGEST,
+        "harness_git_sha": GIT_SHA,
+        "harness_git_dirty": False,
+    }
+
+    with pytest.raises(AttestationError, match="non-finite"):
+        build_statement(**common, governance={"budget": float("nan")})
+    with pytest.raises(AttestationError, match="JSON object"):
+        build_statement(**common, governance=["not", "an", "object"])
+
+
 def test_create_writes_canonical_statement_and_exact_byte_sidecar(tmp_path):
     artifacts, task, bundle = _bundle(tmp_path)
 
@@ -180,6 +236,9 @@ def test_create_writes_canonical_statement_and_exact_byte_sidecar(tmp_path):
     assert result.sidecar_verified
     assert result.subjects_declared == 2
     assert result.subjects_checked == 2
+    assert result.subject_digests == {
+        subject["name"]: subject["digest"]["sha256"] for subject in statement["subject"]
+    }
     assert result.task_checked
     assert not result.harness_checked
 
@@ -205,6 +264,33 @@ def test_artifact_tamper_is_reported_with_expected_and_actual_digests(tmp_path):
     assert len(failure.actual or "") == 64
     assert failure.expected != failure.actual
     assert result.sidecar_verified
+
+
+@pytest.mark.parametrize(
+    ("file_name", "failure_code"),
+    [
+        ("attestation.json", "statement_unsafe"),
+        ("attestation.json.sha256", "sidecar_unsafe"),
+    ],
+)
+def test_verifier_rejects_symlinked_attestation_files(
+    tmp_path, file_name, failure_code
+):
+    artifacts, task, bundle = _bundle(tmp_path)
+    linked = artifacts / file_name
+    external = tmp_path / f"external-{file_name}"
+    external.write_bytes(linked.read_bytes())
+    linked.unlink()
+    linked.symlink_to(external)
+
+    result = verify_attestation(
+        bundle.statement_path,
+        artifact_root=artifacts,
+        task_root=task,
+    )
+
+    assert not result.ok
+    assert failure_code in _codes(result)
 
 
 @pytest.mark.parametrize(
@@ -331,6 +417,44 @@ def test_sidecar_tamper_is_a_structured_failure(tmp_path):
     assert not result.ok
     assert not result.sidecar_verified
     assert "sidecar_digest_mismatch" in _codes(result)
+
+
+def test_regular_file_snapshot_enforces_a_byte_limit(tmp_path):
+    path = tmp_path / "bounded.json"
+    path.write_bytes(b"12345")
+
+    with pytest.raises(AttestationError, match="exceeds 4 bytes"):
+        read_regular_file(path, max_bytes=4)
+
+
+def test_task_tree_hash_enforces_entry_and_depth_limits(monkeypatch, tmp_path):
+    task = _task(tmp_path)
+    monkeypatch.setattr(attestation_module, "MAX_ARTIFACT_FILES", 1)
+
+    with pytest.raises(AttestationError, match="task tree exceeds 1 entries"):
+        hash_tree(task)
+
+    monkeypatch.setattr(attestation_module, "MAX_ARTIFACT_FILES", 50_000)
+    monkeypatch.setattr(attestation_module, "MAX_JSON_DEPTH", 1)
+
+    with pytest.raises(AttestationError, match="maximum depth"):
+        hash_tree(task)
+
+
+def test_verifier_rejects_excessive_subject_count(monkeypatch, tmp_path):
+    artifacts, task, bundle = _bundle(tmp_path)
+    statement = json.loads(bundle.statement_path.read_bytes())
+    monkeypatch.setattr(attestation_module, "MAX_ATTESTATION_SUBJECTS", 1)
+    _rewrite_statement(bundle.statement_path, statement)
+
+    result = verify_attestation(
+        bundle.statement_path,
+        artifact_root=artifacts,
+        task_root=task,
+    )
+
+    assert not result.ok
+    assert "subjects_too_many" in _codes(result)
 
 
 def test_noncanonical_statement_fails_even_with_updated_sidecar(tmp_path):

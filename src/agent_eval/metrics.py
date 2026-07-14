@@ -6,10 +6,11 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .assurance import AssuranceResult
 from .evaluators.tests import TestResults
+from .governance import GovernanceEvidence
 from .outcome import RunOutcome
 
 RUNS_ROOT = Path(__file__).resolve().parents[2] / "runs"
@@ -17,15 +18,20 @@ RUNS_ROOT = Path(__file__).resolve().parents[2] / "runs"
 
 class AgentMetrics(BaseModel):
     """Efficiency metrics parsed from the coding agent's transcript."""
-    wall_time_s: float | None = None
-    tokens_in: int | None = None
-    tokens_out: int | None = None
-    cost_usd: float | None = None
-    turns: int | None = None
-    tool_calls: int | None = None
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    wall_time_s: float | None = Field(
+        default=None, ge=0, allow_inf_nan=False, strict=True
+    )
+    tokens_in: int | None = Field(default=None, ge=0, strict=True)
+    tokens_out: int | None = Field(default=None, ge=0, strict=True)
+    cost_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False, strict=True)
+    turns: int | None = Field(default=None, ge=0, strict=True)
+    tool_calls: int | None = Field(default=None, ge=0, strict=True)
     model: str | None = None
     requested_model: str | None = None
-    agent_exit_code: int | None = None
+    agent_exit_code: int | None = Field(default=None, strict=True)
     timed_out: bool = False
     infra_error: str | None = None
     runtime_image_digest: str | None = None
@@ -54,6 +60,7 @@ class JudgeResult(BaseModel):
     scores: dict[str, int] = Field(default_factory=dict)  # dimension -> 1..5
     weighted_score: float | None = None
     rationale: dict[str, str] = Field(default_factory=dict)
+    backend: str | None = None
     model: str | None = None
 
 
@@ -72,6 +79,11 @@ class RunProvenance(BaseModel):
     credential_source: str | None = None
     credential_mode: str | None = None
     credential_expires_at: str | None = None
+    audit_trace_id: str | None = None
+    audit_final_hash: str | None = None
+    audit_event_count: int | None = None
+    audit_error: str | None = None
+    attestation_error: str | None = None
     tool_versions: dict[str, str | None] = Field(default_factory=dict)
 
 
@@ -90,6 +102,7 @@ class RunRecord(BaseModel):
     judge: JudgeResult = Field(default_factory=JudgeResult)
     assurance: AssuranceResult | None = None
     outcome: RunOutcome | None = None
+    governance: GovernanceEvidence | None = None
     provenance: RunProvenance = Field(default_factory=RunProvenance)
 
     @property
@@ -194,7 +207,16 @@ def load_runs(task_id: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
         return cur.fetchall()
 
 
-def load_run(run_id: str) -> RunRecord | None:
+def load_run(run_id: str, *, forbid_extra: bool = False) -> RunRecord | None:
     with _connect() as conn:
-        row = conn.execute("SELECT results_json FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-    return RunRecord.model_validate_json(row["results_json"]) if row else None
+        row = conn.execute(
+            "SELECT results_json FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+    return (
+        RunRecord.model_validate_json(
+            row["results_json"],
+            extra="forbid" if forbid_extra else None,
+        )
+        if row
+        else None
+    )
