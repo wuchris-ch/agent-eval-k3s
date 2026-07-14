@@ -2,6 +2,7 @@ import json
 
 import pytest
 from pydantic import ValidationError
+from rich.text import Text
 from typer.testing import CliRunner
 
 from agent_eval.cli import app
@@ -941,6 +942,7 @@ def test_benchmark_cli_rejects_nonfinite_thresholds(tmp_path, option):
         ],
     )
 
+    output = " ".join(Text.from_ansi(result.output).plain.split())
     assert result.exit_code == 2
-    assert f"Invalid value for {option}" in result.output
-    assert "must be finite" in result.output
+    assert f"Invalid value for {option}" in output
+    assert "must be finite" in output
