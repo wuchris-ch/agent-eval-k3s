@@ -1,18 +1,15 @@
 """OpenAI Codex CLI adapter. Runs `codex exec` headless in the sandbox pod and
-parses its JSONL event stream. Auth is file-based (ChatGPT subscription or API
-key in ~/.codex/auth.json), so prepare() copies the host credential into the
-pod rather than using the k8s env secret."""
+parses its JSONL event stream. Auth is file-based and projected from the
+runner's unique per-trial Kubernetes Secret."""
 
 from __future__ import annotations
 
 import shlex
-import shutil
-import tempfile
 from pathlib import Path
 
 import json
 
-from ..kube import Pod
+from ..kube import CREDENTIAL_MOUNT, Pod
 from ..metrics import AgentMetrics
 from .base import PROMPT_PATH
 
@@ -26,14 +23,15 @@ class CodexAdapter:
     env: dict[str, str] = {}
 
     def prepare(self, pod: Pod) -> None:
-        """Copy the host's codex credential into the pod (subscription auth
-        lives in ~/.codex/auth.json and cannot be passed as an env var)."""
-        auth = Path.home() / ".codex" / "auth.json"
-        if not auth.is_file():
-            raise RuntimeError("~/.codex/auth.json not found; run `codex login` first")
-        with tempfile.TemporaryDirectory() as tmp:
-            shutil.copy(auth, Path(tmp) / "auth.json")
-            pod.copy_dir_to(Path(tmp), "/root/.codex")
+        """Stage the read-only projected credential into the writable home."""
+        source = f"{CREDENTIAL_MOUNT}/codex-auth.json"
+        proc = pod.exec(
+            f"test -f {source} && mkdir -p $HOME/.codex && "
+            f"cp {source} $HOME/.codex/auth.json && chmod 600 $HOME/.codex/auth.json",
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError("projected Codex credential is unavailable in the pod")
 
     def build_command(self, model: str | None = None) -> str:
         cmd = (f'codex exec --json --skip-git-repo-check '

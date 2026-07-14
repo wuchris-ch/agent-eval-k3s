@@ -1,17 +1,16 @@
-"""k3d cluster lifecycle: create/delete the k3s-in-docker cluster, import task
-images, and manage the API-key secret."""
+"""k3d cluster lifecycle and task-image import."""
 
 from __future__ import annotations
 
-import os
+import json
 import subprocess
+from typing import Any
 
 from rich.console import Console
 
-from .kube import KUBE_CONTEXT, NAMESPACE, KubeError, ensure_namespace, kubectl
+from .kube import KUBE_CONTEXT, NAMESPACE, KubeError, ensure_namespace
 
 CLUSTER_NAME = "agent-eval"
-SECRET_NAME = "agent-api-keys"
 console = Console()
 
 
@@ -22,29 +21,59 @@ def _run(cmd: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
     return proc
 
 
-def cluster_exists() -> bool:
+def _cluster_record() -> dict[str, Any] | None:
     proc = subprocess.run(["k3d", "cluster", "list", "-o", "json"],
                           capture_output=True, text=True)
-    return proc.returncode == 0 and f'"name": "{CLUSTER_NAME}"' in proc.stdout.replace("'", '"')
+    if proc.returncode != 0:
+        return None
+    try:
+        clusters = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(clusters, list):
+        return None
+    return next(
+        (
+            cluster
+            for cluster in clusters
+            if isinstance(cluster, dict) and cluster.get("name") == CLUSTER_NAME
+        ),
+        None,
+    )
+
+
+def cluster_exists() -> bool:
+    return _cluster_record() is not None
+
+
+def _cluster_running(cluster: dict[str, Any]) -> bool:
+    servers = cluster.get("serversCount")
+    agents = cluster.get("agentsCount")
+    return (
+        isinstance(servers, int)
+        and servers > 0
+        and cluster.get("serversRunning") == servers
+        and isinstance(agents, int)
+        and cluster.get("agentsRunning") == agents
+    )
 
 
 def cluster_up() -> None:
-    if cluster_exists():
-        console.print(f"[yellow]cluster {CLUSTER_NAME} already exists[/yellow]")
+    cluster = _cluster_record()
+    if cluster is not None and _cluster_running(cluster):
+        console.print(f"[yellow]cluster {CLUSTER_NAME} already running[/yellow]")
+    elif cluster is not None:
+        console.print(f"starting existing k3d cluster [bold]{CLUSTER_NAME}[/bold]...")
+        _run(["k3d", "cluster", "start", CLUSTER_NAME, "--wait"])
     else:
         console.print(f"creating k3d cluster [bold]{CLUSTER_NAME}[/bold]...")
         _run(["k3d", "cluster", "create", CLUSTER_NAME, "--agents", "1", "--wait"])
     ensure_namespace()
-    sync_api_key_secret()
     console.print("[green]cluster ready[/green]")
 
 
 def ensure_cluster() -> None:
     """Create the cluster on first use so `agent-eval run` works cold."""
-    if cluster_exists():
-        ensure_namespace()
-        return
-    console.print("no cluster found; creating it (first run only)...")
     cluster_up()
 
 
@@ -54,8 +83,13 @@ def cluster_down() -> None:
 
 
 def cluster_status() -> None:
-    if not cluster_exists():
+    cluster = _cluster_record()
+    if cluster is None:
         console.print(f"[red]cluster {CLUSTER_NAME} does not exist[/red] "
+                      "(run: agent-eval cluster up)")
+        return
+    if not _cluster_running(cluster):
+        console.print(f"[yellow]cluster {CLUSTER_NAME} is stopped[/yellow] "
                       "(run: agent-eval cluster up)")
         return
     proc = subprocess.run(
@@ -68,20 +102,6 @@ def cluster_status() -> None:
         capture_output=True, text=True,
     )
     console.print(pods.stdout or pods.stderr)
-
-
-def sync_api_key_secret() -> None:
-    """Create/update the secret holding ANTHROPIC_API_KEY from the host env."""
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        console.print("[yellow]ANTHROPIC_API_KEY not set; agent phase will not work "
-                      "until you export it and re-run `agent-eval cluster up`[/yellow]")
-        return
-    manifest = kubectl("create", "secret", "generic", SECRET_NAME,
-                       f"--from-literal=ANTHROPIC_API_KEY={key}",
-                       "--dry-run=client", "-o", "json", timeout=30)
-    kubectl("apply", "-f", "-", input=manifest.stdout, timeout=30)
-    console.print(f"secret [bold]{SECRET_NAME}[/bold] synced")
 
 
 def build_and_import_image(context_dir: str, tag: str) -> None:

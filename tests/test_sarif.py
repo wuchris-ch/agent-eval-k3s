@@ -75,14 +75,12 @@ def test_only_active_llm_findings_are_emitted_and_severity_is_mapped():
         "major issue",
         "minor issue",
         "nit issue",
-        "unconfirmed",
     ]
     assert [result["level"] for result in results] == [
         "error",
         "error",
         "warning",
         "note",
-        "warning",
     ]
 
 
@@ -509,7 +507,7 @@ def test_gitleaks_retains_redacted_item_locations(monkeypatch, tmp_path):
             "StartLine": 3,
             "Match": 'api_key = "do-not-persist-this"',
         }]))
-        return SimpleNamespace(returncode=1)
+        return SimpleNamespace(returncode=1), "ok"
 
     monkeypatch.setattr(scanners.shutil, "which", lambda tool: f"/usr/bin/{tool}")
     monkeypatch.setattr(scanners, "_run", fake_run)

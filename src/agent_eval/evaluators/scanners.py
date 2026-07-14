@@ -19,6 +19,20 @@ from ..metrics import ScanResults
 console = Console()
 SCAN_TIMEOUT = 600
 _REDACTED_SECRET = "<REDACTED_SECRET>"
+_RUFF_PACKAGE = "ruff==0.15.20"
+_SEMGREP_PACKAGE = "semgrep==1.169.0"
+_SEMGREP_CONFIG = "auto"
+
+
+def _installed_version(command: list[str]) -> str | None:
+    try:
+        proc = subprocess.run(
+            command, capture_output=True, text=True, timeout=20
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    output = (proc.stdout or proc.stderr).strip().splitlines()
+    return output[0][:200] if proc.returncode == 0 and output else None
 
 
 def _workspace_source_path(workspace: Path, raw_path: object) -> Path | None:
@@ -149,14 +163,19 @@ def _redacted_gitleaks_fingerprints(
     }
 
 
-def _run(cmd: list[str], out_file: Path) -> subprocess.CompletedProcess | None:
+def _run(
+    cmd: list[str], out_file: Path
+) -> tuple[subprocess.CompletedProcess | None, str]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=SCAN_TIMEOUT)
         out_file.write_text(proc.stdout or proc.stderr)
-        return proc
-    except (subprocess.TimeoutExpired, OSError) as e:
+        return proc, "ok"
+    except subprocess.TimeoutExpired as e:
         console.print(f"[yellow]scanner {cmd[0]} failed: {e}[/yellow]")
-        return None
+        return None, "timeout"
+    except OSError as e:
+        console.print(f"[yellow]scanner {cmd[0]} failed: {e}[/yellow]")
+        return None, "error"
 
 
 def run_scanners(workspace: Path, run_dir: Path,
@@ -174,28 +193,74 @@ def run_scanners(workspace: Path, run_dir: Path,
 
 def _lint(language: str | None, workspace: Path, scans_dir: Path,
           results: ScanResults) -> None:
+    results.scanner_versions["ruff"] = _RUFF_PACKAGE.removeprefix("ruff==")
+    results.scanner_configs["ruff"] = "isolated-default"
     if language != "python":
+        results.scanner_status["ruff"] = "not_applicable"
         return  # eslint etc. can be added per-language later
-    proc = _run(["uvx", "ruff", "check", "--output-format", "json", "--exit-zero",
-                 str(workspace)], scans_dir / "ruff.json")
-    if proc is None:
+    if not shutil.which("uvx"):
+        results.scanner_status["ruff"] = "unavailable"
+        return
+    proc, status = _run(
+        ["uvx", "--from", _RUFF_PACKAGE, "ruff", "check", "--output-format",
+         "json", "--exit-zero", "--isolated", str(workspace)],
+        scans_dir / "ruff.json"
+    )
+    results.scanner_status["ruff"] = status
+    if proc is None or proc.returncode != 0:
+        if proc is not None:
+            results.scanner_status["ruff"] = "error"
         return
     try:
         findings = json.loads(proc.stdout)
-        results.lint_errors = len(findings)
     except json.JSONDecodeError:
-        pass
+        results.scanner_status["ruff"] = "error"
+        return
+    if not isinstance(findings, list):
+        results.scanner_status["ruff"] = "error"
+        return
+    results.lint_errors = len(findings)
 
 
 def _semgrep(workspace: Path, scans_dir: Path, results: ScanResults) -> None:
-    proc = _run(["uvx", "--python", "3.12", "semgrep", "scan",
-                 "--config", "auto", "--json", "--quiet",
-                 str(workspace)], scans_dir / "semgrep.json")
+    results.scanner_versions["semgrep"] = _SEMGREP_PACKAGE.removeprefix(
+        "semgrep=="
+    )
+    results.scanner_configs["semgrep"] = "registry:auto (mutable)"
+    if not shutil.which("uvx"):
+        results.scanner_status["semgrep"] = "unavailable"
+        return
+    proc, status = _run(
+        ["uvx", "--python", "3.12", "--from", _SEMGREP_PACKAGE,
+         "semgrep", "scan", "--config", _SEMGREP_CONFIG, "--metrics", "auto",
+         "--json", "--quiet", str(workspace)],
+        scans_dir / "semgrep.json",
+    )
+    results.scanner_status["semgrep"] = status
     if proc is None or proc.returncode not in (0, 1):
+        if proc is not None:
+            results.scanner_status["semgrep"] = "error"
         return
     try:
-        findings = json.loads(proc.stdout).get("results", [])
+        report = json.loads(proc.stdout)
     except json.JSONDecodeError:
+        results.scanner_status["semgrep"] = "error"
+        return
+    if not isinstance(report, dict):
+        results.scanner_status["semgrep"] = "error"
+        return
+    findings = report.get("results")
+    if not isinstance(findings, list) or not all(
+        isinstance(finding, dict)
+        and isinstance(finding.get("extra", {}), dict)
+        and isinstance(finding.get("extra", {}).get("severity", "INFO"), str)
+        and (
+            finding.get("start") is None
+            or isinstance(finding.get("start"), dict)
+        )
+        for finding in findings
+    ):
+        results.scanner_status["semgrep"] = "error"
         return
     sev = {"ERROR": 0, "WARNING": 0, "INFO": 0}
     for f in findings:
@@ -222,21 +287,33 @@ def _semgrep(workspace: Path, scans_dir: Path, results: ScanResults) -> None:
 
 def _gitleaks(workspace: Path, scans_dir: Path, results: ScanResults) -> None:
     if not shutil.which("gitleaks"):
+        results.scanner_status["gitleaks"] = "unavailable"
         return
+    results.scanner_versions["gitleaks"] = _installed_version(
+        ["gitleaks", "version"]
+    )
+    results.scanner_configs["gitleaks"] = "embedded-default"
     with tempfile.TemporaryDirectory(prefix="agent-eval-gitleaks-") as tmp:
         report = Path(tmp) / "gitleaks.json"
         log = Path(tmp) / "gitleaks.log"
-        proc = _run(["gitleaks", "dir", str(workspace), "--report-format", "json",
-                     "--report-path", str(report), "--no-banner"],
-                    log)
+        proc, status = _run(
+            ["gitleaks", "dir", str(workspace), "--report-format", "json",
+             "--report-path", str(report), "--no-banner"], log
+        )
+        results.scanner_status["gitleaks"] = status
         if proc is None:
             return
+        if proc.returncode not in (0, 1) or not report.is_file():
+            results.scanner_status["gitleaks"] = "error"
+            return
         try:
-            raw_findings = json.loads(report.read_text()) if report.is_file() else []
-        except (json.JSONDecodeError, OSError):
-            raw_findings = []
+            raw_findings = json.loads(report.read_text())
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            results.scanner_status["gitleaks"] = "error"
+            return
     if not isinstance(raw_findings, list):
-        raw_findings = []
+        results.scanner_status["gitleaks"] = "error"
+        return
     raw_findings = [finding for finding in raw_findings if isinstance(finding, dict)]
 
     results.secrets_found = len(raw_findings)
@@ -266,14 +343,24 @@ def _gitleaks(workspace: Path, scans_dir: Path, results: ScanResults) -> None:
 
 def _trivy(workspace: Path, scans_dir: Path, results: ScanResults) -> None:
     if not shutil.which("trivy"):
+        results.scanner_status["trivy"] = "unavailable"
         return
-    proc = _run(["trivy", "fs", "--scanners", "vuln", "--format", "json",
-                 str(workspace)], scans_dir / "trivy.json")
+    results.scanner_versions["trivy"] = _installed_version(
+        ["trivy", "--version"]
+    )
+    results.scanner_configs["trivy"] = "filesystem-vulnerability-db"
+    proc, status = _run(
+        ["trivy", "fs", "--scanners", "vuln", "--format", "json",
+         str(workspace)], scans_dir / "trivy.json"
+    )
+    results.scanner_status["trivy"] = status
     if proc is None or proc.returncode != 0:
+        if proc is not None:
+            results.scanner_status["trivy"] = "error"
         return
     try:
         data = json.loads(proc.stdout)
         results.vulns = sum(len(r.get("Vulnerabilities") or [])
                             for r in data.get("Results") or [])
     except json.JSONDecodeError:
-        pass
+        results.scanner_status["trivy"] = "error"

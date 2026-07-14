@@ -1,0 +1,25 @@
+version: 1
+benchmark: benchmark.yaml
+baseline: single
+budgets:
+  max_fp_per_case: 0.5
+  max_latency_s: 5
+  max_tokens: 5000
+  max_cost_usd: 0.20
+systems:
+  - id: single
+    mode: single
+    trials:
+      - id: trial-1
+        outputs: outputs/single/trial-1
+      - id: trial-2
+        outputs: outputs/single/trial-2
+  - id: specialist-panel
+    mode: panel
+    members: [security, correctness]
+    quorum: 2
+    trials:
+      - id: trial-1
+        outputs: outputs/panel/trial-1
+      - id: trial-2
+        outputs: outputs/panel/trial-2

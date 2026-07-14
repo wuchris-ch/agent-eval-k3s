@@ -297,6 +297,7 @@ class AggregateMetrics(BaseModel):
     """Aggregate benchmark metrics and their explicit denominators."""
 
     case_count: int
+    scored_case_count: int
     expected_finding_count: int
     prediction_count: int
     changed_lines: int | None
@@ -384,10 +385,13 @@ def _load_predictions(path: Path) -> tuple[list[PredictedFinding], str | None]:
             raise ValueError(
                 f"prediction file {path} finding {index} must be an object"
             )
-        if native and (
-            item.get("verified") is not True or item.get("verdict") == "rejected"
-        ):
-            continue
+        if native:
+            severity = str(item.get("severity") or "").strip().casefold()
+            verdict = str(item.get("verdict") or "").strip().casefold()
+            if item.get("verified") is not True or verdict == "rejected":
+                continue
+            if severity in _HIGH_SEVERITIES and verdict != "confirmed":
+                continue
         normalized_item = dict(item)
         if normalized_item.get("confidence") is None:
             normalized_item["confidence"] = 1.0
@@ -588,11 +592,15 @@ def _wilson_interval(successes: int, total: int) -> WilsonInterval | None:
 
 def _aggregate(cases: list[CaseResult]) -> AggregateMetrics:
     case_count = len(cases)
+    scored_cases = [case for case in cases if case.status == "scored"]
+    scored_case_count = len(scored_cases)
     expected_count = sum(case.expected_count for case in cases)
     prediction_count = sum(case.prediction_count for case in cases)
-    has_complete_exposure = all(case.changed_lines is not None for case in cases)
+    has_complete_exposure = bool(scored_cases) and all(
+        case.changed_lines is not None for case in scored_cases
+    )
     changed_lines = (
-        sum(case.changed_lines or 0 for case in cases)
+        sum(case.changed_lines or 0 for case in scored_cases)
         if has_complete_exposure
         else None
     )
@@ -608,10 +616,16 @@ def _aggregate(cases: list[CaseResult]) -> AggregateMetrics:
     high_matched = 0
     severity_correct = 0
     for case in cases:
+        matches_by_expected_id = {
+            match.expected_id: match for match in case.matches
+        }
         for result in case.expected_results:
             if result.finding.severity in _HIGH_SEVERITIES:
                 high_expected += 1
-                if result.matched:
+                match = matches_by_expected_id.get(result.finding.id)
+                if match and (
+                    match.predicted_severity.strip().casefold() in _HIGH_SEVERITIES
+                ):
                     high_matched += 1
             if result.severity_correct:
                 severity_correct += 1
@@ -624,6 +638,7 @@ def _aggregate(cases: list[CaseResult]) -> AggregateMetrics:
 
     return AggregateMetrics(
         case_count=case_count,
+        scored_case_count=scored_case_count,
         expected_finding_count=expected_count,
         prediction_count=prediction_count,
         changed_lines=changed_lines,
@@ -640,7 +655,7 @@ def _aggregate(cases: list[CaseResult]) -> AggregateMetrics:
         blocker_major_denominator=high_expected,
         severity_accuracy=_rate(severity_correct, true_positives),
         severity_accuracy_denominator=true_positives,
-        false_positives_per_case=_rate(false_positives, case_count),
+        false_positives_per_case=_rate(false_positives, scored_case_count),
         false_positives_per_kloc=(
             false_positives * 1000 / changed_lines
             if changed_lines is not None and changed_lines > 0

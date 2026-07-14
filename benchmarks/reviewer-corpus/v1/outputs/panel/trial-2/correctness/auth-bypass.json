@@ -1,0 +1,6 @@
+{
+  "findings": [
+    {"severity": "blocker", "category": "security", "file": "auth.py", "line": 2}
+  ],
+  "metrics": {"latency_s": 1.7, "tokens": 900, "cost_usd": 0.022}
+}

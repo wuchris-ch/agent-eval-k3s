@@ -26,3 +26,9 @@ judge:
     spec_adherence: 0.4
     maintainability: 0.4
     test_quality: 0.2
+acceptance:
+  min_coverage_percent: 80
+  required_scanners: [ruff, semgrep, gitleaks]
+  max_lint_errors: 0
+  max_security_findings_high: 0
+  max_secrets: 0

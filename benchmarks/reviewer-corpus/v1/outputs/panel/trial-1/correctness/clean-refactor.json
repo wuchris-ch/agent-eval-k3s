@@ -1,0 +1,6 @@
+{
+  "findings": [
+    {"severity": "nit", "category": "style", "file": "formatting.py", "line": 1}
+  ],
+  "metrics": {"latency_s": 1.4, "tokens": 760, "cost_usd": 0.017}
+}

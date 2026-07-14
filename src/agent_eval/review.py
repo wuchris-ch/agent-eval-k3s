@@ -11,7 +11,8 @@ over the changed files -> command graders (exit 0) -> classical grader (tests
 pass on head) -> reverse-classical grader (new/changed tests must FAIL on the
 base commit) -> optional LLM-generated discriminating test (classical +
 adaptive repair) -> LLM findings review where every claim must carry a
-verbatim diff quote, is verified programmatically, and blocker/major findings
+normalized quote from an added or deleted diff run, is verified
+programmatically, and blocker/major findings
 must survive a second adversarial verification pass.
 
 Deterministic evidence sets a risk floor; the LLM can escalate it only through
@@ -23,19 +24,22 @@ from __future__ import annotations
 import ast
 import difflib
 import fnmatch
+import os
 import re
+import stat
 import subprocess
 import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, Field
 from rich.console import Console
 from rich.table import Table
 
-from .graders import (GraderResult, _git, command_grader, head_test_grader,
+from .graders import (GraderResult, _git, _safe_injection_target,
+                      _write_injected_file, command_grader, head_test_grader,
                       head_workspace, load_policy, reverse_test_grader,
-                      scope_graders, worktree)
+                      scanner_graders, scope_graders, worktree)
 from .metrics import DiffStats, ScanResults, now_iso
 
 console = Console()
@@ -71,14 +75,20 @@ class Finding(BaseModel):
     file: str = ""
     line: int | None = None
     claim: str = ""
-    evidence: str = ""             # verbatim quote from the diff
-    verified: bool = False         # quote located in the diff (programmatic)
+    evidence: str = ""             # normalized quote from one side of the diff
+    evidence_side: str = "head"    # head (added) or base (deleted)
+    evidence_line: int | None = None  # evidence-side line before head anchoring
+    verified: bool = False         # quote located in the named file and side
     verdict: str | None = None     # confirmed | rejected (adversarial LLM pass)
     verdict_reason: str = ""
 
     @property
     def active(self) -> bool:
-        return self.verified and self.verdict != "rejected"
+        if not self.verified or self.verdict == "rejected":
+            return False
+        if self.severity in ("blocker", "major"):
+            return self.verdict == "confirmed"
+        return True
 
 
 class LLMReview(BaseModel):
@@ -128,8 +138,12 @@ _FINDING_SCHEMA = {
         "line": {"type": ["integer", "null"]},
         "claim": {"type": "string"},
         "evidence": {"type": "string"},
+        "evidence_side": {"type": "string", "enum": ["head", "base"]},
     },
-    "required": ["severity", "category", "file", "line", "claim", "evidence"],
+    "required": [
+        "severity", "category", "file", "line", "claim", "evidence",
+        "evidence_side",
+    ],
     "additionalProperties": False,
 }
 
@@ -210,11 +224,39 @@ def _merge_base(repo: Path, base: str, head: str) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else base
 
 
+def _worktree_entry(repo: Path, path: str) -> tuple[Path, int] | None:
+    pure = PurePosixPath(path)
+    if (
+        not path
+        or "\\" in path
+        or pure.is_absolute()
+        or any(part in ("", ".", "..") for part in pure.parts)
+    ):
+        return None
+    current = repo.resolve(strict=True)
+    for index, part in enumerate(pure.parts):
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except OSError:
+            return None
+        if index < len(pure.parts) - 1 and (
+            stat.S_ISLNK(mode) or not stat.S_ISDIR(mode)
+        ):
+            return None
+    return current, mode
+
+
 def _head_file_content(repo: Path, head: str | None, path: str) -> str | None:
     try:
         if head is None:
-            src = repo / path
-            return src.read_text() if src.is_file() else None
+            entry = _worktree_entry(repo, path)
+            if entry is None:
+                return None
+            src, mode = entry
+            if stat.S_ISLNK(mode):
+                return os.readlink(src)
+            return src.read_text() if stat.S_ISREG(mode) else None
         return _git(repo, "show", f"{head}:{path}")
     except (RuntimeError, OSError, UnicodeDecodeError):
         return None  # binary or vanished
@@ -267,7 +309,7 @@ _EXCLUDE_PATHSPECS = ("--", ".", ":(exclude).agent-eval",
                       ":(exclude)**/__pycache__/**", ":(exclude)**/*.pyc",
                       ":(exclude)**/node_modules/**", ":(exclude)**/.venv/**")
 _HUNK_HEADER = re.compile(
-    r"^@@ -\d+(?:,\d+)? \+(?P<start>\d+)(?:,\d+)? @@"
+    r"^@@ -(?P<base>\d+)(?:,\d+)? \+(?P<head>\d+)(?:,\d+)? @@"
 )
 
 
@@ -308,7 +350,7 @@ def _parse_head_line_ranges(
 
         hunk = _HUNK_HEADER.match(line)
         if hunk:
-            head_line = int(hunk.group("start")) if current_path else None
+            head_line = int(hunk.group("head")) if current_path else None
             continue
         if current_path is None or head_line is None:
             continue
@@ -401,12 +443,14 @@ def collect_changes(repo: Path, base: str, head: str | None,
     if head is None:  # untracked files never show in git diff
         junk = ("*.pyc", "*__pycache__*", ".agent-eval/*", "*node_modules*",
                 "*.venv/*")
-        for path in _git(repo, "ls-files", "--others", "--exclude-standard").splitlines():
+        untracked = _git(
+            repo, "ls-files", "-z", "--others", "--exclude-standard"
+        ).split("\0")
+        for path in untracked:
             if path and not any(fnmatch.fnmatch(path, p) for p in junk):
-                try:
-                    content = (repo / path).read_text()
-                except (OSError, UnicodeDecodeError):
-                    content = ""
+                entry = _worktree_entry(repo, path)
+                content = _head_file_content(repo, None, path) or ""
+                is_symlink = entry is not None and stat.S_ISLNK(entry[1])
                 added = len(content.splitlines()) if content else 0
                 files.append(ChangedFile(path=path, status="?",
                                          lines_added=added,
@@ -417,7 +461,11 @@ def collect_changes(repo: Path, base: str, head: str | None,
                     lines = content.splitlines(keepends=True)
                     body = "".join(difflib.unified_diff(
                         [], lines, fromfile="/dev/null", tofile=f"b/{path}"))
-                    diff_text += f"\ndiff --git a/{path} b/{path}\nnew file mode 100644\n{body}"
+                    mode = "120000" if is_symlink else "100644"
+                    diff_text += (
+                        f"\ndiff --git a/{path} b/{path}\n"
+                        f"new file mode {mode}\n{body}"
+                    )
 
     head_line_ranges = _parse_head_line_ranges(
         diff_text, [changed.path for changed in files]
@@ -439,7 +487,14 @@ def snapshot_changed_files(repo: Path, files: list[ChangedFile],
         content = _head_file_content(repo, head, f.path)
         if content is None:
             continue
-        target = dest / f.path
+        pure = PurePosixPath(f.path)
+        if (
+            "\\" in f.path
+            or pure.is_absolute()
+            or any(part in ("", ".", "..") for part in pure.parts)
+        ):
+            continue
+        target = dest.joinpath(*pure.parts)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
         copied += 1
@@ -545,7 +600,7 @@ def compute_risk(files: list[ChangedFile], stats: DiffStats,
             force_high = True
         if scans.sec_findings_high:
             signals.append(f"high-severity security findings ({scans.sec_findings_high})")
-            score += 2
+            force_high = True
     if tests and tests.passed is False:
         signals.append("test command failed")
         force_high = True
@@ -580,17 +635,26 @@ def _sanitize_gen_filename(name: str, workspace: Path) -> str | None:
     name = name.lstrip("./")
     if not name or not _SAFE_FILENAME.match(name):
         return None
-    if (workspace / name).exists():  # never overwrite a real file
+    try:
+        target = _safe_injection_target(workspace, name)
+    except (OSError, ValueError):
+        return None
+    if target.exists():  # never overwrite a real file
         parts = name.rsplit("/", 1)
         parts[-1] = "agent_eval_gen_" + parts[-1]
         name = "/".join(parts)
-        if (workspace / name).exists():
+        try:
+            target = _safe_injection_target(workspace, name)
+        except (OSError, ValueError):
+            return None
+        if target.exists():
             return None
     return name
 
 
 def _build_gen_test_prompts(repo: Path, head: str | None, test_cmd: str,
                             diff: str, files: list[ChangedFile],
+                            source_root: Path | None = None,
                             ) -> tuple[str, str]:
     system = (
         "You write ONE discriminating test file for a code change: it must "
@@ -605,7 +669,16 @@ def _build_gen_test_prompts(repo: Path, head: str | None, test_cmd: str,
                and f.status != "D"][:MAX_GEN_CONTEXT_FILES]
     blocks = []
     for f in sources:
-        content = _head_file_content(repo, head, f.path)
+        if source_root is None:
+            content = _head_file_content(repo, head, f.path)
+        else:
+            try:
+                root = source_root.resolve(strict=True)
+                candidate = (source_root / f.path).resolve(strict=True)
+                candidate.relative_to(root)
+                content = candidate.read_text() if candidate.is_file() else None
+            except (OSError, RuntimeError, UnicodeDecodeError, ValueError):
+                content = None
         if content:
             blocks.append(f"### {f.path} (after the change)\n```\n"
                           f"{content[:MAX_GEN_FILE_CHARS]}\n```")
@@ -624,6 +697,7 @@ def run_generated_test_graders(repo: Path, head: str | None, anchor: str,
                                test_cmd: str, diff: str,
                                files: list[ChangedFile], head_ws: Path,
                                out_dir: Path,
+                               prompts: tuple[str, str] | None = None,
                                ) -> tuple[list[GraderResult], GeneratedTest | None]:
     """Classical grader with LLM-authored tests: generate a discriminating
     test, run it on head (must pass; one adaptive repair on failure), then
@@ -633,7 +707,9 @@ def run_generated_test_graders(repo: Path, head: str | None, anchor: str,
 
     results: list[GraderResult] = []
     console.print("generating a discriminating test with the LLM...")
-    system, user = _build_gen_test_prompts(repo, head, test_cmd, diff, files)
+    system, user = prompts or _build_gen_test_prompts(
+        repo, head, test_cmd, diff, files
+    )
     try:
         gen, model = structured_completion(system, user, GeneratedTest,
                                            _GEN_TEST_SCHEMA)
@@ -652,9 +728,12 @@ def run_generated_test_graders(repo: Path, head: str | None, anchor: str,
     gen.filename = filename
 
     def run_with_injected(tree: Path, code: str) -> tuple[int | None, str]:
-        target = tree / filename
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(code)
+        try:
+            target = _write_injected_file(
+                tree, filename, code, overwrite=False
+            )
+        except (OSError, ValueError) as exc:
+            return None, f"generated test injection refused: {exc}"
         try:
             return _run_shell(test_cmd, tree, TEST_TIMEOUT)
         finally:
@@ -672,9 +751,16 @@ def run_generated_test_graders(repo: Path, head: str | None, anchor: str,
             "(names, signatures, fixtures), fix the test. If it reveals a "
             "real behavioral bug in the change, keep the failing assertion "
             "and say so in notes. Output the complete corrected file.")
-        repair_user = (f"{user}\n\n# Your previous test file ({gen.filename})\n\n"
-                       f"```\n{gen.code}\n```\n\n# Failure output\n\n"
-                       f"```\n{tail}\n```")
+        # Runtime output may contain ambient host secrets printed by the
+        # repository or test process. It is retained as local evidence but is
+        # never included in an external-model repair prompt.
+        repair_user = (
+            f"{user}\n\n# Your previous test file ({gen.filename})\n\n"
+            f"```\n{gen.code}\n```\n\n# Failure status\n\n"
+            "The test command exited non-zero. Runtime output is intentionally "
+            "withheld; repair only superficial mismatches visible in the "
+            "provided code and diff."
+        )
         try:
             gen2, model = structured_completion(repair_system, repair_user,
                                                 GeneratedTest, _GEN_TEST_SCHEMA)
@@ -705,8 +791,26 @@ def run_generated_test_graders(repo: Path, head: str | None, anchor: str,
     if head_pass:
         start = time.monotonic()
         with worktree(repo, anchor) as base_tree:
-            base_exit, base_tail = run_with_injected(base_tree, gen.code)
-        if base_exit is None:
+            baseline_exit, baseline_tail = _run_shell(
+                test_cmd, base_tree, TEST_TIMEOUT
+            )
+            if baseline_exit == 0:
+                base_exit, base_tail = run_with_injected(base_tree, gen.code)
+            else:
+                base_exit, base_tail = None, baseline_tail
+        if baseline_exit is None:
+            base_pass = None
+            details = (
+                "base suite timed out before generated-test injection; "
+                "discrimination could not be established"
+            )
+        elif baseline_exit != 0:
+            base_pass = None
+            details = (
+                f"base suite already fails (exit {baseline_exit}) before "
+                "generated-test injection; discrimination could not be established"
+            )
+        elif base_exit is None:
             base_pass, details = None, base_tail
         elif base_exit != 0:
             base_pass = True
@@ -729,60 +833,79 @@ def _normalize_ws(s: str) -> str:
     return " ".join(s.split())
 
 
-def _added_head_line_runs(
+def _diff_evidence_runs(
     diff: str, changed_paths: list[str]
-) -> dict[str, list[list[tuple[int, str]]]]:
-    """Return contiguous added-line runs with their head-side line numbers."""
+) -> dict[str, dict[str, list[list[tuple[int, int, str]]]]]:
+    """Return contiguous added/deleted runs with source lines and head anchors."""
+
     known_paths = set(changed_paths)
-    runs: dict[str, list[list[tuple[int, str]]]] = {
-        path: [] for path in changed_paths
+    runs: dict[str, dict[str, list[list[tuple[int, int, str]]]]] = {
+        side: {path: [] for path in changed_paths} for side in ("head", "base")
     }
-    current_path: str | None = None
+    base_path: str | None = None
+    head_path: str | None = None
+    base_line: int | None = None
     head_line: int | None = None
-    current_run: list[tuple[int, str]] | None = None
+    head_run: list[tuple[int, int, str]] | None = None
+    base_run: list[tuple[int, int, str]] | None = None
 
     for line in diff.splitlines():
         if line.startswith("diff --git "):
-            current_path = None
-            head_line = None
-            current_run = None
+            base_path = head_path = None
+            base_line = head_line = None
+            head_run = base_run = None
             continue
-        if head_line is None and line.startswith("+++ "):
-            current_path = _patch_path(line[4:], known_paths)
-            current_run = None
+        if base_line is None and line.startswith("--- "):
+            base_path = _patch_path(line[4:], known_paths)
+            continue
+        if base_line is None and line.startswith("+++ "):
+            head_path = _patch_path(line[4:], known_paths)
             continue
 
         hunk = _HUNK_HEADER.match(line)
         if hunk:
-            head_line = int(hunk.group("start")) if current_path else None
-            current_run = None
+            base_line = int(hunk.group("base"))
+            head_line = int(hunk.group("head"))
+            head_run = base_run = None
             continue
-        if current_path is None or head_line is None:
+        if base_line is None or head_line is None:
             continue
         if line.startswith("+"):
-            if current_run is None:
-                current_run = []
-                runs[current_path].append(current_run)
-            current_run.append((head_line, line[1:]))
+            base_run = None
+            if head_path is not None:
+                if head_run is None:
+                    head_run = []
+                    runs["head"][head_path].append(head_run)
+                head_run.append((head_line, max(1, head_line), line[1:]))
             head_line += 1
-        elif line.startswith("-") or line.startswith("\\ No newline"):
-            current_run = None
+        elif line.startswith("-"):
+            head_run = None
+            if base_path is not None:
+                if base_run is None:
+                    base_run = []
+                    runs["base"][base_path].append(base_run)
+                base_run.append((base_line, max(1, head_line), line[1:]))
+            base_line += 1
+        elif line.startswith("\\ No newline"):
+            continue
         else:
-            current_run = None
+            head_run = base_run = None
+            base_line += 1
             head_line += 1
 
     return runs
 
 
 def _evidence_line_ranges(
-    runs: list[list[tuple[int, str]]], quote: str
-) -> list[tuple[int, int]]:
-    """Locate a normalized evidence quote within contiguous added-line runs."""
-    matches: list[tuple[int, int]] = []
+    runs: list[list[tuple[int, int, str]]], quote: str
+) -> list[tuple[int, int, int]]:
+    """Locate a normalized quote and return source range plus head anchor."""
+
+    matches: list[tuple[int, int, int]] = []
     for run in runs:
         text = ""
-        spans: list[tuple[int, int, int]] = []
-        for line_number, content in run:
+        spans: list[tuple[int, int, int, int]] = []
+        for line_number, head_anchor, content in run:
             normalized = _normalize_ws(content)
             if not normalized:
                 continue
@@ -790,18 +913,23 @@ def _evidence_line_ranges(
                 text += " "
             start = len(text)
             text += normalized
-            spans.append((start, len(text), line_number))
+            spans.append((start, len(text), line_number, head_anchor))
 
         offset = 0
         while quote and (position := text.find(quote, offset)) >= 0:
             end = position + len(quote)
             matched_lines = [
                 line_number
-                for start, stop, line_number in spans
+                for start, stop, line_number, _ in spans
                 if start < end and stop > position
             ]
             if matched_lines:
-                location = (matched_lines[0], matched_lines[-1])
+                anchors = [
+                    head_anchor
+                    for start, stop, _, head_anchor in spans
+                    if start < end and stop > position
+                ]
+                location = (matched_lines[0], matched_lines[-1], anchors[0])
                 if location not in matches:
                     matches.append(location)
             offset = position + 1
@@ -820,24 +948,39 @@ def _finding_path(value: str, changed_paths: set[str]) -> str | None:
 def verify_findings(findings: list[Finding], diff: str,
                     changed_paths: list[str]) -> list[Finding]:
     """Programmatic verification bar: a finding survives only if its evidence
-    is a verbatim quote from added lines in its named changed file. A supplied
-    line must overlap the evidence; a missing line is derived from it. Nits
-    are capped at MAX_NITS. Returns the surviving list (unverified are kept
-    in the report JSON but excluded from risk and rendering)."""
+    is a whitespace-normalized quote from contiguous added or deleted lines in
+    its named changed file. A supplied line must overlap that evidence on the
+    declared side. Base-side findings are mapped to the nearest head hunk
+    anchor for reporting. Nits are capped at MAX_NITS."""
     known_paths = set(changed_paths)
-    added_runs = _added_head_line_runs(diff, changed_paths)
+    evidence_runs = _diff_evidence_runs(diff, changed_paths)
     kept: list[Finding] = []
     nits = 0
     for f in findings:
         quote = _normalize_ws(f.evidence)
         path = _finding_path(f.file, known_paths)
-        locations = _evidence_line_ranges(added_runs.get(path, []), quote) \
-            if path and len(quote) >= 12 else []
-        if f.line is None and locations:
-            f.line = locations[0][0]
-        f.verified = bool(locations) and f.line is not None and any(
-            start <= f.line <= end for start, end in locations
+        side = f.evidence_side if f.evidence_side in {"head", "base"} else None
+        locations = (
+            _evidence_line_ranges(evidence_runs[side].get(path, []), quote)
+            if path and side and len(quote) >= 12
+            else []
         )
+        supplied_line = f.line
+        if supplied_line is None and locations:
+            supplied_line = locations[0][0]
+        matching = next(
+            (
+                location
+                for location in locations
+                if supplied_line is not None
+                and location[0] <= supplied_line <= location[1]
+            ),
+            None,
+        )
+        f.verified = matching is not None
+        if matching is not None:
+            f.evidence_line = supplied_line
+            f.line = matching[2]
         if f.verified and f.severity == "nit":
             nits += 1
             if nits > MAX_NITS:
@@ -852,8 +995,8 @@ def _grader_evidence_lines(graders: list[GraderResult]) -> list[str]:
     for g in graders:
         state = {True: "pass", False: "FAIL", None: "skipped"}[g.passed]
         lines.append(f"  - [{state}] {g.name} ({g.category}): {g.details}")
-        if g.passed is False and g.output_tail:
-            lines.append(f"    output tail: {g.output_tail[-800:]}")
+        # Command output stays in the local report. A repository can print
+        # ambient secrets, so output tails do not cross the model boundary.
     return lines
 
 
@@ -864,9 +1007,11 @@ def _build_review_prompts(report: ChangeReport, diff: str,
         "change. You are given executable evidence (grader results, scanner "
         "findings, risk signals) plus the diff.\n"
         "Rules for findings:\n"
-        "- Every finding's `evidence` must be a verbatim contiguous quote "
-        "from added lines in its named file. Its `line` must be one of the "
-        "quoted added lines; use null to derive it from the evidence. Findings "
+        "- Every finding's `evidence` must be a contiguous quote from changed "
+        "lines in its named file. Set `evidence_side` to `head` for added lines "
+        "or `base` for deleted lines. Its `line` must be on the quoted side; "
+        "use null to derive it from the evidence. Whitespace is normalized, "
+        "but paraphrases are rejected. Findings "
         "whose quote cannot be located are discarded, so never paraphrase.\n"
         "- Report only problems INTRODUCED by this change, not pre-existing "
         "ones, and only what you can prove from the diff and evidence; if "
@@ -926,7 +1071,8 @@ def _llm_verify_findings(findings: list[Finding], diff: str) -> None:
         "valuable as confirming a real one.")
     listing = "\n".join(
         f"[{i}] ({f.severity}/{f.category}) {f.file}:{f.line} — {f.claim}\n"
-        f"    evidence: {f.evidence}" for i, f in candidates)
+        f"    evidence ({f.evidence_side} line {f.evidence_line}): {f.evidence}"
+        for i, f in candidates)
     user = (f"# Candidate findings\n\n{listing}\n\n"
             f"# Diff\n\n```diff\n{diff}\n```\n\n"
             "Return a verdict for every candidate index above.")
@@ -954,7 +1100,7 @@ def llm_findings_risk(review: LLMReview) -> str:
     if any(f.severity == "blocker" and f.verdict == "confirmed" for f in active):
         return "high"
     if any(f.severity == "major" and f.verdict == "confirmed" for f in active):
-        return "medium"
+        return "high"
     return "low"
 
 
@@ -998,12 +1144,23 @@ def review_change(repo: Path, base: str | None = None, head: str | None = None,
                   checks: list[str] | None = None, gen_tests: bool = False,
                   policy_path: Path | None = None,
                   run_scans: bool = True, run_llm: bool = True,
-                  out_dir: Path | None = None) -> ChangeReport:
+                  out_dir: Path | None = None,
+                  allow_local_execution: bool = False) -> ChangeReport:
     repo = repo.resolve()
     base = resolve_base(repo, base)
-    policy = load_policy(repo, policy_path)
+    policy = load_policy(
+        repo,
+        policy_path,
+        trusted_ref=base if policy_path is None else None,
+    )
     test_cmd = test_cmd or policy.test_cmd
     checks = [*policy.checks, *(checks or [])]
+    if (test_cmd or checks or gen_tests) and not allow_local_execution:
+        raise RuntimeError(
+            "local execution blocked: test/check/generated graders run "
+            "change-controlled code; pass allow_local_execution only for a "
+            "trusted change"
+        )
     report = ChangeReport(repo=str(repo), base=base,
                           head=head or "working tree", created_at=now_iso())
 
@@ -1027,20 +1184,90 @@ def review_change(repo: Path, base: str | None = None, head: str | None = None,
     report.graders += scope_graders([(f.path, f.subsystem) for f in files],
                                     stats.lines_added + stats.lines_removed,
                                     policy)
+    if policy_path is None and any(
+        file.path in {".agent-eval.yaml", ".agent-eval.yml"} for file in files
+    ):
+        report.graders.append(
+            GraderResult(
+                name="review policy is unchanged",
+                category="scope",
+                blocking=True,
+                passed=False,
+                details=(
+                    "the change modifies its own review policy; review that "
+                    "policy separately or supply an external --policy"
+                ),
+            )
+        )
 
+    secret_screening_safe = False
+    generated_test_prompts: tuple[str, str] | None = None
     if run_scans:
         with tempfile.TemporaryDirectory(prefix="agent-eval-review-") as tmp:
-            copied = snapshot_changed_files(repo, files, head, Path(tmp))
-            if copied:
-                from .evaluators.scanners import run_scanners
-                language = "python" if any(f.path.endswith(".py") for f in files) else None
-                console.print(f"scanning {copied} changed file(s)...")
-                report.scans = run_scanners(Path(tmp), out_dir, language)
-                prefix = str(Path(tmp).resolve()) + "/"
-                for finding in report.scans.findings:
-                    if isinstance(finding.get("path"), str):
-                        finding["path"] = finding["path"].removeprefix(prefix)
-                _scope_scans_to_changed_lines(report.scans, files)
+            scan_root = Path(tmp)
+            copied = snapshot_changed_files(repo, files, head, scan_root)
+            from .evaluators.scanners import run_scanners
+
+            # Screen the exact diff, including deleted lines and filename
+            # metadata, in addition to the head-side source snapshot.
+            (scan_root / "agent-eval-change.diff").write_text(diff_text)
+            metadata = [
+                context or "",
+                test_cmd or "",
+                *checks,
+                policy.model_dump_json(),
+                *(file.path for file in files),
+                *_git(
+                    repo, "ls-files", "*test*", "*spec*", check=False
+                ).splitlines()[:20],
+            ]
+            (scan_root / "agent-eval-review-metadata.txt").write_text(
+                "\n".join(metadata) + "\n"
+            )
+            language = "python" if any(f.path.endswith(".py") for f in files) else None
+            console.print(f"scanning {copied} changed file(s)...")
+            report.scans = run_scanners(scan_root, out_dir, language)
+            raw_secret_count = report.scans.secrets_found
+            secret_screening_safe = (
+                report.scans.scanner_status.get("gitleaks") == "ok"
+                and raw_secret_count == 0
+            )
+            if secret_screening_safe and gen_tests and test_cmd and run_llm:
+                # Cache model input from the screened snapshot before any
+                # change-controlled local command can mutate the worktree.
+                generated_test_prompts = _build_gen_test_prompts(
+                    repo,
+                    head,
+                    test_cmd,
+                    diff_text,
+                    files,
+                    source_root=scan_root,
+                )
+            prefix = str(scan_root.resolve()) + "/"
+            for finding in report.scans.findings:
+                if isinstance(finding.get("path"), str):
+                    finding["path"] = finding["path"].removeprefix(prefix)
+            _scope_scans_to_changed_lines(report.scans, files)
+            if raw_secret_count is not None:
+                report.scans.secrets_found = raw_secret_count
+
+    report.graders += scanner_graders(report.scans, policy)
+    external_model_safe = secret_screening_safe
+    if run_llm or gen_tests:
+        report.graders.append(
+            GraderResult(
+                name="external model input has passed secret screening",
+                category="scanner",
+                blocking=True,
+                passed=external_model_safe,
+                details=(
+                    "gitleaks completed with zero secrets"
+                    if external_model_safe
+                    else "external model calls skipped: gitleaks must complete "
+                    "successfully with zero detected secrets"
+                ),
+            )
+        )
 
     head_tests_pass: bool | None = None
     with head_workspace(repo, head) as ws:
@@ -1060,10 +1287,28 @@ def review_change(repo: Path, base: str | None = None, head: str | None = None,
                 console.print("[yellow]skipping generated tests: the existing "
                               "suite must pass on head first so failures are "
                               "attributable[/yellow]")
-            elif run_llm:
+            elif (
+                run_llm
+                and external_model_safe
+                and generated_test_prompts is not None
+            ):
                 gen_results, _ = run_generated_test_graders(
-                    repo, head, anchor, test_cmd, diff_text, files, ws, out_dir)
+                    repo,
+                    head,
+                    anchor,
+                    test_cmd,
+                    diff_text,
+                    files,
+                    ws,
+                    out_dir,
+                    prompts=generated_test_prompts,
+                )
                 report.graders += gen_results
+            else:
+                console.print(
+                    "[yellow]skipping generated tests: diff did not pass "
+                    "secret screening[/yellow]"
+                )
 
     changed_tests = {f.path: c for f in files
                      if f.subsystem == "tests" and f.status != "D"
@@ -1082,11 +1327,15 @@ def review_change(repo: Path, base: str | None = None, head: str | None = None,
     report.blocked = any(g.blocking and g.passed is False for g in report.graders)
     report.risk = report.heuristic_risk
 
-    if run_llm:
+    if run_llm and external_model_safe:
         report.llm, report.llm_model = run_llm_review(report, diff_text, context)
         if report.llm:
             report.risk = _max_risk(report.heuristic_risk,
                                     llm_findings_risk(report.llm))
+    elif run_llm:
+        console.print(
+            "[yellow]skipping LLM review: diff did not pass secret screening[/yellow]"
+        )
 
     _persist(report, out_dir)
     return report
@@ -1140,6 +1389,13 @@ def print_review(report: ChangeReport) -> None:
                       f"sec high/med/low={s.sec_findings_high}/"
                       f"{s.sec_findings_medium}/{s.sec_findings_low} "
                       f"secrets={s.secrets_found} vulns={s.vulns}")
+        console.print(
+            "  statuses: "
+            + ", ".join(
+                f"{name}={status}"
+                for name, status in sorted(s.scanner_status.items())
+            )
+        )
     if report.graders:
         gt = Table(title=None, show_edge=False, pad_edge=False)
         for col in ("grader", "category", "result", "details"):
@@ -1235,7 +1491,7 @@ def markdown_review(report: ChangeReport) -> str:
         rejected = sum(1 for f in report.llm.findings
                        if f.verified and f.verdict == "rejected")
         if dropped or rejected:
-            lines += [f"*{dropped} finding(s) dropped without verbatim diff "
+            lines += [f"*{dropped} finding(s) dropped without matching diff "
                       f"evidence; {rejected} rejected on adversarial "
                       "verification (see review.json).*", ""]
     return "\n".join(lines) + "\n"
