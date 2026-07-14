@@ -74,7 +74,11 @@ def pick_backend() -> str | None:
         return backend
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "claude"
-    if shutil.which("codex"):
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    codex_authenticated = bool(os.environ.get("OPENAI_API_KEY")) or (
+        codex_home / "auth.json"
+    ).is_file()
+    if shutil.which("codex") and codex_authenticated:
         return "codex"
     return None
 
@@ -174,6 +178,24 @@ def run_judge(task: Task, run_dir: Path) -> JudgeResult:
     except Exception as e:  # judge is supplementary; never fail the run
         console.print(f"[yellow]judge failed: {e}[/yellow]")
         return JudgeResult(rationale={"_error": str(e)})
+
+    returned_dimensions = [entry.dimension for entry in parsed.scores]
+    expected_dimensions = list(task.judge.weights)
+    if (
+        len(returned_dimensions) != len(expected_dimensions)
+        or set(returned_dimensions) != set(expected_dimensions)
+    ):
+        result = JudgeResult(
+            model=model,
+            rationale={
+                "_error": (
+                    "judge returned an incomplete or duplicate dimension set: "
+                    f"expected {expected_dimensions}, got {returned_dimensions}"
+                )
+            },
+        )
+        (run_dir / "judge.json").write_text(result.model_dump_json(indent=2))
+        return result
 
     result = JudgeResult(model=model)
     for entry in parsed.scores:

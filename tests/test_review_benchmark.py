@@ -490,7 +490,7 @@ def test_metric_math_clean_cases_and_wilson_intervals(tmp_path):
     assert metrics.precision == pytest.approx(2 / 3)
     assert metrics.recall == pytest.approx(2 / 3)
     assert metrics.f1 == pytest.approx(2 / 3)
-    assert metrics.blocker_major_recall == 1.0
+    assert metrics.blocker_major_recall == 0.5
     assert metrics.severity_accuracy == 0.5
     assert metrics.false_positives_per_case == 0.5
     assert metrics.false_positives_per_kloc == 10.0
@@ -653,12 +653,9 @@ def test_native_change_report_filters_inactive_findings(tmp_path):
     case = result.cases[0]
 
     assert case.status == "scored"
-    assert case.prediction_count == 2
-    assert (case.tp, case.fp, case.fn) == (2, 0, 2)
-    assert {match.expected_id for match in case.matches} == {
-        "confirmed",
-        "unadjudicated",
-    }
+    assert case.prediction_count == 1
+    assert (case.tp, case.fp, case.fn) == (1, 0, 3)
+    assert {match.expected_id for match in case.matches} == {"confirmed"}
 
 
 def test_clean_case_accuracy_penalizes_generic_false_alarms(tmp_path):
@@ -734,6 +731,70 @@ def test_fp_per_kloc_requires_changed_lines_for_every_case(tmp_path):
     assert metrics.false_positives == 1
     assert metrics.changed_lines is None
     assert metrics.false_positives_per_kloc is None
+
+
+def test_missing_outputs_do_not_dilute_false_positive_exposure(tmp_path):
+    manifest = BenchmarkManifest(
+        cases=[
+            BenchmarkCase(id="scored", changed_lines=100),
+            BenchmarkCase(id="missing", changed_lines=900),
+            BenchmarkCase(id="incomplete", changed_lines=500),
+        ]
+    )
+    reviews = tmp_path / "reviews"
+    _write_predictions(
+        reviews,
+        "scored",
+        [
+            {
+                "severity": "minor",
+                "category": "correctness",
+                "file": "src/app.py",
+                "line": 1,
+            }
+        ],
+    )
+    (reviews / "incomplete.json").write_text(json.dumps({}))
+
+    metrics = score_benchmark(manifest, reviews).metrics
+
+    assert metrics.case_count == 3
+    assert metrics.scored_case_count == 1
+    assert metrics.false_positives == 1
+    assert metrics.false_positives_per_case == 1.0
+    assert metrics.changed_lines == 100
+    assert metrics.false_positives_per_kloc == 10.0
+
+
+def test_critical_recall_requires_a_high_severity_prediction(tmp_path):
+    manifest = BenchmarkManifest(
+        cases=[
+            BenchmarkCase(
+                id="critical",
+                expected_findings=[
+                    _expected("critical", severity="blocker", line_start=10)
+                ],
+            )
+        ]
+    )
+    reviews = tmp_path / "reviews"
+    _write_predictions(
+        reviews,
+        "critical",
+        [
+            {
+                "severity": "minor",
+                "category": "correctness",
+                "file": "src/app.py",
+                "line": 10,
+            }
+        ],
+    )
+
+    metrics = score_benchmark(manifest, reviews).metrics
+
+    assert metrics.recall == 1.0
+    assert metrics.blocker_major_recall == 0.0
 
 
 def test_benchmark_cli_writes_item_results_and_enforces_regression_gates(tmp_path):

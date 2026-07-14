@@ -1,6 +1,9 @@
 import json
+import os
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from agent_eval.agents.claude_code import ClaudeCodeAdapter
 from agent_eval.evaluators.tests import parse_coverage, parse_junit
@@ -12,10 +15,61 @@ REPO = Path(__file__).resolve().parents[1]
 
 def test_load_example_task():
     task = load_task("example-todo-api")
-    assert task.image_tag == "agent-eval/example-todo-api:latest"
+    assert task.image_tag.startswith("agent-eval/example-todo-api:")
+    assert task.image_tag != "agent-eval/example-todo-api:latest"
+    assert len(task.image_tag.rsplit(":", 1)[1]) == 12
     assert "junit.xml" in task.test_command
     assert task.validate_layout() == []
     assert abs(sum(task.judge.weights.values()) - 1.0) < 1e-9
+
+
+def test_task_image_tag_changes_with_build_context(tmp_path):
+    from agent_eval.task import load_task
+
+    task_dir = tmp_path / "content-task"
+    workspace = task_dir / "environment" / "workspace"
+    tests = task_dir / "tests"
+    workspace.mkdir(parents=True)
+    tests.mkdir()
+    (task_dir / "task.yaml").write_text(
+        "id: content-task\nprompt: Change it\ntest_command: pytest\n"
+    )
+    (task_dir / "environment" / "Dockerfile").write_text("FROM python:3.12\n")
+    source = workspace / "app.py"
+    source.write_text("value = 1\n")
+    (tests / "test_app.py").write_text("def test_x(): assert True\n")
+    first = load_task("content-task", tmp_path).image_tag
+
+    source.write_text("value = 2\n")
+    second = load_task("content-task", tmp_path).image_tag
+
+    assert first != second
+
+
+def test_task_image_tag_binds_file_modes_and_generated_context_files(tmp_path):
+    task_dir = tmp_path / "content-task"
+    workspace = task_dir / "environment" / "workspace"
+    tests = task_dir / "tests"
+    workspace.mkdir(parents=True)
+    tests.mkdir()
+    (task_dir / "task.yaml").write_text(
+        "id: content-task\nprompt: Change it\ntest_command: pytest\n"
+    )
+    (task_dir / "environment" / "Dockerfile").write_text("FROM python:3.12\n")
+    source = workspace / "tool.py"
+    source.write_text("value = 1\n")
+    (tests / "test_app.py").write_text("def test_x(): assert True\n")
+
+    original = load_task("content-task", tmp_path).image_tag
+    source.chmod(0o755)
+    executable = load_task("content-task", tmp_path).image_tag
+    assert executable != original
+
+    cache = workspace / "__pycache__"
+    cache.mkdir()
+    (cache / "tool.pyc").write_bytes(b"generated")
+    with_generated_file = load_task("content-task", tmp_path).image_tag
+    assert with_generated_file != executable
 
 
 def test_parse_junit(tmp_path):
@@ -38,11 +92,126 @@ def test_parse_junit_missing_is_infra_error(tmp_path):
     assert r.infra_error and not r.resolved
 
 
+@pytest.mark.parametrize(
+    ("contents", "error"),
+    [
+        ("<not-junit/>", "root must be"),
+        ('<testsuite tests="many"/>', "non-negative integer"),
+        ('<testsuite tests="-1"/>', "non-negative integer"),
+        (
+            '<testsuite tests="1" failures="1" errors="1" skipped="0"/>',
+            "exceed tests count",
+        ),
+        (
+            '<testsuites tests="2"><testsuite tests="1"/></testsuites>',
+            "does not match",
+        ),
+    ],
+)
+def test_parse_junit_rejects_invalid_structure_and_counts(
+    tmp_path, contents, error
+):
+    junit = tmp_path / "junit.xml"
+    junit.write_text(contents)
+
+    result = parse_junit(junit, command_exit_code=0)
+
+    assert result.infra_error and error in result.infra_error
+    assert not result.resolved
+
+
+def test_parse_junit_fails_closed_for_unreadable_or_unicode_invalid_artifacts(
+    monkeypatch, tmp_path
+):
+    junit = tmp_path / "junit.xml"
+    junit.write_bytes(b'\xff\xfe<testsuite tests="1"/>')
+    invalid_encoding = parse_junit(junit, command_exit_code=0)
+    assert invalid_encoding.infra_error
+    assert not invalid_encoding.resolved
+
+    def unreadable(_path):
+        raise PermissionError("untrusted artifact is not readable")
+
+    monkeypatch.setattr("agent_eval.evaluators.tests.ET.parse", unreadable)
+    unreadable_result = parse_junit(junit, command_exit_code=0)
+    assert unreadable_result.infra_error == "junit xml unreadable: PermissionError"
+    assert not unreadable_result.resolved
+
+
+def test_parse_junit_fails_closed_for_unknown_xml_encoding(tmp_path):
+    junit = tmp_path / "junit.xml"
+    junit.write_bytes(
+        b'<?xml version="1.0" encoding="x-unknown"?>'
+        b'<testsuite tests="1"/>'
+    )
+
+    result = parse_junit(junit, command_exit_code=0)
+
+    assert result.infra_error == "junit xml unreadable: LookupError"
+    assert not result.resolved
+
+
+def test_parse_junit_requires_successful_command_and_a_passed_test(tmp_path):
+    junit = tmp_path / "junit.xml"
+    junit.write_text(
+        '<testsuites><testsuite tests="1" failures="0" errors="0" skipped="0">'
+        '<testcase classname="t" name="ok"/>'
+        "</testsuite></testsuites>"
+    )
+
+    assert parse_junit(junit, command_exit_code=0).resolved
+    failed_command = parse_junit(junit, command_exit_code=1)
+    assert failed_command.command_exit_code == 1
+    assert not failed_command.resolved
+
+    junit.write_text(
+        '<testsuites><testsuite tests="1" failures="0" errors="0" skipped="1">'
+        '<testcase classname="t" name="skipped"><skipped/></testcase>'
+        "</testsuite></testsuites>"
+    )
+    all_skipped = parse_junit(junit, command_exit_code=0)
+    assert all_skipped.passed == 0
+    assert not all_skipped.resolved
+
+
 def test_parse_coverage(tmp_path):
     cov = tmp_path / "coverage.json"
     cov.write_text(json.dumps({"totals": {"percent_covered": 87.5}}))
     assert parse_coverage(cov) == 87.5
     assert parse_coverage(tmp_path / "nope.json") is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"{not json",
+        b"\xff\xfe{not utf-8}",
+        b'{"totals": {"percent_covered": true}}',
+        b'{"totals": {"percent_covered": "100"}}',
+        b'{"totals": {"percent_covered": -0.1}}',
+        b'{"totals": {"percent_covered": 100.1}}',
+        b'{"totals": {"percent_covered": NaN}}',
+        b'{"totals": {"percent_covered": ' + (b"9" * 400) + b"}}",
+    ],
+)
+def test_parse_coverage_fails_closed_for_untrusted_artifacts(tmp_path, payload):
+    coverage = tmp_path / "coverage.json"
+    coverage.write_bytes(payload)
+
+    assert parse_coverage(coverage) is None
+
+
+def test_parse_coverage_fails_closed_when_artifact_becomes_unreadable(
+    monkeypatch, tmp_path
+):
+    coverage = tmp_path / "coverage.json"
+    coverage.write_text('{"totals": {"percent_covered": 100}}')
+
+    def unreadable(_path):
+        raise PermissionError("untrusted artifact is not readable")
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    assert parse_coverage(coverage) is None
 
 
 def test_claude_transcript_parsing(tmp_path):
@@ -197,6 +366,46 @@ def test_policy_loading(tmp_path):
     assert load_policy(tmp_path / "nowhere").test_cmd is None
 
 
+def test_explicit_policy_path_must_exist_and_parse(tmp_path):
+    from agent_eval.graders import load_policy
+
+    missing = tmp_path / "missing.yaml"
+    with pytest.raises(RuntimeError, match="not a readable regular file"):
+        load_policy(tmp_path, explicit=missing)
+
+    malformed = tmp_path / "malformed.yaml"
+    malformed.write_text("review: [\n")
+    with pytest.raises(RuntimeError, match="invalid review policy"):
+        load_policy(tmp_path, explicit=malformed)
+
+
+def test_review_policy_is_loaded_from_trusted_base_and_rejects_typos(tmp_path):
+    from pydantic import ValidationError
+
+    from agent_eval.graders import ReviewPolicy, load_policy
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True
+    )
+    policy = tmp_path / ".agent-eval.yaml"
+    policy.write_text("review:\n  max_files: 3\n")
+    subprocess.run(["git", "add", ".agent-eval.yaml"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "policy"], cwd=tmp_path, check=True
+    )
+    policy.write_text("review:\n  max_files: 999\n")
+
+    assert load_policy(tmp_path, trusted_ref="HEAD").max_files == 3
+    with pytest.raises(ValidationError, match="max_fiels"):
+        ReviewPolicy.model_validate({"max_fiels": 3})
+
+
 def test_verify_findings():
     from agent_eval.review import Finding, verify_findings
 
@@ -209,7 +418,8 @@ def test_verify_findings():
 
     good = Finding(severity="major", file="src/auth.py",
                    claim="weak hash",
-                   evidence="hashlib.md5(password.encode()).hexdigest()")
+                   evidence="hashlib.md5(password.encode()).hexdigest()",
+                   evidence_side="head")
     paraphrase = Finding(severity="major", file="src/auth.py",
                          claim="weak hash", evidence="uses an md5 digest call")
     wrong_file = Finding(severity="major", file="src/other.py",
@@ -232,6 +442,34 @@ def test_verify_findings():
     assert verified[3].verified is False
     assert verified[4].verified is False
     assert verified[0].line == 2
+
+
+def test_verify_findings_supports_deletion_only_security_regressions():
+    from agent_eval.review import Finding, verify_findings
+
+    diff = """\
+diff --git a/src/auth.py b/src/auth.py
+--- a/src/auth.py
++++ b/src/auth.py
+@@ -80,3 +80,2 @@ def delete_account(user, account):
+-    if not user.is_admin:
+-        raise PermissionError("admin required")
+     perform_delete(account)
+"""
+    finding = Finding(
+        severity="blocker",
+        category="security",
+        file="src/auth.py",
+        claim="authorization guard was removed",
+        evidence="if not user.is_admin: raise PermissionError(\"admin required\")",
+        evidence_side="base",
+    )
+
+    verified = verify_findings([finding], diff, ["src/auth.py"])[0]
+
+    assert verified.verified is True
+    assert verified.evidence_line == 80
+    assert verified.line == 80
 
 
 def test_verify_findings_binds_evidence_to_declared_file():
@@ -366,12 +604,91 @@ def test_llm_findings_risk():
     assert llm_findings_risk(LLMReview(risk="high",
                                        findings=[rejected_blocker,
                                                  unverified])) == "low"
-    assert llm_findings_risk(LLMReview(findings=[confirmed_major])) == "medium"
+    assert llm_findings_risk(LLMReview(findings=[confirmed_major])) == "high"
+
+
+def test_unconfirmed_high_severity_finding_is_not_active():
+    from agent_eval.review import Finding
+
+    assert not Finding(severity="blocker", verified=True).active
+    assert not Finding(severity="major", verified=True).active
+    assert Finding(severity="minor", verified=True).active
+
+
+def test_reverse_test_grader_does_not_credit_an_already_failing_base(
+    monkeypatch, tmp_path
+):
+    from agent_eval import graders
+
+    calls = []
+
+    def fake_run(cmd, cwd, timeout):
+        calls.append((cmd, cwd, timeout))
+        return 1, "pre-existing base failure"
+
+    monkeypatch.setattr(graders, "_run_shell", fake_run)
+    result = graders.reverse_test_grader(
+        "pytest -q", tmp_path, {"tests/test_new.py": "def test_new(): pass\n"}
+    )
+
+    assert result.passed is None
+    assert "already fails" in result.details
+    assert len(calls) == 1
+    assert not (tmp_path / "tests/test_new.py").exists()
+
+
+def test_judge_requires_every_configured_dimension_once(monkeypatch, tmp_path):
+    from agent_eval.evaluators import judge
+
+    task = load_task("example-todo-api")
+    (tmp_path / "workspace.diff").write_text("+changed behavior\n")
+    response = judge.JudgeResponse(
+        scores=[
+            judge.DimensionScore(
+                dimension="spec_adherence", score=5, rationale="first"
+            ),
+            judge.DimensionScore(
+                dimension="spec_adherence", score=4, rationale="duplicate"
+            ),
+            judge.DimensionScore(
+                dimension="maintainability", score=4, rationale="present"
+            ),
+        ]
+    )
+    monkeypatch.setattr(judge, "pick_backend", lambda: "codex")
+    monkeypatch.setattr(
+        judge,
+        "structured_completion",
+        lambda *args, **kwargs: (response, "test-model"),
+    )
+
+    result = judge.run_judge(task, tmp_path)
+
+    assert result.weighted_score is None
+    assert "incomplete or duplicate" in result.rationale["_error"]
+    assert (tmp_path / "judge.json").is_file()
+
+
+def test_auto_judge_requires_codex_auth_not_only_binary(monkeypatch, tmp_path):
+    from agent_eval.evaluators import judge
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("AGENT_EVAL_JUDGE", "auto")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setattr(judge.shutil, "which", lambda name: "/usr/bin/codex")
+
+    assert judge.pick_backend() is None
+
+    auth = tmp_path / "codex" / "auth.json"
+    auth.parent.mkdir()
+    auth.write_text("{}")
+    assert judge.pick_backend() == "codex"
 
 
 def test_compute_risk_with_graders():
     from agent_eval.graders import GraderResult
-    from agent_eval.metrics import DiffStats
+    from agent_eval.metrics import DiffStats, ScanResults
     from agent_eval.review import ChangedFile, compute_risk
 
     docs_only = [ChangedFile(path="README.md", subsystem="docs", lines_added=5)]
@@ -394,6 +711,35 @@ def test_compute_risk_with_graders():
     _, risk = compute_risk(docs_only, stats, None, None, [skipped])
     assert risk == "low"
 
+    high_scan = ScanResults(sec_findings_high=1)
+    _, risk = compute_risk(docs_only, stats, high_scan, None, [])
+    assert risk == "high"
+
+
+def test_scanner_graders_fail_closed_on_missing_or_excess_evidence():
+    from agent_eval.graders import ReviewPolicy, scanner_graders
+    from agent_eval.metrics import ScanResults
+
+    policy = ReviewPolicy(
+        required_scanners=["gitleaks"],
+        max_lint_errors=0,
+        max_security_findings_high=0,
+        max_secrets=0,
+    )
+    missing = scanner_graders(None, policy)
+    assert missing
+    assert all(result.blocking and result.passed is False for result in missing)
+
+    scans = ScanResults(
+        lint_errors=1,
+        sec_findings_high=0,
+        secrets_found=0,
+        scanner_status={"gitleaks": "ok"},
+    )
+    by_name = {result.name: result for result in scanner_graders(scans, policy)}
+    assert by_name["scanner available: gitleaks"].passed is True
+    assert by_name["scanner threshold: lint errors"].passed is False
+
 
 def test_sanitize_gen_filename(tmp_path):
     from agent_eval.review import _sanitize_gen_filename
@@ -404,6 +750,11 @@ def test_sanitize_gen_filename(tmp_path):
     assert _sanitize_gen_filename("a;rm -rf.py", tmp_path) is None
     (tmp_path / "test_x.py").write_text("existing")
     assert _sanitize_gen_filename("test_x.py", tmp_path) == "agent_eval_gen_test_x.py"
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+    assert _sanitize_gen_filename("linked/test_escape.py", tmp_path) is None
 
 
 def test_collect_changes_counts_untracked_files(tmp_path):
@@ -430,6 +781,277 @@ def test_collect_changes_counts_untracked_files(tmp_path):
     assert stats.lines_added == 2
     assert "diff --git a/src/new_feature.py b/src/new_feature.py" in diff
     assert "+def hello():" in diff
+
+
+def test_working_tree_symlink_never_leaks_target_content(tmp_path):
+    from agent_eval.review import collect_changes, snapshot_changed_files
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
+
+    outside = tmp_path / "private.txt"
+    outside.write_text("DO_NOT_EXFILTRATE\n")
+    (repo / "leak").symlink_to(outside)
+
+    files, _, diff = collect_changes(repo, "HEAD", None)
+    snapshot = tmp_path / "snapshot"
+    assert snapshot_changed_files(repo, files, None, snapshot) == 1
+    assert "DO_NOT_EXFILTRATE" not in diff
+    assert "DO_NOT_EXFILTRATE" not in (snapshot / "leak").read_text()
+    assert "new file mode 120000" in diff
+
+
+def test_changed_tracked_symlink_serializes_only_its_link_target(tmp_path):
+    from agent_eval.review import collect_changes, snapshot_changed_files
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    link = repo / "config-link"
+    link.symlink_to("old-target")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
+
+    outside = tmp_path / "private.txt"
+    outside.write_text("DO_NOT_EXFILTRATE\n")
+    link.unlink()
+    link.symlink_to(outside)
+
+    files, _, diff = collect_changes(repo, "HEAD", None)
+    snapshot = tmp_path / "snapshot"
+    assert snapshot_changed_files(repo, files, None, snapshot) == 1
+    assert "DO_NOT_EXFILTRATE" not in diff
+    assert (snapshot / "config-link").read_text() == os.fspath(outside)
+
+
+def test_reverse_test_injection_refuses_symlinked_parent(tmp_path):
+    from agent_eval.graders import reverse_test_grader
+
+    base = tmp_path / "base"
+    outside = tmp_path / "outside"
+    base.mkdir()
+    outside.mkdir()
+    (base / "linked").symlink_to(outside, target_is_directory=True)
+
+    result = reverse_test_grader(
+        "true", base, {"linked/test_escape.py": "def test_noop(): pass\n"}
+    )
+
+    assert result.passed is None
+    assert "unsafe test injection refused" in result.details
+    assert not (outside / "test_escape.py").exists()
+
+
+def test_review_skips_external_model_when_secret_screening_fails(
+    monkeypatch, tmp_path
+):
+    from agent_eval import review
+    from agent_eval.evaluators import scanners
+    from agent_eval.metrics import ScanResults
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    source = repo / "app.py"
+    source.write_text("value = 1\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
+    source.write_text("token = 'detected-secret'\n")
+
+    monkeypatch.setattr(
+        scanners,
+        "run_scanners",
+        lambda *args, **kwargs: ScanResults(
+            secrets_found=1,
+            scanner_status={"gitleaks": "ok"},
+        ),
+    )
+    monkeypatch.setattr(
+        review,
+        "run_llm_review",
+        lambda *args, **kwargs: pytest.fail("unsafe diff reached external model"),
+    )
+
+    report = review.review_change(
+        repo,
+        base="HEAD",
+        run_scans=True,
+        run_llm=True,
+        out_dir=tmp_path / "report",
+    )
+
+    assert report.llm is None
+    assert report.blocked is True
+    assert any(
+        grader.name == "external model input has passed secret screening"
+        and grader.passed is False
+        for grader in report.graders
+    )
+
+
+def test_review_context_is_inside_secret_screening_boundary(
+    monkeypatch, tmp_path
+):
+    from agent_eval import review
+    from agent_eval.evaluators import scanners
+    from agent_eval.metrics import ScanResults
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    source = repo / "app.py"
+    source.write_text("value = 1\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
+    source.write_text("value = 2\n")
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+
+    def fake_scanners(scan_root, *args, **kwargs):
+        metadata = (scan_root / "agent-eval-review-metadata.txt").read_text()
+        screened_diff = (scan_root / "agent-eval-change.diff").read_text()
+        assert secret in metadata
+        assert "diff --git" in screened_diff
+        return ScanResults(
+            secrets_found=1,
+            scanner_status={"gitleaks": "ok"},
+        )
+
+    monkeypatch.setattr(scanners, "run_scanners", fake_scanners)
+    monkeypatch.setattr(
+        review,
+        "run_llm_review",
+        lambda *args, **kwargs: pytest.fail("secret context reached model"),
+    )
+
+    report = review.review_change(
+        repo,
+        base="HEAD",
+        context=f"ticket token: {secret}",
+        out_dir=tmp_path / "report",
+    )
+
+    assert report.llm is None
+    assert report.blocked is True
+
+
+def test_generated_test_prompt_uses_screened_snapshot_not_mutated_worktree(
+    monkeypatch, tmp_path
+):
+    from agent_eval import review
+
+    repo = tmp_path / "repo"
+    snapshot = tmp_path / "screened"
+    repo.mkdir()
+    snapshot.mkdir()
+    (repo / "app.py").write_text("token = 'MUTATED_AFTER_SCAN'\n")
+    (snapshot / "app.py").write_text("value = 'screened-safe'\n")
+    monkeypatch.setattr(review, "_git", lambda *args, **kwargs: "")
+
+    _, user = review._build_gen_test_prompts(
+        repo,
+        None,
+        "pytest -q",
+        "+value = 'screened-safe'\n",
+        [review.ChangedFile(path="app.py", status="M")],
+        source_root=snapshot,
+    )
+
+    assert "screened-safe" in user
+    assert "MUTATED_AFTER_SCAN" not in user
+
+
+def test_generated_test_repair_never_sends_runtime_output_to_model(
+    monkeypatch, tmp_path
+):
+    from contextlib import contextmanager
+
+    from agent_eval import graders, review
+
+    head = tmp_path / "head"
+    base = tmp_path / "base"
+    out = tmp_path / "out"
+    head.mkdir()
+    base.mkdir()
+    out.mkdir()
+    runtime_secret = "AWS_SECRET_ACCESS_KEY=do-not-send-this-value"
+    model_users = []
+
+    monkeypatch.setattr(
+        review,
+        "_build_gen_test_prompts",
+        lambda *args, **kwargs: ("system", "screened source context"),
+    )
+
+    responses = [
+        review.GeneratedTest(
+            filename="tests/test_generated.py",
+            code="def test_generated(): assert False\n",
+        ),
+        review.GeneratedTest(
+            filename="tests/test_generated.py",
+            code="def test_generated(): assert True\n",
+        ),
+    ]
+
+    def fake_completion(system, user, *args, **kwargs):
+        del system, args, kwargs
+        model_users.append(user)
+        return responses.pop(0), "test-model"
+
+    exits = iter(
+        [
+            (1, runtime_secret),
+            (0, "head pass"),
+            (0, "baseline pass"),
+            (1, "base correctly fails"),
+        ]
+    )
+    monkeypatch.setattr(
+        "agent_eval.evaluators.judge.structured_completion", fake_completion
+    )
+    monkeypatch.setattr(graders, "_run_shell", lambda *args, **kwargs: next(exits))
+
+    @contextmanager
+    def fake_worktree(repo, anchor):
+        del repo, anchor
+        yield base
+
+    monkeypatch.setattr(review, "worktree", fake_worktree)
+
+    review.run_generated_test_graders(
+        head,
+        None,
+        "HEAD",
+        "pytest -q",
+        "+changed\n",
+        [],
+        head,
+        out,
+    )
+
+    assert len(model_users) == 2
+    assert runtime_secret not in model_users[1]
+    assert "Runtime output is intentionally withheld" in model_users[1]
 
 
 def test_collect_changes_preserves_renamed_head_paths(tmp_path):

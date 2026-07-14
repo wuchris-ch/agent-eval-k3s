@@ -1,0 +1,36 @@
+schema_version: "1.0"
+corpus_id: agent-eval-reviewer-corpus
+version: "1.0.0"
+benchmark_manifest: benchmark.yaml
+benchmark_sha256: da8d418f70431d361f701c78f0983f76ee88403a37f8ad5bb650d75a6ad71afa
+cases:
+  - id: auth-bypass
+    kind: faulty
+    diff: cases/auth-bypass/change.diff
+    reproducer:
+      command: [python, reproduce.py]
+      base_cwd: cases/auth-bypass/base
+      head_cwd: cases/auth-bypass/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/auth-bypass/change.diff: a4cb8433f9eec4abe63a9f6f510dea189e1b86636edd6f082d7e5ea14d3280b2
+      cases/auth-bypass/base/auth.py: d430d77d842a80552160c0d23f22759ea97b4c9092d86c261b0c194abb4ac665
+      cases/auth-bypass/base/reproduce.py: 8765a1649cc5dcd28d5f64f21061a701c08b7207a999ec832cc3487cb1785aa4
+      cases/auth-bypass/head/auth.py: 57a86c9dd89a4d02750da3df2ed62a467dd3a03659148bcc6616da820b4166ac
+      cases/auth-bypass/head/reproduce.py: 8765a1649cc5dcd28d5f64f21061a701c08b7207a999ec832cc3487cb1785aa4
+  - id: clean-refactor
+    kind: clean
+    diff: cases/clean-refactor/change.diff
+    reproducer:
+      command: [python, reproduce.py]
+      base_cwd: cases/clean-refactor/base
+      head_cwd: cases/clean-refactor/head
+      expected_base_exit: 0
+      expected_head_exit: 0
+    artifact_sha256:
+      cases/clean-refactor/change.diff: 403884a1a898a0f1006e74ac0999f950d11db08df151f3ae3232e6dff04e069e
+      cases/clean-refactor/base/formatting.py: ac45a2383747e7376b3d75abee9dcc295a843bb2f5710df59873b20a31c5bfe4
+      cases/clean-refactor/base/reproduce.py: e69d658562b9474a73a94d433db4779e6a4724e422d473bc433f736af12692f5
+      cases/clean-refactor/head/formatting.py: 97cf988eb4fb9a6cf09ffed5a401aab70c37942fed7703e7a8129ca4a6b91365
+      cases/clean-refactor/head/reproduce.py: e69d658562b9474a73a94d433db4779e6a4724e422d473bc433f736af12692f5

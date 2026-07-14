@@ -16,16 +16,20 @@ non-blocking failures add weighted risk signals.
 from __future__ import annotations
 
 import fnmatch
+import os
+import stat
 import shutil
 import subprocess
 import tempfile
 import time
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterator
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .metrics import ScanResults
 
 COMMAND_TIMEOUT = 600
 TEST_TIMEOUT = 900
@@ -48,6 +52,8 @@ class ReviewPolicy(BaseModel):
     Path patterns are fnmatch globs matched against the full repo-relative
     path (`*` crosses directory separators, so `src/*` matches `src/a/b.py`).
     """
+    model_config = ConfigDict(extra="forbid")
+
     test_cmd: str | None = None
     checks: list[str] = Field(default_factory=list)
     blocked_paths: list[str] = Field(default_factory=list)   # blocking
@@ -55,15 +61,72 @@ class ReviewPolicy(BaseModel):
     max_files: int | None = None                             # non-blocking
     max_lines: int | None = None                             # non-blocking
     require_tests_for: list[str] = Field(default_factory=list)  # non-blocking
+    required_scanners: list[str] = Field(default_factory=list)
+    max_lint_errors: int | None = Field(default=None, ge=0)
+    max_security_findings_high: int | None = Field(default=None, ge=0)
+    max_security_findings_medium: int | None = Field(default=None, ge=0)
+    max_secrets: int | None = Field(default=None, ge=0)
+    max_vulnerabilities: int | None = Field(default=None, ge=0)
+
+    @field_validator("required_scanners")
+    @classmethod
+    def _normalize_required_scanners(cls, value: list[str]) -> list[str]:
+        result = []
+        for scanner in value:
+            normalized = scanner.strip().lower()
+            if not normalized:
+                raise ValueError("required scanner names must not be empty")
+            if normalized not in result:
+                result.append(normalized)
+        return result
 
 
-def load_policy(repo: Path, explicit: Path | None = None) -> ReviewPolicy:
-    candidates = [explicit] if explicit else \
-        [repo / ".agent-eval.yaml", repo / ".agent-eval.yml"]
-    for path in candidates:
-        if path and path.is_file():
-            data = yaml.safe_load(path.read_text()) or {}
+def load_policy(
+    repo: Path,
+    explicit: Path | None = None,
+    *,
+    trusted_ref: str | None = None,
+) -> ReviewPolicy:
+    def parse_policy(raw: str, source: str) -> ReviewPolicy:
+        try:
+            data = yaml.safe_load(raw) or {}
+            if not isinstance(data, dict):
+                raise ValueError("policy root must be a mapping")
             return ReviewPolicy(**(data.get("review") or data))
+        except (yaml.YAMLError, ValueError) as exc:
+            raise RuntimeError(f"invalid review policy {source}: {exc}") from exc
+
+    if explicit is not None:
+        path = explicit.expanduser()
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(
+                f"explicit review policy is not a readable regular file: {path}"
+            )
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RuntimeError(f"could not read explicit review policy {path}: {exc}") from exc
+        return parse_policy(raw, str(path))
+
+    if trusted_ref is not None and explicit is None:
+        for name in (".agent-eval.yaml", ".agent-eval.yml"):
+            proc = subprocess.run(
+                ["git", "show", f"{trusted_ref}:{name}"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode == 0:
+                return parse_policy(proc.stdout, f"{trusted_ref}:{name}")
+        return ReviewPolicy()
+    candidates = [repo / ".agent-eval.yaml", repo / ".agent-eval.yml"]
+    for path in candidates:
+        if path.is_file():
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise RuntimeError(f"could not read review policy {path}: {exc}") from exc
+            return parse_policy(raw, str(path))
     return ReviewPolicy()
 
 
@@ -111,6 +174,48 @@ def _run_shell(cmd: str, cwd: Path, timeout: int) -> tuple[int | None, str]:
         return None, f"timed out after {timeout}s"
 
 
+def _safe_injection_target(workspace: Path, relative: str) -> Path:
+    """Resolve a worktree-relative write target without following symlinks."""
+
+    pure = PurePosixPath(relative)
+    if (
+        not relative
+        or "\\" in relative
+        or pure.is_absolute()
+        or any(part in ("", ".", "..") for part in pure.parts)
+    ):
+        raise ValueError("injection path must be a canonical worktree-relative path")
+    root = workspace.resolve(strict=True)
+    current = root
+    for index, part in enumerate(pure.parts):
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"injection path contains symlink: {relative}")
+        if index < len(pure.parts) - 1 and not stat.S_ISDIR(mode):
+            raise ValueError(f"injection parent is not a directory: {relative}")
+        if index == len(pure.parts) - 1 and stat.S_ISDIR(mode):
+            raise ValueError(f"injection target is a directory: {relative}")
+    return root.joinpath(*pure.parts)
+
+
+def _write_injected_file(
+    workspace: Path, relative: str, content: str, *, overwrite: bool
+) -> Path:
+    target = _safe_injection_target(workspace, relative)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target = _safe_injection_target(workspace, relative)
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    flags |= os.O_TRUNC if overwrite else os.O_EXCL
+    fd = os.open(target, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(content)
+    return target
+
+
 # -------------------------------------------------------------------- graders
 
 def command_grader(cmd: str, workspace: Path,
@@ -144,10 +249,45 @@ def reverse_test_grader(test_cmd: str, base_tree: Path,
         return GraderResult(name="new/changed tests vs base commit",
                             category="reverse-classical", blocking=False,
                             details="no new or changed tests to validate")
+    baseline_code, baseline_tail = _run_shell(test_cmd, base_tree, TEST_TIMEOUT)
+    if baseline_code is None:
+        return GraderResult(
+            name="new/changed tests vs base commit",
+            category="reverse-classical",
+            blocking=False,
+            passed=None,
+            details=(
+                "base suite timed out before test injection; discrimination "
+                "could not be established"
+            ),
+            output_tail=baseline_tail,
+            duration_s=round(time.monotonic() - start, 1),
+        )
+    if baseline_code != 0:
+        return GraderResult(
+            name="new/changed tests vs base commit",
+            category="reverse-classical",
+            blocking=False,
+            passed=None,
+            details=(
+                f"base suite already fails (exit {baseline_code}) before test "
+                "injection; discrimination could not be established"
+            ),
+            output_tail=baseline_tail,
+            duration_s=round(time.monotonic() - start, 1),
+        )
     for rel, content in test_files.items():
-        target = base_tree / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
+        try:
+            _write_injected_file(base_tree, rel, content, overwrite=True)
+        except (OSError, ValueError) as exc:
+            return GraderResult(
+                name="new/changed tests vs base commit",
+                category="reverse-classical",
+                blocking=False,
+                passed=None,
+                details=f"unsafe test injection refused: {exc}",
+                duration_s=round(time.monotonic() - start, 1),
+            )
     code, tail = _run_shell(test_cmd, base_tree, TEST_TIMEOUT)
     if code is None:
         passed, details = None, tail
@@ -220,4 +360,66 @@ def scope_graders(paths_by_subsystem: list[tuple[str, str]],
                 details=(f"{len(needing)} changed file(s) under "
                          f"{policy.require_tests_for} "
                          + ("with" if has_tests else "WITHOUT") + " test changes")))
+    return results
+
+
+def scanner_graders(
+    scans: ScanResults | None, policy: ReviewPolicy
+) -> list[GraderResult]:
+    """Create blocking, fail-closed graders for configured scan evidence."""
+
+    results: list[GraderResult] = []
+    statuses = scans.scanner_status if scans is not None else {}
+    for scanner in policy.required_scanners:
+        state = statuses.get(scanner)
+        passed = state in {"ok", "not_applicable"}
+        results.append(
+            GraderResult(
+                name=f"scanner available: {scanner}",
+                category="scanner",
+                blocking=True,
+                passed=passed,
+                details=(
+                    f"status {state}"
+                    if state is not None
+                    else "scanner evidence unavailable"
+                ),
+            )
+        )
+
+    thresholds = (
+        ("lint errors", scans.lint_errors if scans else None, policy.max_lint_errors),
+        (
+            "high security findings",
+            scans.sec_findings_high if scans else None,
+            policy.max_security_findings_high,
+        ),
+        (
+            "medium security findings",
+            scans.sec_findings_medium if scans else None,
+            policy.max_security_findings_medium,
+        ),
+        ("secrets", scans.secrets_found if scans else None, policy.max_secrets),
+        (
+            "vulnerabilities",
+            scans.vulns if scans else None,
+            policy.max_vulnerabilities,
+        ),
+    )
+    for name, observed, maximum in thresholds:
+        if maximum is None:
+            continue
+        results.append(
+            GraderResult(
+                name=f"scanner threshold: {name}",
+                category="scanner",
+                blocking=True,
+                passed=observed is not None and observed <= maximum,
+                details=(
+                    f"observed {observed}; maximum {maximum}"
+                    if observed is not None
+                    else f"evidence unavailable; maximum {maximum}"
+                ),
+            )
+        )
     return results

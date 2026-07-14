@@ -26,15 +26,26 @@ def print_runs_table(task_id: str | None = None, limit: int = 50) -> None:
         console.print("[yellow]no runs recorded yet[/yellow]")
         return
     table = Table(title="agent-eval runs", show_lines=False)
-    for col in ("run id", "agent", "resolved", "tests", "cov%", "time s", "cost $",
+    for col in ("run id", "agent", "outcome", "resolved", "tests", "cov%", "time s", "cost $",
                 "tokens", "turns", "diff +/-", "judge"):
         table.add_column(col)
     for r in rows:
-        resolved = "[green]yes[/green]" if r["resolved"] else "[red]no[/red]"
+        record = RunRecord.model_validate_json(r["results_json"])
+        if (
+            record.correctness.command_exit_code is None
+            and record.correctness.infra_error is None
+        ):
+            resolved = "[yellow]unknown (legacy)[/yellow]"
+        else:
+            resolved = (
+                "[green]yes[/green]" if record.correctness.resolved
+                else "[red]no[/red]"
+            )
+        outcome = record.outcome.status if record.outcome else "legacy"
         tokens = (f"{r['tokens_in']}/{r['tokens_out']}"
                   if r["tokens_in"] is not None else "-")
         table.add_row(
-            r["run_id"], r["agent"], resolved,
+            r["run_id"], r["agent"], outcome, resolved,
             f"{_fmt(r['tests_passed'])}/{_fmt(r['tests_total'])}",
             _fmt(r["coverage"]), _fmt(r["wall_time_s"]), _fmt(r["cost_usd"]),
             tokens, _fmt(r["turns"]),
@@ -62,19 +73,39 @@ def pass_at_k(n: int, c: int, k: int) -> float:
 def print_trial_summary(records: list[RunRecord], k: int = 1) -> None:
     n = len(records)
     c = sum(1 for r in records if r.correctness.resolved)
-    console.print(f"\ntrials: {n}  resolved: {c}  pass@{k}: {pass_at_k(n, c, k):.2f}")
+    accepted = sum(r.outcome is not None and r.outcome.status == "accepted"
+                   for r in records)
+    rejected = sum(r.outcome is not None and r.outcome.status == "rejected"
+                   for r in records)
+    infra = sum(r.outcome is not None and r.outcome.status == "infra_error"
+                for r in records)
+    console.print(
+        f"\ntrials: {n}  resolved: {c}  pass@{k}: {pass_at_k(n, c, k):.2f}  "
+        f"outcomes accepted/rejected/infra: {accepted}/{rejected}/{infra}"
+    )
 
 
 def markdown_report(task_id: str | None = None, limit: int = 50) -> str:
     rows = load_runs(task_id, limit)
     lines = ["# agent-eval report", "",
-             "| run id | agent | resolved | tests | cov% | time s | cost $ | tokens in/out | turns | diff | judge |",
-             "|---|---|---|---|---|---|---|---|---|---|---|"]
+             "| run id | agent | outcome | resolved | tests | cov% | time s | cost $ | tokens in/out | turns | diff | judge |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
+        record = RunRecord.model_validate_json(r["results_json"])
+        has_resolution_evidence = (
+            record.correctness.command_exit_code is not None
+            or record.correctness.infra_error is not None
+        )
+        resolved = (
+            "yes" if record.correctness.resolved
+            else "no" if has_resolution_evidence
+            else "unknown (legacy)"
+        )
+        outcome = record.outcome.status if record.outcome else "legacy"
         tokens = (f"{r['tokens_in']}/{r['tokens_out']}"
                   if r["tokens_in"] is not None else "-")
         lines.append(
-            f"| {r['run_id']} | {r['agent']} | {'yes' if r['resolved'] else 'no'} "
+            f"| {r['run_id']} | {r['agent']} | {outcome} | {resolved} "
             f"| {_fmt(r['tests_passed'])}/{_fmt(r['tests_total'])} | {_fmt(r['coverage'])} "
             f"| {_fmt(r['wall_time_s'])} | {_fmt(r['cost_usd'])} | {tokens} "
             f"| {_fmt(r['turns'])} | +{r['diff_added']}/-{r['diff_removed']} "

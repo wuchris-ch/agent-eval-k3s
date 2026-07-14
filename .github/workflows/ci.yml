@@ -1,0 +1,41 @@
+name: assurance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install pinned uv
+        run: python -m pip install uv==0.9.16
+      - name: Sync locked dependencies
+        run: uv sync --frozen
+      - name: Lint
+        run: uv run ruff check .
+      - name: Test
+        run: uv run pytest -q
+      - name: Validate executable reviewer corpus
+        run: >-
+          uv run agent-eval corpus validate
+          benchmarks/reviewer-corpus/v1/corpus.yaml
+      - name: Reproduce reviewer experiment
+        run: >-
+          uv run agent-eval benchmark-experiment
+          --experiment benchmarks/reviewer-corpus/v1/experiment.yaml
+          --out reviewer-experiment.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reviewer-experiment
+          path: reviewer-experiment.json
+          if-no-files-found: error

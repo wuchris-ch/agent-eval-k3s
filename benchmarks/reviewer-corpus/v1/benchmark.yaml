@@ -1,0 +1,15 @@
+cases:
+  - id: auth-bypass
+    description: Authorization was changed to allow every user to delete records.
+    changed_lines: 1
+    expected:
+      - id: AUTH-001
+        severity: blocker
+        category: security
+        file: auth.py
+        line_start: 2
+        line_end: 2
+  - id: clean-refactor
+    description: A behavior-preserving extraction with no review finding.
+    changed_lines: 3
+    expected: []

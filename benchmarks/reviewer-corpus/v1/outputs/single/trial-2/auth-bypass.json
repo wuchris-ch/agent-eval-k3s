@@ -1,0 +1,4 @@
+{
+  "findings": [],
+  "metrics": {"latency_s": 1.3, "tokens": 820, "cost_usd": 0.019}
+}

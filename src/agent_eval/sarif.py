@@ -15,6 +15,8 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Iterable
 from urllib.parse import quote, unquote, urlsplit
 
+from . import __version__
+
 if TYPE_CHECKING:
     from .review import ChangeReport
 
@@ -285,9 +287,9 @@ def _active_llm_results(
     changed_ranges = _head_line_ranges(report, known_paths)
     results: list[dict[str, Any]] = []
     for finding in report.llm.findings:
-        verdict = _semantic_text(finding.verdict).casefold()
-        if not finding.verified or verdict == "rejected":
+        if not finding.active:
             continue
+        verdict = _semantic_text(finding.verdict).casefold()
 
         severity = _semantic_text(finding.severity).casefold() or "unknown"
         category = _semantic_text(finding.category).casefold() or "general"
@@ -540,7 +542,7 @@ def to_sarif(report: ChangeReport) -> dict[str, Any]:
                 "tool": {
                     "driver": {
                         "name": "agent-eval",
-                        "semanticVersion": "0.1.0",
+                        "semanticVersion": __version__,
                         "rules": rules,
                     }
                 },

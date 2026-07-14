@@ -21,14 +21,16 @@ app = typer.Typer(
     no_args_is_help=True)
 cluster_app = typer.Typer(help="Manage the k3d/k3s cluster.", no_args_is_help=True)
 tasks_app = typer.Typer(help="List and validate eval tasks.", no_args_is_help=True)
+corpus_app = typer.Typer(help="Validate versioned reviewer corpora.", no_args_is_help=True)
 app.add_typer(cluster_app, name="cluster")
 app.add_typer(tasks_app, name="tasks")
+app.add_typer(corpus_app, name="corpus")
 console = Console()
 
 
 @cluster_app.command("up")
 def cluster_up() -> None:
-    """Create the k3d cluster, namespace, and API-key secret."""
+    """Create the k3d cluster and evaluation namespace."""
     cluster_mod.cluster_up()
 
 
@@ -54,7 +56,7 @@ def tasks_list() -> None:
 
 @tasks_app.command("validate")
 def tasks_validate(task_id: str) -> None:
-    """Run the oracle solution through the eval pipeline; it must pass."""
+    """Require the starter to fail and the oracle solution to pass."""
     task = load_task(task_id)
     cluster_mod.ensure_cluster()
     record = validate_task(task)
@@ -67,6 +69,32 @@ def tasks_validate(task_id: str) -> None:
                       f"failures: {c.failures or c.infra_error}")
         console.print(f"see {record.run_dir}/eval-output.txt")
         raise typer.Exit(1)
+
+
+@corpus_app.command("validate")
+def corpus_validate(
+    manifest: Path = typer.Argument(..., exists=True, dir_okay=False),
+    execute: bool = typer.Option(
+        True, "--execute/--no-execute", help="Run base/head reproducers."
+    ),
+) -> None:
+    """Validate corpus hashes, gold diff locations, and reproducers."""
+    from .corpus import validate_corpus
+
+    try:
+        result = validate_corpus(manifest, execute=execute)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]could not validate corpus: {exc}[/red]")
+        raise typer.Exit(1) from None
+    if result.valid:
+        console.print(
+            f"[green]corpus valid[/green]: {result.corpus_id} v{result.version}, "
+            f"{len(result.reproducers)} reproducer(s) checked"
+        )
+        return
+    for error in result.errors:
+        console.print(f"[red]{error}[/red]")
+    raise typer.Exit(2)
 
 
 @app.command()
@@ -85,13 +113,26 @@ def review(
                                          "(repeatable, e.g. --check 'ruff check .')."),
     gen_tests: bool = typer.Option(False, "--gen-tests",
                                    help="LLM-generated discriminating test: must pass on "
-                                        "head and fail on base. Runs generated code "
-                                        "locally; use only on changes you trust."),
+                                        "head and fail on base. Requires explicit local "
+                                        "execution trust."),
+    allow_local_execution: bool = typer.Option(
+        False,
+        "--allow-local-execution",
+        help="Allow test/check/generated code from the change to run on this Mac.",
+    ),
     context: str = typer.Option(None, "--context",
                                 help="Ticket/spec text the change should implement; "
                                      "prefix with @ to read from a file."),
-    policy: Path = typer.Option(None, "--policy",
-                                help="Review policy file (default: <repo>/.agent-eval.yaml)."),
+    policy: Path = typer.Option(
+        None,
+        "--policy",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Review policy file (default: <repo>/.agent-eval.yaml).",
+    ),
     scan: bool = typer.Option(True, help="Run scanners over the changed files."),
     llm: bool = typer.Option(True, help="Run the LLM risk review."),
     out: Path = typer.Option(None, "--out",
@@ -108,6 +149,7 @@ def review(
         report = review_change(repo, base, head, test_cmd=test_cmd,
                                context=context, checks=list(check or []),
                                gen_tests=gen_tests, policy_path=policy,
+                               allow_local_execution=allow_local_execution,
                                run_scans=scan, run_llm=llm, out_dir=out)
     except RuntimeError as e:
         console.print(f"[red]{e}[/red]")
@@ -181,6 +223,7 @@ def benchmark_review(
     table.add_column("metric")
     table.add_column("value", justify="right")
     table.add_row("cases", str(metrics.case_count))
+    table.add_row("complete cases", str(metrics.scored_case_count))
     table.add_row("TP / FP / FN", f"{metrics.tp} / {metrics.fp} / {metrics.fn}")
     table.add_row("precision", _metric(metrics.precision))
     table.add_row("recall", _metric(metrics.recall))
@@ -245,6 +288,67 @@ def benchmark_review(
         raise typer.Exit(2)
 
 
+@app.command("benchmark-experiment")
+def benchmark_experiment(
+    experiment: Path = typer.Option(
+        ..., "--experiment", exists=True, dir_okay=False,
+        help="Versioned repeated reviewer experiment YAML.",
+    ),
+    out: Path = typer.Option(None, "--out", dir_okay=False),
+    require_budgets: bool = typer.Option(
+        True,
+        "--require-budgets/--allow-budget-failures",
+        help="Exit 2 when any system is incomplete or exceeds a declared budget.",
+    ),
+) -> None:
+    """Compare repeated single-reviewer and quorum-panel outputs."""
+    from .review_experiment import run_experiment
+
+    try:
+        result = run_experiment(experiment)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]could not run reviewer experiment: {exc}[/red]")
+        raise typer.Exit(1) from None
+    table = Table(title="Reviewer experiment", show_edge=False)
+    for column in ("system", "mode", "trials", "F1", "FP/case", "latency", "tokens", "cost", "stable", "budget"):
+        table.add_column(column)
+    for system in result.systems:
+        stats = system.statistics
+        table.add_row(
+            system.system_id,
+            system.mode,
+            str(len(system.trials)),
+            _metric(stats.f1.mean),
+            _metric(stats.false_positives_per_case.mean),
+            _metric(stats.latency_s.mean),
+            _metric(stats.tokens.mean),
+            _metric(stats.cost_usd.mean),
+            _metric(system.finding_stability.mean_jaccard),
+            "yes" if system.budget.eligible else "no",
+        )
+    console.print(table)
+    for comparison in result.paired_comparisons:
+        console.print(
+            f"paired {comparison.candidate_system_id} vs "
+            f"{comparison.baseline_system_id}: "
+            f"{comparison.wins} win / {comparison.ties} tie / "
+            f"{comparison.losses} loss, {comparison.compared_pairs}/"
+            f"{comparison.expected_pairs} comparable"
+        )
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(result.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        console.print(f"experiment result: {out}")
+    ineligible = [system for system in result.systems if not system.budget.eligible]
+    if require_budgets and ineligible:
+        for system in ineligible:
+            console.print(
+                f"[red]budget failed for {system.system_id}: "
+                f"{'; '.join(system.budget.failures)}[/red]"
+            )
+        raise typer.Exit(2)
+
+
 @app.command()
 def doctor() -> None:
     """Check local prerequisites and show which features each one unlocks."""
@@ -260,14 +364,18 @@ def doctor() -> None:
         ("codex login", (Path.home() / ".codex" / "auth.json").is_file(),
          "codex auth inside sandbox pods", "codex login"),
         ("ANTHROPIC_API_KEY", bool(os.environ.get("ANTHROPIC_API_KEY")),
-         "claude-code agent + claude judge", "export ANTHROPIC_API_KEY=..."),
+         "reusable claude fallback + claude judge", "export ANTHROPIC_API_KEY=..."),
+        ("credential broker", bool(os.environ.get("AGENT_EVAL_CREDENTIAL_COMMAND")),
+         "provider-minted per-trial credentials (recommended)",
+         "export AGENT_EVAL_CREDENTIAL_COMMAND='broker-command'"),
         ("docker", sh.which("docker") is not None, "agent benchmark mode (k3s)",
          "brew install colima docker && colima start"),
         ("kubectl", sh.which("kubectl") is not None, "agent benchmark mode (k3s)",
          "brew install kubectl"),
         ("k3d", sh.which("k3d") is not None, "agent benchmark mode (k3s)",
          "brew install k3d"),
-        ("gitleaks", sh.which("gitleaks") is not None, "secret scanning (optional)",
+        ("gitleaks", sh.which("gitleaks") is not None,
+         "secret gate before external diff review/judging",
          "brew install gitleaks"),
         ("trivy", sh.which("trivy") is not None, "dependency vuln scanning (optional)",
          "brew install trivy"),
@@ -279,8 +387,11 @@ def doctor() -> None:
         table.add_row(name, "[green]ok[/green]" if ok else "[red]missing[/red]",
                       unlocks, "" if ok else fix)
     console.print(table)
-    console.print("\n`agent-eval review` needs only git (+ uvx and an LLM backend "
-                  "for full reports). `agent-eval run` needs docker/kubectl/k3d.")
+    console.print(
+        "\nDeterministic `agent-eval review` needs git. Scanner-backed external "
+        "LLM review also needs uvx, gitleaks, and an authenticated LLM backend. "
+        "`agent-eval run` needs docker/kubectl/k3d."
+    )
 
 
 @app.command()
@@ -289,6 +400,9 @@ def evaluate(
     workspace: Path = typer.Option(..., "--workspace", exists=True, file_okay=False),
     scan: bool = typer.Option(True, help="Run static/security scanners."),
     judge: bool = typer.Option(True, help="Run the LLM judge."),
+    gate: bool = typer.Option(
+        False, "--gate", help="Exit 2 unless the task acceptance policy accepts."
+    ),
 ) -> None:
     """Evaluate an already-produced workspace (eval-only mode)."""
     task = load_task(task_id)
@@ -297,6 +411,8 @@ def evaluate(
                                 run_scans=scan, run_judge=judge)
     print_run_detail(record.run_id)
     print_runs_table(task_id, limit=5)
+    if gate and (record.outcome is None or not record.outcome.accepted):
+        raise typer.Exit(2)
 
 
 @app.command()
@@ -308,6 +424,12 @@ def run(
     rebuild: bool = typer.Option(False, help="Force rebuild of the task image."),
     scan: bool = typer.Option(True, help="Run static/security scanners."),
     judge: bool = typer.Option(True, help="Run the LLM judge."),
+    experiment_id: str = typer.Option(
+        None, "--experiment-id", help="Pair trials across agents in comparisons."
+    ),
+    gate: bool = typer.Option(
+        False, "--gate", help="Exit 2 if any trial is not accepted."
+    ),
 ) -> None:
     """Full harness: launch the coding agent in k3s, then evaluate its output."""
     from .agents import get_adapter
@@ -321,13 +443,123 @@ def run(
     for trial in range(1, trials + 1):
         console.rule(f"trial {trial}/{trials}")
         record = run_agent_trial(task, adapter, trial=trial, model=model,
-                                 run_scans=scan, run_judge=judge)
+                                 run_scans=scan, run_judge=judge,
+                                 experiment_id=experiment_id)
         records.append(record)
         status = "resolved" if record.correctness.resolved else "not resolved"
         console.print(f"trial {trial}: [bold]{status}[/bold] "
                       f"({record.correctness.passed}/{record.correctness.total} tests)")
     print_runs_table(task_id, limit=trials + 5)
     print_trial_summary(records)
+    if gate and any(record.outcome is None or not record.outcome.accepted
+                    for record in records):
+        raise typer.Exit(2)
+
+
+@app.command("compare")
+def compare(
+    task_id: str = typer.Option(..., "--task"),
+    out: Path = typer.Option(None, "--out", dir_okay=False),
+    limit: int = typer.Option(1000, "--limit", min=1),
+    include_controls: bool = typer.Option(
+        False,
+        "--include-controls",
+        help="Include oracle and external eval-only records.",
+    ),
+) -> None:
+    """Compare persisted coding-agent outcomes by agent and model."""
+    from .agent_comparison import compare_agents
+    from .metrics import RunRecord, load_runs
+
+    records = [
+        RunRecord.model_validate_json(row["results_json"])
+        for row in load_runs(task_id, limit)
+    ]
+    if not include_controls:
+        records = [
+            record for record in records
+            if record.agent not in {"external", "oracle"}
+        ]
+    if not records:
+        console.print("[yellow]no runs recorded yet[/yellow]")
+        return
+    result = compare_agents(records)
+    table = Table(title="Coding-agent comparison", show_edge=False)
+    for column in (
+        "agent/model", "n", "resolved", "accepted", "95% CI", "infra",
+        "time p50/p95", "tokens p50", "cost p50", "judge p50",
+    ):
+        table.add_column(column)
+    for summary in result.summaries:
+        interval = summary.resolved_wilson_95
+        table.add_row(
+            f"{summary.agent}/{summary.model}",
+            str(summary.sample_size),
+            (
+                f"{summary.resolved}/{summary.correctness_evidence_count} "
+                f"({summary.resolved_rate:.1%})"
+                if summary.resolved_rate is not None
+                else "n/a (legacy evidence incomplete)"
+            ),
+            (
+                f"{summary.accepted}/{summary.accepted_evidence_count} "
+                f"({summary.accepted_rate:.1%})"
+                if summary.accepted_rate is not None
+                else "n/a"
+            ),
+            (
+                f"{interval.lower:.1%}..{interval.upper:.1%}"
+                if interval else "n/a"
+            ),
+            f"{summary.infrastructure_failure_rate:.1%}",
+            f"{_metric(summary.wall_time_s.median)}/{_metric(summary.wall_time_s.p95)}",
+            _metric(summary.total_tokens.median),
+            _metric(summary.cost_usd.median),
+            _metric(summary.judge_score.median),
+        )
+    console.print(table)
+    if not result.paired:
+        console.print(
+            "[yellow]no paired comparison: use the same --experiment-id and "
+            "trial numbers for each agent[/yellow]"
+        )
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(result.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        console.print(f"comparison result: {out}")
+
+
+@app.command("verify-run")
+def verify_run(
+    run_id: str = typer.Option(..., "--run"),
+) -> None:
+    """Recompute a run's unsigned local provenance and artifact hashes."""
+    from .attestation import verify_attestation
+    from .metrics import load_run
+
+    record = load_run(run_id)
+    if record is None:
+        console.print(f"[red]run {run_id} not found[/red]")
+        raise typer.Exit(1)
+    statement = record.run_dir / "attestation.json"
+    if not statement.is_file():
+        console.print(f"[red]run {run_id} has no attestation[/red]")
+        raise typer.Exit(2)
+    result = verify_attestation(
+        statement,
+        artifact_root=record.run_dir,
+        task_root=load_task(record.task_id).path,
+        harness_repo=Path(__file__).resolve().parents[2],
+    )
+    if result.ok:
+        console.print(
+            f"[green]verified[/green]: {result.subjects_checked} artifact(s), "
+            "task tree, and harness Git state match the unsigned statement"
+        )
+        return
+    for failure in result.failures:
+        console.print(f"[red]{failure.code}: {failure.message}[/red]")
+    raise typer.Exit(2)
 
 
 @app.command()

@@ -1,7 +1,7 @@
 [project]
 name = "agent-eval"
-version = "0.1.0"
-description = "Coding-agent evaluation harness on k3s: sandboxed agent runs, hidden-test verification, metrics, scanners, and an LLM judge"
+version = "0.2.0"
+description = "Enterprise coding-agent and pull-request-review evaluation harness with isolated trials, evidence gates, benchmarks, and attestations"
 readme = "README.md"
 authors = [
     { name = "Chris", email = "chriswu.ca@gmail.com" }
