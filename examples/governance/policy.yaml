@@ -1,0 +1,51 @@
+schema_version: agent-eval.policy/v1
+policy_id: engineering-agent-evals
+revision: 2026-07-14.1
+rules:
+  allowed_tenants:
+    - acme-engineering
+  allowed_projects:
+    - developer-productivity
+  allowed_tasks:
+    - example-*
+  allowed_network_modes:
+    - proxy
+  allowed_egress_domains:
+    - .anthropic.com
+    - .claude.ai
+  allowed_proxy_images:
+    - ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
+  allowed_data_classifications:
+    - public
+    - internal
+  allowed_retention_classes:
+    - ephemeral
+    - standard
+  require_scans: true
+  require_judge: true
+  require_broker_credentials: false
+  max_trials: 3
+  max_agent_seconds: 900
+  max_eval_seconds: 300
+  max_total_tokens: 100000
+  max_cost_usd: 5.0
+model_registry:
+  registry_id: production-models
+  revision: 2026-07-14.1
+  models:
+    - adapter: claude-code
+      model: claude-sonnet-4-5-20250929
+      provider: anthropic
+      status: approved
+      allowed_data_classifications:
+        - public
+        - internal
+      max_total_tokens: 80000
+      max_cost_usd: 3.0
+    - adapter: judge:claude
+      model: claude-sonnet-4-5-20250929
+      provider: anthropic
+      status: approved
+      allowed_data_classifications:
+        - public
+        - internal

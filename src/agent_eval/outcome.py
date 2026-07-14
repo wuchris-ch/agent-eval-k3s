@@ -91,6 +91,19 @@ def _check(
         reasons.append(f"{name}: observed {observed_text}; requires {requirement}")
 
 
+def _valid_accounting_value(value: object, *, integer: bool) -> bool:
+    """Reject malformed accounting evidence even if model validation was bypassed."""
+
+    if integer:
+        return type(value) is int and value >= 0
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
 def evaluate_outcome(record: Any, policy: AcceptancePolicy) -> RunOutcome:
     """Evaluate a ``RunRecord`` without importing it, avoiding model cycles."""
 
@@ -110,6 +123,29 @@ def evaluate_outcome(record: Any, policy: AcceptancePolicy) -> RunOutcome:
 
     checks: list[OutcomeCheck] = []
     reasons: list[str] = []
+
+    accounting_validity: dict[str, bool] = {}
+    for field_name, display_name, integer in (
+        ("wall_time_s", "wall time accounting", False),
+        ("tokens_in", "input token accounting", True),
+        ("tokens_out", "output token accounting", True),
+        ("cost_usd", "cost accounting", False),
+        ("turns", "turn accounting", True),
+        ("tool_calls", "tool-call accounting", True),
+    ):
+        value = getattr(record.efficiency, field_name, None)
+        valid = value is None or _valid_accounting_value(value, integer=integer)
+        accounting_validity[field_name] = valid
+        if not valid:
+            _check(
+                checks,
+                reasons,
+                name=display_name,
+                passed=False,
+                observed=value,
+                requirement="a finite nonnegative number",
+            )
+
     if record.efficiency.agent_exit_code is not None:
         _check(
             checks,
@@ -154,8 +190,9 @@ def evaluate_outcome(record: Any, policy: AcceptancePolicy) -> RunOutcome:
             missing=value is None,
         )
 
-    def maximum(name: str, value: float | int | None,
-                threshold: float | int | None) -> None:
+    def maximum(
+        name: str, value: float | int | None, threshold: float | int | None
+    ) -> None:
         if threshold is None:
             return
         _check(
@@ -168,8 +205,9 @@ def evaluate_outcome(record: Any, policy: AcceptancePolicy) -> RunOutcome:
             missing=value is None,
         )
 
-    minimum("coverage percent", correctness.coverage_percent,
-            policy.min_coverage_percent)
+    minimum(
+        "coverage percent", correctness.coverage_percent, policy.min_coverage_percent
+    )
     minimum("judge score", record.judge.weighted_score, policy.min_judge_score)
 
     statuses = getattr(record.scans, "scanner_status", {})
@@ -193,13 +231,21 @@ def evaluate_outcome(record: Any, policy: AcceptancePolicy) -> RunOutcome:
     )
     maximum("secrets", record.scans.secrets_found, policy.max_secrets)
     maximum("vulnerabilities", record.scans.vulns, policy.max_vulnerabilities)
-    maximum("wall time seconds", record.efficiency.wall_time_s,
-            policy.max_wall_time_s)
+    wall_time_s = (
+        record.efficiency.wall_time_s if accounting_validity["wall_time_s"] else None
+    )
+    maximum("wall time seconds", wall_time_s, policy.max_wall_time_s)
     total_tokens = None
-    if record.efficiency.tokens_in is not None and record.efficiency.tokens_out is not None:
+    if (
+        accounting_validity["tokens_in"]
+        and accounting_validity["tokens_out"]
+        and record.efficiency.tokens_in is not None
+        and record.efficiency.tokens_out is not None
+    ):
         total_tokens = record.efficiency.tokens_in + record.efficiency.tokens_out
     maximum("total tokens", total_tokens, policy.max_total_tokens)
-    maximum("cost USD", record.efficiency.cost_usd, policy.max_cost_usd)
+    cost_usd = record.efficiency.cost_usd if accounting_validity["cost_usd"] else None
+    maximum("cost USD", cost_usd, policy.max_cost_usd)
 
     if policy.require_challenges_passed:
         assurance = getattr(record, "assurance", None)

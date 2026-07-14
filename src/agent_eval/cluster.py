@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from rich.console import Console
@@ -104,8 +105,45 @@ def cluster_status() -> None:
     console.print(pods.stdout or pods.stderr)
 
 
-def build_and_import_image(context_dir: str, tag: str) -> None:
+def build_image(context_dir: str, tag: str) -> None:
     console.print(f"building image [bold]{tag}[/bold]...")
     _run(["docker", "build", "-t", tag, context_dir], timeout=1800)
+
+
+def build_image_with_metadata(
+    context_dir: str,
+    tag: str,
+    *,
+    platform: str,
+    metadata_file: str | Path,
+) -> None:
+    """Load one platform image and atomically record its OCI build metadata."""
+
+    console.print(f"building governed image [bold]{tag}[/bold]...")
+    _run(
+        [
+            "docker",
+            "buildx",
+            "build",
+            "--load",
+            "--provenance=false",
+            "--platform",
+            platform,
+            "--metadata-file",
+            str(metadata_file),
+            "-t",
+            tag,
+            context_dir,
+        ],
+        timeout=1800,
+    )
+
+
+def import_image(tag: str) -> None:
     console.print("importing image into cluster...")
     _run(["k3d", "image", "import", tag, "-c", CLUSTER_NAME], timeout=600)
+
+
+def build_and_import_image(context_dir: str, tag: str) -> None:
+    build_image(context_dir, tag)
+    import_image(tag)

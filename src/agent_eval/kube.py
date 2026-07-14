@@ -523,6 +523,58 @@ class Pod:
         match = re.search(r"sha256:[0-9a-fA-F]{64}", image_id)
         return match.group(0).lower() if match else None
 
+    def image_manifest_digest(self, image_ref: str) -> str | None:
+        """Resolve the running container's CRI identity to a manifest digest.
+
+        Kubernetes ``imageID`` can be a config digest. Governed execution
+        therefore resolves that exact running ID through CRI and reads the
+        repository digest for the admitted run-unique reference.
+        """
+
+        proc = kubectl("get", "pod", self.name, "-o", "json", check=False, timeout=30)
+        if proc.returncode != 0:
+            return None
+        try:
+            pod = json.loads(proc.stdout)
+            node_name = pod["spec"]["nodeName"]
+            spec_image = pod["spec"]["containers"][0]["image"]
+            image_id = pod["status"]["containerStatuses"][0]["imageID"]
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+            return None
+        if (
+            spec_image != image_ref
+            or re.fullmatch(r"k3d-agent-eval-(?:server|agent)-\d+", node_name) is None
+            or not isinstance(image_id, str)
+            or not image_id
+        ):
+            return None
+        try:
+            inspected = subprocess.run(
+                ["docker", "exec", node_name, "crictl", "inspecti", image_id],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if inspected.returncode != 0:
+            return None
+        try:
+            repo_digests = json.loads(inspected.stdout)["status"]["repoDigests"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+        repository = image_ref.rpartition(":")[0]
+        digests = {
+            digest.lower()
+            for value in repo_digests
+            if isinstance(value, str)
+            for repo, separator, digest in [value.rpartition("@")]
+            if separator
+            and (repo == repository or repo.endswith(f"/{repository}"))
+            and re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest)
+        }
+        return next(iter(digests)) if len(digests) == 1 else None
+
     def delete(self) -> None:
         kubectl(
             "delete", "pod", self.name, "--ignore-not-found", "--wait=true",
@@ -779,15 +831,21 @@ def sandbox_egress_policy_manifest(
     }
 
 
-def sandbox_pod_manifest(name: str, prefix: str, image: str, *,
-                         env_from_secret: str | None = None,
-                         credential_env_keys: tuple[str, ...] = (),
-                         credential_file_items: dict[str, str] | None = None,
-                         extra_env: dict[str, str] | None = None,
-                         active_deadline: int = 3600,
-                         resources: dict[str, dict[str, str]] | None = None,
-                         security: dict | None = None,
-                         proxy_id: str | None = None) -> dict:
+def sandbox_pod_manifest(
+    name: str,
+    prefix: str,
+    image: str,
+    *,
+    env_from_secret: str | None = None,
+    credential_env_keys: tuple[str, ...] = (),
+    credential_file_items: dict[str, str] | None = None,
+    extra_env: dict[str, str] | None = None,
+    active_deadline: int = 3600,
+    resources: dict[str, dict[str, str]] | None = None,
+    security: dict | None = None,
+    image_pull_policy: str = "IfNotPresent",
+    proxy_id: str | None = None,
+) -> dict:
     """Return the auditable pod manifest used for agent and eval sandboxes.
 
     The service-account token and service discovery environment are disabled,
@@ -795,6 +853,8 @@ def sandbox_pod_manifest(name: str, prefix: str, image: str, *,
     capabilities, and bounded resources. The caller applies an open, denied,
     or proxy-only egress policy separately.
     """
+    if image_pull_policy not in {"IfNotPresent", "Never"}:
+        raise ValueError("image pull policy must be IfNotPresent or Never")
     security = {**DEFAULT_SECURITY, **(security or {})}
     container_security = {
         "allowPrivilegeEscalation": False,
@@ -826,11 +886,16 @@ def sandbox_pod_manifest(name: str, prefix: str, image: str, *,
     spec: dict = {
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {"name": name, "labels": {
-            "app": "agent-eval", "role": "sandbox", "phase": prefix,
-            "sandbox-id": name,
-            **({"egress-proxy": proxy_id} if proxy_id else {}),
-        }},
+        "metadata": {
+            "name": name,
+            "labels": {
+                "app": "agent-eval",
+                "role": "sandbox",
+                "phase": prefix,
+                "sandbox-id": name,
+                **({"egress-proxy": proxy_id} if proxy_id else {}),
+            },
+        },
         "spec": {
             "automountServiceAccountToken": False,
             "enableServiceLinks": False,
@@ -844,19 +909,21 @@ def sandbox_pod_manifest(name: str, prefix: str, image: str, *,
             "restartPolicy": "Never",
             "activeDeadlineSeconds": active_deadline,
             "terminationGracePeriodSeconds": 1,
-            "containers": [{
-                "name": "sandbox",
-                "image": image,
-                "imagePullPolicy": "IfNotPresent",
-                "command": ["sh", "-c", "sleep infinity"],
-                "workingDir": "/workspace",
-                "env": env,
-                "securityContext": container_security,
-                "resources": deepcopy(
-                    DEFAULT_SANDBOX_RESOURCES if resources is None else resources
-                ),
-                "volumeMounts": volume_mounts,
-            }],
+            "containers": [
+                {
+                    "name": "sandbox",
+                    "image": image,
+                    "imagePullPolicy": image_pull_policy,
+                    "command": ["sh", "-c", "sleep infinity"],
+                    "workingDir": "/workspace",
+                    "env": env,
+                    "securityContext": container_security,
+                    "resources": deepcopy(
+                        DEFAULT_SANDBOX_RESOURCES if resources is None else resources
+                    ),
+                    "volumeMounts": volume_mounts,
+                }
+            ],
             "volumes": volumes,
         },
     }
@@ -895,28 +962,38 @@ def sandbox_pod_manifest(name: str, prefix: str, image: str, *,
     return spec
 
 
-def create_sandbox_pod(prefix: str, image: str, *, env_from_secret: str | None = None,
-                       credential_env_keys: tuple[str, ...] = (),
-                       credential_file_items: dict[str, str] | None = None,
-                       extra_env: dict[str, str] | None = None,
-                       active_deadline: int = 3600,
-                       resources: dict[str, dict[str, str]] | None = None,
-                       security: dict | None = None,
-                       egress_mode: str = "open",
-                       proxy_id: str | None = None) -> Pod:
+def create_sandbox_pod(
+    prefix: str,
+    image: str,
+    *,
+    env_from_secret: str | None = None,
+    credential_env_keys: tuple[str, ...] = (),
+    credential_file_items: dict[str, str] | None = None,
+    extra_env: dict[str, str] | None = None,
+    active_deadline: int = 3600,
+    resources: dict[str, dict[str, str]] | None = None,
+    security: dict | None = None,
+    image_pull_policy: str = "IfNotPresent",
+    egress_mode: str = "open",
+    proxy_id: str | None = None,
+) -> Pod:
     """Create a sleeping pod we can copy files into and exec commands in."""
     name = f"{prefix}-{uuid.uuid4().hex[:8]}"
     spec = sandbox_pod_manifest(
-        name, prefix, image, env_from_secret=env_from_secret,
+        name,
+        prefix,
+        image,
+        env_from_secret=env_from_secret,
         credential_env_keys=credential_env_keys,
         credential_file_items=credential_file_items,
         extra_env=extra_env,
-        active_deadline=active_deadline, resources=resources, security=security,
+        active_deadline=active_deadline,
+        resources=resources,
+        security=security,
+        image_pull_policy=image_pull_policy,
         proxy_id=proxy_id,
     )
-    policy = sandbox_egress_policy_manifest(
-        name, egress_mode, proxy_id=proxy_id
-    )
+    policy = sandbox_egress_policy_manifest(name, egress_mode, proxy_id=proxy_id)
     policy_name = policy["metadata"]["name"]
     kubectl("apply", "-f", "-", input=json.dumps(policy).encode(), timeout=60)
     try:
@@ -927,14 +1004,23 @@ def create_sandbox_pod(prefix: str, image: str, *, env_from_secret: str | None =
         # deterministic name before dropping its policy.
         with suppress(Exception):
             kubectl(
-                "delete", "pod", name, "--ignore-not-found", "--wait=true",
-                check=False, timeout=60,
+                "delete",
+                "pod",
+                name,
+                "--ignore-not-found",
+                "--wait=true",
+                check=False,
+                timeout=60,
             )
         if policy_name:
             with suppress(Exception):
                 kubectl(
-                    "delete", "networkpolicy", policy_name,
-                    "--ignore-not-found", check=False, timeout=30,
+                    "delete",
+                    "networkpolicy",
+                    policy_name,
+                    "--ignore-not-found",
+                    check=False,
+                    timeout=30,
                 )
         raise
     return Pod(name, network_policy_name=policy_name)

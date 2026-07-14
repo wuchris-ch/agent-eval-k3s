@@ -14,8 +14,13 @@ from ..metrics import AgentMetrics
 from .base import PROMPT_PATH
 
 # item types that represent the agent acting on the environment
-_TOOL_ITEM_TYPES = {"command_execution", "file_change", "mcp_tool_call",
-                    "patch_apply", "web_search"}
+_TOOL_ITEM_TYPES = {
+    "command_execution",
+    "file_change",
+    "mcp_tool_call",
+    "patch_apply",
+    "web_search",
+}
 
 
 class CodexAdapter:
@@ -47,6 +52,7 @@ class CodexAdapter:
             return metrics
         tokens_in = tokens_out = turns = tool_calls = 0
         saw_usage = False
+        usage_complete = True
         for line in transcript.read_text().splitlines():
             line = line.strip()
             if not line:
@@ -58,10 +64,31 @@ class CodexAdapter:
             etype = event.get("type")
             if etype == "turn.completed":
                 turns += 1
-                usage = event.get("usage") or {}
-                tokens_in += usage.get("input_tokens") or 0
-                tokens_out += usage.get("output_tokens") or 0
-                saw_usage = True
+                usage = event.get("usage")
+                if usage is None:
+                    usage_complete = False
+                    usage = {}
+                elif not isinstance(usage, dict):
+                    raise ValueError(
+                        "Codex transcript contains invalid usage accounting"
+                    )
+                input_tokens = usage.get("input_tokens")
+                output_tokens = usage.get("output_tokens")
+                if input_tokens is None or output_tokens is None:
+                    usage_complete = False
+                elif (
+                    type(input_tokens) is not int
+                    or input_tokens < 0
+                    or type(output_tokens) is not int
+                    or output_tokens < 0
+                ):
+                    raise ValueError(
+                        "Codex transcript contains invalid token accounting"
+                    )
+                else:
+                    tokens_in += input_tokens
+                    tokens_out += output_tokens
+                    saw_usage = True
             elif etype in ("item.completed", "item.started"):
                 item = event.get("item") or {}
                 if etype == "item.completed" and item.get("type") in _TOOL_ITEM_TYPES:
@@ -72,7 +99,7 @@ class CodexAdapter:
                     metrics.model = model
         metrics.turns = turns or None
         metrics.tool_calls = tool_calls
-        if saw_usage:
+        if saw_usage and usage_complete:
             metrics.tokens_in = tokens_in
             metrics.tokens_out = tokens_out
         # cost stays None: subscription usage has no per-request price
