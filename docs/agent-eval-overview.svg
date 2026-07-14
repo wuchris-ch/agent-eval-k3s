@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 480" role="img" aria-labelledby="title description">
+  <title id="title">agent-eval-k3s overview</title>
+  <desc id="description">Two workflows share one evidence model. Pull request review turns a Git diff into an evidence-checked merge report. Coding agent evaluation runs an agent in an isolated pod, grades it in a fresh evaluator pod, and produces an explicit outcome.</desc>
+  <defs>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --canvas: #ffffff;
+        --text: #172033;
+        --muted: #667085;
+        --line: #d8dee9;
+        --review-fill: #eef6ff;
+        --review-stroke: #4d8fd8;
+        --agent-fill: #f3efff;
+        --agent-stroke: #8066cc;
+        --shared-fill: #edf9f3;
+        --shared-stroke: #3f9a70;
+        --arrow: #98a2b3;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --canvas: #0d1117;
+          --text: #e6edf3;
+          --muted: #9da7b3;
+          --line: #30363d;
+          --review-fill: #10263d;
+          --review-stroke: #58a6ff;
+          --agent-fill: #211b38;
+          --agent-stroke: #a78bfa;
+          --shared-fill: #102b22;
+          --shared-stroke: #56d39b;
+          --arrow: #6e7681;
+        }
+      }
+      text {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        fill: var(--text);
+      }
+      .canvas { fill: var(--canvas); }
+      .lane-label { font-size: 17px; font-weight: 600; letter-spacing: .02em; }
+      .node-title { font-size: 18px; font-weight: 600; }
+      .node-detail { font-size: 14px; fill: var(--muted); }
+      .review-node { fill: var(--review-fill); stroke: var(--review-stroke); }
+      .agent-node { fill: var(--agent-fill); stroke: var(--agent-stroke); }
+      .shared-node { fill: var(--shared-fill); stroke: var(--shared-stroke); }
+      .node { stroke-width: 1.5; rx: 14; }
+      .arrow { stroke: var(--arrow); stroke-width: 2; fill: none; marker-end: url(#arrowhead); }
+      .divider { stroke: var(--line); stroke-width: 1; }
+    </style>
+    <marker id="arrowhead" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="var(--arrow)"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" width="1200" height="480" rx="20"/>
+
+  <text class="lane-label" x="48" y="53">PR REVIEW</text>
+  <rect class="node review-node" x="48" y="75" width="225" height="92"/>
+  <text class="node-title" x="72" y="112">Git diff</text>
+  <text class="node-detail" x="72" y="138">The proposed change</text>
+
+  <path class="arrow" d="M273 121 H321"/>
+  <rect class="node review-node" x="322" y="75" width="235" height="92"/>
+  <text class="node-title" x="346" y="112">Run checks</text>
+  <text class="node-detail" x="346" y="138">Tests, policy, scanners</text>
+
+  <path class="arrow" d="M557 121 H605"/>
+  <rect class="node review-node" x="606" y="75" width="250" height="92"/>
+  <text class="node-title" x="630" y="112">Verify findings</text>
+  <text class="node-detail" x="630" y="138">AI claims need diff evidence</text>
+
+  <path class="arrow" d="M856 121 H904"/>
+  <rect class="node review-node" x="905" y="75" width="247" height="92"/>
+  <text class="node-title" x="929" y="112">Merge report</text>
+  <text class="node-detail" x="929" y="138">Risk, reasons, JSON, SARIF</text>
+
+  <line class="divider" x1="48" y1="210" x2="1152" y2="210"/>
+
+  <text class="lane-label" x="48" y="253">AGENT EVALUATION</text>
+  <rect class="node agent-node" x="48" y="275" width="225" height="92"/>
+  <text class="node-title" x="72" y="312">Task + model</text>
+  <text class="node-detail" x="72" y="338">A repeatable coding job</text>
+
+  <path class="arrow" d="M273 321 H321"/>
+  <rect class="node agent-node" x="322" y="275" width="235" height="92"/>
+  <text class="node-title" x="346" y="312">Agent pod</text>
+  <text class="node-detail" x="346" y="338">The agent edits code</text>
+
+  <path class="arrow" d="M557 321 H605"/>
+  <rect class="node agent-node" x="606" y="275" width="250" height="92"/>
+  <text class="node-title" x="630" y="312">Fresh evaluator</text>
+  <text class="node-detail" x="630" y="338">Hidden tests in a clean pod</text>
+
+  <path class="arrow" d="M856 321 H904"/>
+  <rect class="node agent-node" x="905" y="275" width="247" height="92"/>
+  <text class="node-title" x="929" y="312">Scorecard</text>
+  <text class="node-detail" x="929" y="338">Scanners, judge, outcome</text>
+
+  <rect class="node shared-node" x="48" y="405" width="1104" height="48"/>
+  <text class="node-title" x="600" y="435" text-anchor="middle">Shared assurance: policies | budgets | audit trail | provenance | explicit evidence</text>
+</svg>
