@@ -4,19 +4,23 @@ to parse its transcript into efficiency metrics."""
 from __future__ import annotations
 
 from .base import PROMPT_PATH, AgentAdapter
-from .claude_code import ClaudeCodeAdapter
-from .codex import CodexAdapter
-
-_ADAPTERS: dict[str, AgentAdapter] = {
-    ClaudeCodeAdapter.name: ClaudeCodeAdapter(),
-    CodexAdapter.name: CodexAdapter(),
-}
-
-
-def get_adapter(name: str) -> AgentAdapter:
-    if name not in _ADAPTERS:
-        raise KeyError(f"unknown agent {name!r}; available: {', '.join(_ADAPTERS)}")
-    return _ADAPTERS[name]
+from .registry import (
+    ENTRY_POINT_GROUP,
+    AdapterMetadata,
+    BUILTIN_ADAPTER_NAMES,
+    get_adapter,
+    is_builtin_adapter,
+    list_adapters,
+)
 
 
-__all__ = ["AgentAdapter", "get_adapter", "PROMPT_PATH"]
+__all__ = [
+    "AdapterMetadata",
+    "AgentAdapter",
+    "BUILTIN_ADAPTER_NAMES",
+    "ENTRY_POINT_GROUP",
+    "get_adapter",
+    "is_builtin_adapter",
+    "list_adapters",
+    "PROMPT_PATH",
+]

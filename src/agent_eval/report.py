@@ -20,6 +20,15 @@ def _fmt(value, suffix: str = "") -> str:
     return f"{value}{suffix}"
 
 
+def _correctness_observed(record: RunRecord) -> bool:
+    return (
+        record.correctness.command_exit_code is not None
+        and record.correctness.infra_error is None
+        and record.efficiency.infra_error is None
+        and (record.outcome is None or record.outcome.status != "infra_error")
+    )
+
+
 def print_runs_table(task_id: str | None = None, limit: int = 50) -> None:
     rows = load_runs(task_id, limit)
     if not rows:
@@ -32,9 +41,12 @@ def print_runs_table(task_id: str | None = None, limit: int = 50) -> None:
     for r in rows:
         record = RunRecord.model_validate_json(r["results_json"])
         if (
-            record.correctness.command_exit_code is None
-            and record.correctness.infra_error is None
+            record.correctness.infra_error is not None
+            or record.efficiency.infra_error is not None
+            or (record.outcome is not None and record.outcome.status == "infra_error")
         ):
+            resolved = "[yellow]n/a (infra)[/yellow]"
+        elif record.correctness.command_exit_code is None:
             resolved = "[yellow]unknown (legacy)[/yellow]"
         else:
             resolved = (
@@ -65,22 +77,33 @@ def print_run_detail(run_id: str) -> None:
 
 def pass_at_k(n: int, c: int, k: int) -> float:
     """Unbiased pass@k estimator (Chen et al. 2021): n trials, c successes."""
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in (n, c, k)):
+        raise TypeError("pass@k inputs must be integers")
+    if n <= 0 or c < 0 or c > n or k <= 0 or k > n:
+        raise ValueError("pass@k requires 0 <= c <= n and 1 <= k <= n")
     if n - c < k:
         return 1.0
     return 1.0 - comb(n - c, k) / comb(n, k)
 
 
 def print_trial_summary(records: list[RunRecord], k: int = 1) -> None:
-    n = len(records)
-    c = sum(1 for r in records if r.correctness.resolved)
+    evaluable = [
+        record
+        for record in records
+        if _correctness_observed(record)
+    ]
+    n = len(evaluable)
+    c = sum(1 for record in evaluable if record.correctness.resolved)
     accepted = sum(r.outcome is not None and r.outcome.status == "accepted"
                    for r in records)
     rejected = sum(r.outcome is not None and r.outcome.status == "rejected"
                    for r in records)
     infra = sum(r.outcome is not None and r.outcome.status == "infra_error"
                 for r in records)
+    pass_estimate = f"{pass_at_k(n, c, k):.2f}" if n >= k else "n/a"
     console.print(
-        f"\ntrials: {n}  resolved: {c}  pass@{k}: {pass_at_k(n, c, k):.2f}  "
+        f"\ntrials: {len(records)}  correctness observed: {n}  resolved: {c}  "
+        f"pass@{k}: {pass_estimate}  "
         f"outcomes accepted/rejected/infra: {accepted}/{rejected}/{infra}"
     )
 
@@ -92,13 +115,20 @@ def markdown_report(task_id: str | None = None, limit: int = 50) -> str:
              "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         record = RunRecord.model_validate_json(r["results_json"])
-        has_resolution_evidence = (
-            record.correctness.command_exit_code is not None
-            or record.correctness.infra_error is not None
-        )
         resolved = (
-            "yes" if record.correctness.resolved
-            else "no" if has_resolution_evidence
+            "n/a (infra)"
+            if (
+                record.correctness.infra_error is not None
+                or record.efficiency.infra_error is not None
+                or (
+                    record.outcome is not None
+                    and record.outcome.status == "infra_error"
+                )
+            )
+            else "yes"
+            if record.correctness.resolved
+            else "no"
+            if record.correctness.command_exit_code is not None
             else "unknown (legacy)"
         )
         outcome = record.outcome.status if record.outcome else "legacy"

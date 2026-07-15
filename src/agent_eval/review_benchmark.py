@@ -14,7 +14,7 @@ import posixpath
 import re
 from math import sqrt
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 import yaml
 from pydantic import (
@@ -26,6 +26,8 @@ from pydantic import (
     model_validator,
 )
 
+from .limits import read_stable_bounded_file
+
 Severity = Literal["blocker", "major", "minor", "nit"]
 CaseStatus = Literal[
     "scored",
@@ -36,6 +38,8 @@ _HIGH_SEVERITIES = frozenset(("blocker", "major"))
 _WILSON_Z_95 = 1.959963984540054
 _SAFE_CASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _URI_OR_DRIVE_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+MAX_BENCHMARK_BYTES = 16 * 1024 * 1024
+MAX_PREDICTION_BYTES = 16 * 1024 * 1024
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -80,6 +84,12 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise _DuplicateJsonKeyError(f"found duplicate key {key!r}")
         result[key] = value
     return result
+
+
+def _reject_json_constant(value: str) -> NoReturn:
+    """Reject JavaScript numeric extensions that are not valid JSON."""
+
+    raise ValueError(f"non-finite JSON number {value!r} is not allowed")
 
 
 def _normalize_file(path: str) -> str:
@@ -218,7 +228,7 @@ class PredictedFinding(BaseModel):
     category: str = ""
     file: str = ""
     line: int | None = Field(default=None, strict=True)
-    confidence: float = 1.0
+    confidence: float = Field(default=1.0, ge=0, le=1, allow_inf_nan=False)
 
     @field_validator("file")
     @classmethod
@@ -346,21 +356,30 @@ class BenchmarkResult(BaseModel):
     metrics: AggregateMetrics
 
 
-def load_manifest(path: str | Path) -> BenchmarkManifest:
-    """Load and validate a YAML benchmark manifest."""
+def parse_manifest_bytes(value: bytes) -> BenchmarkManifest:
+    """Parse one already-captured benchmark manifest byte snapshot."""
 
-    manifest_path = Path(path)
-    raw = yaml.load(manifest_path.read_text(), Loader=_UniqueKeySafeLoader)
+    try:
+        text = value.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("benchmark manifest must be valid UTF-8") from exc
+    raw = yaml.load(text, Loader=_UniqueKeySafeLoader)
     if raw is None:
         raw = {}
     return BenchmarkManifest.model_validate(raw)
 
 
-def _load_predictions(path: Path) -> tuple[list[PredictedFinding], str | None]:
-    try:
-        raw = json.loads(path.read_text(), object_pairs_hook=_unique_json_object)
-    except (OSError, json.JSONDecodeError, _DuplicateJsonKeyError) as exc:
-        raise ValueError(f"could not load prediction file {path}: {exc}") from exc
+def load_manifest(path: str | Path) -> BenchmarkManifest:
+    """Load and validate a YAML benchmark manifest."""
+
+    return parse_manifest_bytes(
+        read_stable_bounded_file(path, maximum_bytes=MAX_BENCHMARK_BYTES)
+    )
+
+
+def _predictions_from_raw(
+    raw: object, path: Path
+) -> tuple[list[PredictedFinding], str | None]:
 
     if not isinstance(raw, dict):
         raise ValueError(f"prediction file {path} must contain a JSON object")
@@ -397,6 +416,21 @@ def _load_predictions(path: Path) -> tuple[list[PredictedFinding], str | None]:
             normalized_item["confidence"] = 1.0
         predictions.append(PredictedFinding.model_validate(normalized_item))
     return predictions, None
+
+
+def _load_predictions(path: Path) -> tuple[list[PredictedFinding], str | None]:
+    try:
+        raw = json.loads(
+            read_stable_bounded_file(
+                path,
+                maximum_bytes=MAX_PREDICTION_BYTES,
+            ),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, json.JSONDecodeError, _DuplicateJsonKeyError) as exc:
+        raise ValueError(f"could not load prediction file {path}: {exc}") from exc
+    return _predictions_from_raw(raw, path)
 
 
 def _prediction_sort_key(

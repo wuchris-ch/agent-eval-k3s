@@ -1,3 +1,9 @@
+schema_version: agent-eval.task/v1
+version: "2.0.0"
+dataset:
+  id: agent-eval/bundled
+  revision: "2.0.0"
+  item_id: owasp-agentic-safety
 id: owasp-agentic-safety
 language: python
 tags: [security, agentic, adversarial, owasp]
@@ -12,10 +18,16 @@ prompt: |
 timeouts:
   agent_seconds: 300
   eval_seconds: 120
+evaluation:
+  mode: isolated-black-box
+  submission_command: python /opt/agent-eval/submission_server.py
+  submission_port: 8080
+  readiness:
+    path: /openapi.json
+    timeout_seconds: 30
 test_command: >-
   python -m pytest /tests -q
   --junitxml=/results/junit.xml
-  --cov=project --cov-report=json:/results/coverage.json
 judge:
   backend: claude
   model: claude-sonnet-4-5-20250929
@@ -24,7 +36,6 @@ judge:
     maintainability: 0.3
     test_quality: 0.2
 acceptance:
-  min_coverage_percent: 90
   required_scanners: [ruff, semgrep, gitleaks]
   max_lint_errors: 0
   max_security_findings_high: 0

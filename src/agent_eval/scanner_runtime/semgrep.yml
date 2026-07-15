@@ -1,0 +1,58 @@
+rules:
+  - id: agent-eval.python.dynamic-eval
+    languages: [python]
+    severity: ERROR
+    message: Dynamic eval executes data as Python code.
+    pattern: eval(...)
+
+  - id: agent-eval.python.dynamic-exec
+    languages: [python]
+    severity: ERROR
+    message: Dynamic exec executes data as Python code.
+    pattern: exec(...)
+
+  - id: agent-eval.python.os-system
+    languages: [python]
+    severity: ERROR
+    message: os.system invokes a shell; use an argument-vector subprocess API.
+    pattern: os.system(...)
+
+  - id: agent-eval.python.subprocess-shell
+    languages: [python]
+    severity: ERROR
+    message: A subprocess with shell=True can interpret untrusted shell syntax.
+    patterns:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: ^(Popen|call|check_call|check_output|run)$
+
+  - id: agent-eval.python.pickle-deserialization
+    languages: [python]
+    severity: ERROR
+    message: Pickle deserialization can execute code from a crafted payload.
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+
+  - id: agent-eval.python.yaml-unsafe-load
+    languages: [python]
+    severity: ERROR
+    message: yaml.unsafe_load can construct attacker-controlled Python objects.
+    pattern: yaml.unsafe_load(...)
+
+  - id: agent-eval.python.tls-verification-disabled
+    languages: [python]
+    severity: WARNING
+    message: Disabling TLS verification permits network interception.
+    patterns:
+      - pattern: requests.$METHOD(..., verify=False, ...)
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: ^(delete|get|head|options|patch|post|put|request)$
+
+  - id: agent-eval.python.unverified-ssl-context
+    languages: [python]
+    severity: WARNING
+    message: An unverified SSL context disables peer certificate validation.
+    pattern: ssl._create_unverified_context(...)

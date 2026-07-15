@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import fnmatch
 import os
-import stat
+import selectors
+import signal
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -30,9 +32,25 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .metrics import ScanResults
+from .yaml_utils import load_unique_yaml
 
 COMMAND_TIMEOUT = 600
 TEST_TIMEOUT = 900
+COMMAND_OUTPUT_LIMIT_BYTES = 4 * 1024 * 1024
+COMMAND_OUTPUT_TAIL_BYTES = 4000
+MAX_COMMAND_BYTES = 16 * 1024
+_COMMAND_ENV_ALLOWLIST = (
+    "CURL_CA_BUNDLE",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SYSTEMROOT",
+    "VIRTUAL_ENV",
+)
 
 
 class GraderResult(BaseModel):
@@ -68,6 +86,28 @@ class ReviewPolicy(BaseModel):
     max_secrets: int | None = Field(default=None, ge=0)
     max_vulnerabilities: int | None = Field(default=None, ge=0)
 
+    @staticmethod
+    def _validate_command(value: str) -> str:
+        if not value.strip():
+            raise ValueError("review commands must not be empty")
+        if "\0" in value:
+            raise ValueError("review commands must not contain NUL bytes")
+        if len(value.encode("utf-8")) > MAX_COMMAND_BYTES:
+            raise ValueError(
+                f"review commands must not exceed {MAX_COMMAND_BYTES} UTF-8 bytes"
+            )
+        return value
+
+    @field_validator("test_cmd")
+    @classmethod
+    def _valid_test_command(cls, value: str | None) -> str | None:
+        return cls._validate_command(value) if value is not None else None
+
+    @field_validator("checks")
+    @classmethod
+    def _valid_check_commands(cls, value: list[str]) -> list[str]:
+        return [cls._validate_command(command) for command in value]
+
     @field_validator("required_scanners")
     @classmethod
     def _normalize_required_scanners(cls, value: list[str]) -> list[str]:
@@ -89,7 +129,7 @@ def load_policy(
 ) -> ReviewPolicy:
     def parse_policy(raw: str, source: str) -> ReviewPolicy:
         try:
-            data = yaml.safe_load(raw) or {}
+            data = load_unique_yaml(raw) or {}
             if not isinstance(data, dict):
                 raise ValueError("policy root must be a mapping")
             return ReviewPolicy(**(data.get("review") or data))
@@ -165,13 +205,115 @@ def head_workspace(repo: Path, head: str | None) -> Iterator[Path]:
             yield tree
 
 
-def _run_shell(cmd: str, cwd: Path, timeout: int) -> tuple[int | None, str]:
+def _command_environment(private_root: Path) -> dict[str, str]:
+    environment = {
+        name: value
+        for name in _COMMAND_ENV_ALLOWLIST
+        if (value := os.environ.get(name)) is not None
+    }
+    environment.setdefault("PATH", os.defpath)
+    environment.update(
+        {
+            "HOME": str(private_root / "home"),
+            "TMPDIR": str(private_root / "tmp"),
+            "TMP": str(private_root / "tmp"),
+            "TEMP": str(private_root / "tmp"),
+            "XDG_CACHE_HOME": str(private_root / "cache"),
+            "XDG_CONFIG_HOME": str(private_root / "config"),
+            "XDG_DATA_HOME": str(private_root / "data"),
+            "XDG_STATE_HOME": str(private_root / "state"),
+        }
+    )
+    return environment
+
+
+def _terminate_command(process: subprocess.Popen[bytes]) -> None:
     try:
-        proc = subprocess.run(cmd, shell=True, cwd=cwd, text=True,
-                              capture_output=True, timeout=timeout)
-        return proc.returncode, (proc.stdout + proc.stderr)[-4000:]
-    except subprocess.TimeoutExpired:
-        return None, f"timed out after {timeout}s"
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+    process.wait()
+
+
+def _append_command_tail(tail: bytearray, chunk: bytes) -> None:
+    tail.extend(chunk)
+    overflow = len(tail) - COMMAND_OUTPUT_TAIL_BYTES
+    if overflow > 0:
+        del tail[:overflow]
+
+
+def _run_shell(
+    cmd: str,
+    cwd: Path,
+    timeout: float,
+) -> tuple[int | None, str]:
+    try:
+        ReviewPolicy._validate_command(cmd)
+    except (UnicodeEncodeError, ValueError) as exc:
+        return None, f"invalid command: {exc}"
+
+    with tempfile.TemporaryDirectory(prefix="agent-eval-command-") as temporary:
+        private_root = Path(temporary)
+        for name in ("home", "tmp", "cache", "config", "data", "state"):
+            (private_root / name).mkdir(mode=0o700)
+        try:
+            process = subprocess.Popen(
+                ["/bin/sh", "-c", cmd],
+                cwd=cwd,
+                env=_command_environment(private_root),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except (OSError, ValueError) as exc:
+            return None, f"could not start command: {type(exc).__name__}"
+
+        assert process.stdout is not None
+        output = process.stdout
+        os.set_blocking(output.fileno(), False)
+        selector = selectors.DefaultSelector()
+        selector.register(output, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout
+        total = 0
+        tail = bytearray()
+        failure: str | None = None
+        try:
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failure = f"timed out after {timeout:g}s"
+                    break
+                for key, _ in selector.select(timeout=min(remaining, 0.1)):
+                    chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                        continue
+                    total += len(chunk)
+                    _append_command_tail(tail, chunk)
+                    if total > COMMAND_OUTPUT_LIMIT_BYTES:
+                        failure = (
+                            "output exceeded the "
+                            f"{COMMAND_OUTPUT_LIMIT_BYTES}-byte limit"
+                        )
+                        break
+                if failure is not None:
+                    break
+        finally:
+            selector.close()
+            if not output.closed:
+                output.close()
+            _terminate_command(process)
+
+        detail = tail.decode("utf-8", errors="replace")
+        if failure is not None:
+            return None, failure
+        return process.returncode, detail
 
 
 def _safe_injection_target(workspace: Path, relative: str) -> Path:

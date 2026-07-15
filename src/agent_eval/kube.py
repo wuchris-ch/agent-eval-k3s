@@ -3,6 +3,7 @@ transfer uses tar pipes (more reliable than kubectl cp for directories)."""
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import os
@@ -27,11 +28,96 @@ KUBE_CONTEXT = "k3d-agent-eval"
 CREDENTIAL_MOUNT = "/var/run/agent-eval-credentials"
 PROXY_PORT = 3128
 PROXY_ACTIVE_DEADLINE_SECONDS = 3600
+K3S_POD_CIDR = "10.42.0.0/16"
+K3S_SERVICE_CIDR = "10.43.0.0/16"
+K3S_CLUSTER_DNS_SERVICE_CIDR = "10.43.0.10/32"
+# Squid checks these after resolving the request hostname. The list excludes
+# destinations that must never be reachable through a task's domain allowlist,
+# including the default k3s pod/service networks and common metadata services.
+PROXY_BLOCKED_IPV4_CIDRS = (
+    "0.0.0.0/8",  # current network and the unspecified address
+    "10.0.0.0/8",  # RFC 1918; contains the k3s pod and service CIDRs
+    "100.64.0.0/10",  # carrier-grade NAT and Alibaba metadata
+    "127.0.0.0/8",  # loopback
+    "168.63.129.16/32",  # Azure platform and metadata virtual address
+    "169.254.0.0/16",  # link-local and common cloud metadata endpoints
+    "172.16.0.0/12",  # RFC 1918
+    "192.0.0.0/24",  # IETF protocol assignments and Oracle metadata
+    "192.0.2.0/24",  # documentation
+    "192.88.99.0/24",  # deprecated 6to4 relay anycast
+    "192.168.0.0/16",  # RFC 1918
+    "198.18.0.0/15",  # benchmark testing
+    "198.51.100.0/24",  # documentation
+    "203.0.113.0/24",  # documentation
+    "224.0.0.0/4",  # multicast
+    "240.0.0.0/4",  # reserved and limited broadcast
+)
+PROXY_BLOCKED_IPV6_CIDRS = (
+    "::/128",  # unspecified
+    "::1/128",  # loopback
+    "64:ff9b::/96",  # well-known NAT64 translation
+    "64:ff9b:1::/48",  # local-use NAT64 translation
+    "100::/64",  # discard-only
+    "2001::/23",  # IETF special-use, including benchmark and ORCHID ranges
+    "2001:db8::/32",  # documentation
+    "2002::/16",  # deprecated 6to4
+    "3fff::/20",  # documentation
+    "fc00::/7",  # unique-local, including AWS IPv6 metadata
+    "fe80::/10",  # link-local
+    "fec0::/10",  # deprecated site-local
+    "ff00::/8",  # multicast
+)
+# Kubernetes egress is allowlisted to global unicast IPv6. These special-use
+# ranges sit inside 2000::/3 and therefore need explicit exclusions.
+PROXY_PUBLIC_IPV6_CIDR = "2000::/3"
+PROXY_PUBLIC_IPV6_EXCEPT_CIDRS = (
+    "2001::/23",
+    "2001:db8::/32",
+    "2002::/16",
+    "3fff::/20",
+)
 MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
 MAX_SNAPSHOT_MEMBERS = 50_000
 MAX_SNAPSHOT_PATH_BYTES = 4_096
 MAX_ARCHIVE_STDERR_BYTES = 1024 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 16 * 1024 * 1024
+TRIAL_SECRET_ROLLBACK_ATTEMPTS = 3
+POD_SECURITY_LEVEL = "restricted"
+# cluster.py pins k3s v1.35.5+k3s1 by its multi-platform OCI index digest.
+POD_SECURITY_VERSION = "v1.35"
+_DNS_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+_IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_CONTAINERD_MANIFEST_MEDIA_TYPES = {
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+}
+_CONTAINERD_INDEX_MEDIA_TYPES = {
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+}
+_QUOTA_COUNT_DEFAULTS = {
+    "pods": ("AGENT_EVAL_QUOTA_PODS", 32, 256),
+    "secrets": ("AGENT_EVAL_QUOTA_SECRETS", 64, 512),
+    "configmaps": ("AGENT_EVAL_QUOTA_CONFIGMAPS", 32, 256),
+    "services": ("AGENT_EVAL_QUOTA_SERVICES", 16, 128),
+}
+_QUOTA_RESOURCE_DEFAULTS = {
+    "cpu": (
+        ("AGENT_EVAL_QUOTA_REQUESTS_CPU", 8, 256),
+        ("AGENT_EVAL_QUOTA_LIMITS_CPU", 32, 512),
+        "",
+    ),
+    "memory": (
+        ("AGENT_EVAL_QUOTA_REQUESTS_MEMORY_GI", 16, 1024),
+        ("AGENT_EVAL_QUOTA_LIMITS_MEMORY_GI", 64, 2048),
+        "Gi",
+    ),
+    "ephemeral-storage": (
+        ("AGENT_EVAL_QUOTA_REQUESTS_EPHEMERAL_STORAGE_GI", 32, 2048),
+        ("AGENT_EVAL_QUOTA_LIMITS_EPHEMERAL_STORAGE_GI", 128, 4096),
+        "Gi",
+    ),
+}
 DEFAULT_SECURITY = {
     "run_as_non_root": True,
     "run_as_user": 10001,
@@ -57,6 +143,251 @@ class CommandOutputLimitError(KubeError):
         )
         self.stdout = stdout
         self.stderr = stderr
+
+
+def _normalize_containerd_image_ref(image_ref: str) -> str | None:
+    """Apply Docker's familiar-name normalization used by containerd."""
+
+    if (
+        not image_ref
+        or any(character.isspace() for character in image_ref)
+        or "@" in image_ref
+    ):
+        return None
+    first, separator, _rest = image_ref.partition("/")
+    if not separator:
+        return f"docker.io/library/{image_ref}"
+    if first == "localhost" or "." in first or ":" in first:
+        return image_ref
+    return f"docker.io/{image_ref}"
+
+
+def containerd_image_manifest_identity(
+    node_name: str,
+    image_ref: str,
+    *,
+    expected_manifest_digest: str | None = None,
+) -> tuple[str, str] | None:
+    """Resolve a node ref to one Linux manifest and its config digest."""
+
+    normalized_ref = _normalize_containerd_image_ref(image_ref)
+    if (
+        normalized_ref is None
+        or expected_manifest_digest is not None
+        and _IMAGE_DIGEST_RE.fullmatch(expected_manifest_digest) is None
+    ):
+        return None
+    try:
+        listed = _run_bounded_command(
+            [
+                "docker",
+                "exec",
+                node_name,
+                "ctr",
+                "-n",
+                "k8s.io",
+                "images",
+                "list",
+                f"name=={normalized_ref}",
+            ],
+            timeout=30,
+        )
+        listed_output = listed.stdout.decode("utf-8")
+    except (
+        CommandOutputLimitError,
+        OSError,
+        subprocess.TimeoutExpired,
+        UnicodeError,
+    ):
+        return None
+    if listed.returncode != 0:
+        return None
+    lines = [line for line in listed_output.splitlines() if line.strip()]
+    expected_header = [
+        "REF",
+        "TYPE",
+        "DIGEST",
+        "SIZE",
+        "PLATFORMS",
+        "LABELS",
+    ]
+    if not lines or lines[0].split() != expected_header:
+        return None
+    rows = [line.split() for line in lines[1:]]
+    if len(rows) != 1 or len(rows[0]) < 3:
+        return None
+    observed_ref, media_type, manifest_digest = rows[0][:3]
+    if (
+        observed_ref != normalized_ref
+        or media_type
+        not in _CONTAINERD_MANIFEST_MEDIA_TYPES | _CONTAINERD_INDEX_MEDIA_TYPES
+        or _IMAGE_DIGEST_RE.fullmatch(manifest_digest) is None
+    ):
+        return None
+
+    def content_for(digest: str) -> bytes | None:
+        try:
+            content = _run_bounded_command(
+                [
+                    "docker",
+                    "exec",
+                    node_name,
+                    "ctr",
+                    "-n",
+                    "k8s.io",
+                    "content",
+                    "get",
+                    digest,
+                ],
+                timeout=30,
+            )
+        except (CommandOutputLimitError, OSError, subprocess.TimeoutExpired):
+            return None
+        if content.returncode != 0:
+            return None
+        if "sha256:" + hashlib.sha256(content.stdout).hexdigest() != digest:
+            return None
+        return content.stdout
+
+    manifest_content = content_for(manifest_digest)
+    if manifest_content is None:
+        return None
+    try:
+        manifest = json.loads(manifest_content)
+    except (json.JSONDecodeError, TypeError, UnicodeError):
+        return None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schemaVersion") != 2
+        or manifest.get("mediaType") != media_type
+    ):
+        return None
+
+    if media_type in _CONTAINERD_INDEX_MEDIA_TYPES:
+        descriptors = manifest.get("manifests")
+        if not isinstance(descriptors, list):
+            return None
+        candidates = []
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict):
+                return None
+            platform = descriptor.get("platform")
+            if not isinstance(platform, dict):
+                continue
+            if (
+                platform.get("os") == "linux"
+                and platform.get("architecture") not in {None, "", "unknown"}
+                and descriptor.get("mediaType") in _CONTAINERD_MANIFEST_MEDIA_TYPES
+                and isinstance(descriptor.get("digest"), str)
+                and _IMAGE_DIGEST_RE.fullmatch(descriptor["digest"]) is not None
+            ):
+                candidates.append(descriptor)
+        if expected_manifest_digest is not None:
+            candidates = [
+                descriptor
+                for descriptor in candidates
+                if descriptor["digest"] == expected_manifest_digest
+            ]
+        if len(candidates) != 1:
+            return None
+        selected = candidates[0]
+        media_type = selected["mediaType"]
+        manifest_digest = selected["digest"]
+        manifest_content = content_for(manifest_digest)
+        if manifest_content is None:
+            return None
+        try:
+            manifest = json.loads(manifest_content)
+        except (json.JSONDecodeError, TypeError, UnicodeError):
+            return None
+        if not isinstance(manifest, dict):
+            return None
+
+    try:
+        config_digest = manifest["config"]["digest"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+    if (
+        manifest.get("schemaVersion") != 2
+        or manifest.get("mediaType") != media_type
+        or media_type not in _CONTAINERD_MANIFEST_MEDIA_TYPES
+        or not isinstance(config_digest, str)
+        or _IMAGE_DIGEST_RE.fullmatch(config_digest) is None
+        or expected_manifest_digest is not None
+        and manifest_digest != expected_manifest_digest
+    ):
+        return None
+    return manifest_digest, config_digest
+
+
+def runtime_class_name() -> str | None:
+    """Return the validated sandbox RuntimeClass, if one is configured."""
+
+    value = os.environ.get("AGENT_EVAL_RUNTIME_CLASS")
+    if value is None:
+        return None
+    if _DNS_LABEL_RE.fullmatch(value) is None:
+        raise ValueError(
+            "AGENT_EVAL_RUNTIME_CLASS must be a lowercase DNS label of at "
+            "most 63 characters"
+        )
+    return value
+
+
+def _bounded_positive_env(name: str, default: int, maximum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    if re.fullmatch(r"[1-9][0-9]*", raw) is None:
+        raise ValueError(f"{name} must be a positive base-10 integer")
+    value = int(raw)
+    if value > maximum:
+        raise ValueError(f"{name} must not exceed {maximum}")
+    return value
+
+
+def _namespace_manifest() -> dict:
+    labels = {
+        f"pod-security.kubernetes.io/{mode}": POD_SECURITY_LEVEL
+        for mode in ("enforce", "audit", "warn")
+    }
+    labels.update(
+        {
+            f"pod-security.kubernetes.io/{mode}-version": POD_SECURITY_VERSION
+            for mode in ("enforce", "audit", "warn")
+        }
+    )
+    return {
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {"name": NAMESPACE, "labels": labels},
+    }
+
+
+def _resource_quota_manifest() -> dict:
+    hard = {
+        resource: str(_bounded_positive_env(env_name, default, maximum))
+        for resource, (env_name, default, maximum) in _QUOTA_COUNT_DEFAULTS.items()
+    }
+    for resource, (
+        request_config,
+        limit_config,
+        suffix,
+    ) in _QUOTA_RESOURCE_DEFAULTS.items():
+        requests = _bounded_positive_env(*request_config)
+        limits = _bounded_positive_env(*limit_config)
+        if requests > limits:
+            raise ValueError(
+                f"namespace quota requests.{resource} cannot exceed limits.{resource}"
+            )
+        hard[f"requests.{resource}"] = f"{requests}{suffix}"
+        hard[f"limits.{resource}"] = f"{limits}{suffix}"
+    return {
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {"name": "agent-eval-quota"},
+        "spec": {"hard": hard},
+    }
 
 
 def _bounded_output(streams: tuple, maximum: int) -> tuple[bytes, bytes]:
@@ -320,24 +651,34 @@ def kubectl(*args: str, input: bytes | None = None, timeout: int | None = None,
 
 
 def ensure_namespace() -> None:
+    # Validate all pod-wide runtime configuration before the first cluster
+    # mutation so a malformed RuntimeClass never reaches kubectl.
+    runtime_class_name()
+    namespace = _namespace_manifest()
+    quota = _resource_quota_manifest()
     proc = subprocess.run(
-        ["kubectl", "--context", KUBE_CONTEXT, "create", "namespace", NAMESPACE],
+        ["kubectl", "--context", KUBE_CONTEXT, "apply", "-f", "-"],
+        input=json.dumps(namespace).encode(),
         capture_output=True,
+        timeout=30,
     )
-    if proc.returncode != 0 and b"AlreadyExists" not in proc.stderr:
+    if proc.returncode != 0:
         raise KubeError(proc.stderr.decode(errors="replace"))
-    manifest = {
+    default_deny = {
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
         "metadata": {"name": "sandbox-default-deny"},
         "spec": {
-            "podSelector": {"matchLabels": {"role": "sandbox"}},
+            # Select every current and future pod in the task namespace. A pod
+            # receives connectivity only through a narrower additive policy.
+            "podSelector": {},
             "policyTypes": ["Ingress", "Egress"],
             "ingress": [],
             "egress": [],
         },
     }
-    kubectl("apply", "-f", "-", input=json.dumps(manifest).encode(), timeout=30)
+    for manifest in (quota, default_deny):
+        kubectl("apply", "-f", "-", input=json.dumps(manifest).encode(), timeout=30)
 
 
 @dataclass
@@ -348,6 +689,16 @@ class Pod:
     def wait_ready(self, timeout: int = 300) -> None:
         kubectl("wait", "--for=condition=Ready", f"pod/{self.name}",
                 f"--timeout={timeout}s", timeout=timeout + 30)
+
+    def ip_address(self) -> str:
+        """Return the validated current pod IP without using cluster DNS."""
+
+        proc = kubectl("get", "pod", self.name, "-o", "json", timeout=30)
+        try:
+            value = json.loads(proc.stdout)["status"]["podIP"]
+            return str(ipaddress.ip_address(value))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise KubeError(f"pod {self.name} has no valid IP address") from exc
 
     def copy_dir_to(self, local_dir: Path, remote_dir: str) -> None:
         """Copy the *contents* of local_dir into remote_dir (created if absent)."""
@@ -505,31 +856,13 @@ class Pod:
             return "command exited 137 (SIGKILL; resource-limit termination possible)"
         return None
 
-    def image_digest(self) -> str | None:
-        """Return the image digest reported by the container runtime."""
-
-        proc = kubectl(
-            "get", "pod", self.name, "-o", "json", check=False, timeout=30
-        )
-        if proc.returncode != 0:
-            return None
-        try:
-            statuses = json.loads(proc.stdout).get("status", {}).get(
-                "containerStatuses", []
-            )
-            image_id = statuses[0].get("imageID", "")
-        except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
-            return None
-        match = re.search(r"sha256:[0-9a-fA-F]{64}", image_id)
-        return match.group(0).lower() if match else None
-
-    def image_manifest_digest(self, image_ref: str) -> str | None:
-        """Resolve the running container's CRI identity to a manifest digest.
-
-        Kubernetes ``imageID`` can be a config digest. Governed execution
-        therefore resolves that exact running ID through CRI and reads the
-        repository digest for the admitted run-unique reference.
-        """
+    def image_manifest_digest(
+        self,
+        image_ref: str,
+        *,
+        expected_manifest_digest: str | None = None,
+    ) -> str | None:
+        """Bind the running CRI config to the node's exact image manifest."""
 
         proc = kubectl("get", "pod", self.name, "-o", "json", check=False, timeout=30)
         if proc.returncode != 0:
@@ -548,32 +881,68 @@ class Pod:
             or not image_id
         ):
             return None
+        image_id_match = re.search(r"sha256:[0-9a-fA-F]{64}", image_id)
+        if image_id_match is None:
+            return None
+        running_config_digest = image_id_match.group(0).lower()
         try:
-            inspected = subprocess.run(
+            inspected = _run_bounded_command(
                 ["docker", "exec", node_name, "crictl", "inspecti", image_id],
-                capture_output=True,
-                text=True,
                 timeout=30,
             )
-        except (OSError, subprocess.TimeoutExpired):
+            inspected_output = inspected.stdout.decode("utf-8")
+        except (
+            CommandOutputLimitError,
+            OSError,
+            subprocess.TimeoutExpired,
+            UnicodeError,
+        ):
             return None
         if inspected.returncode != 0:
             return None
         try:
-            repo_digests = json.loads(inspected.stdout)["status"]["repoDigests"]
-        except (json.JSONDecodeError, KeyError, TypeError):
+            status = json.loads(inspected_output)["status"]
+            cri_config_digest = status["id"].lower()
+            repo_tags = status["repoTags"]
+            repo_digests = status["repoDigests"]
+        except (AttributeError, json.JSONDecodeError, KeyError, TypeError):
             return None
-        repository = image_ref.rpartition(":")[0]
-        digests = {
-            digest.lower()
-            for value in repo_digests
-            if isinstance(value, str)
-            for repo, separator, digest in [value.rpartition("@")]
-            if separator
-            and (repo == repository or repo.endswith(f"/{repository}"))
-            and re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest)
-        }
-        return next(iter(digests)) if len(digests) == 1 else None
+        normalized_ref = _normalize_containerd_image_ref(image_ref)
+        if (
+            normalized_ref is None
+            or not isinstance(repo_tags, list)
+            or normalized_ref not in repo_tags
+            or not isinstance(repo_digests, list)
+        ):
+            return None
+        identity = containerd_image_manifest_identity(
+            node_name,
+            image_ref,
+            expected_manifest_digest=expected_manifest_digest,
+        )
+        if identity is None:
+            return None
+        manifest_digest, manifest_config_digest = identity
+        last_slash = normalized_ref.rfind("/")
+        last_colon = normalized_ref.rfind(":")
+        repository = (
+            normalized_ref[:last_colon]
+            if last_colon > last_slash
+            else normalized_ref
+        )
+        expected_repo_digest = f"{repository}@{manifest_digest}"
+        return (
+            manifest_digest
+            if (
+                manifest_config_digest == running_config_digest
+                and manifest_config_digest == cri_config_digest
+                # k3d-imported local images commonly have an exact repoTag but
+                # no repoDigest. If CRI does report repo digests, they must not
+                # contradict the manifest bound independently above.
+                and (not repo_digests or expected_repo_digest in repo_digests)
+            )
+            else None
+        )
 
     def delete(self) -> None:
         kubectl(
@@ -597,8 +966,51 @@ class TrialSecret:
     def delete(self) -> None:
         kubectl(
             "delete", "secret", self.name, "--ignore-not-found",
+            "--wait=true",
             timeout=30,
         )
+
+    @property
+    def cleanup_command(self) -> str:
+        """Return a credential-free operator command for this exact Secret."""
+
+        return shlex.join(
+            [
+                "kubectl",
+                "--context",
+                KUBE_CONTEXT,
+                "-n",
+                NAMESPACE,
+                "delete",
+                "secret",
+                self.name,
+                "--ignore-not-found",
+                "--wait=true",
+            ]
+        )
+
+
+@dataclass(frozen=True)
+class SandboxLink:
+    """Narrow evaluator-to-submission NetworkPolicy pair."""
+
+    policy_names: tuple[str, str]
+
+    def delete(self) -> None:
+        failures = []
+        for name in self.policy_names:
+            try:
+                kubectl(
+                    "delete",
+                    "networkpolicy",
+                    name,
+                    "--ignore-not-found",
+                    timeout=30,
+                )
+            except (KubeError, subprocess.TimeoutExpired) as exc:
+                failures.append(f"{name}: {type(exc).__name__}: {exc}")
+        if failures:
+            raise KubeError("sandbox link cleanup failed: " + "; ".join(failures))
 
 
 @dataclass
@@ -617,7 +1029,23 @@ class EgressProxy:
         )
 
     def logs(self) -> str:
-        proc = kubectl("logs", self.name, check=False, timeout=30)
+        proc = _run_bounded_command(
+            [
+                "kubectl",
+                "--context",
+                KUBE_CONTEXT,
+                "-n",
+                NAMESPACE,
+                "logs",
+                self.name,
+            ],
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).decode(errors="replace")[-2000:]
+            raise KubeError(
+                f"kubectl logs {self.name} failed ({proc.returncode}): {detail}"
+            )
         return (proc.stdout + proc.stderr).decode(errors="replace")
 
     def delete(self) -> None:
@@ -646,19 +1074,84 @@ class EgressProxy:
             raise KubeError("egress proxy cleanup failed: " + "; ".join(failures))
 
 
-def create_trial_secret(material) -> TrialSecret:
-    """Create a unique Secret from in-memory ``CredentialMaterial``."""
+def _rollback_trial_secret(secret: TrialSecret) -> bool:
+    """Best-effort delete plus an independent API absence check."""
 
-    name = f"agent-credential-{uuid.uuid4().hex[:10]}"
+    for _attempt in range(TRIAL_SECRET_ROLLBACK_ATTEMPTS):
+        try:
+            secret.delete()
+        except Exception:
+            # A delete timeout can still mean that the API server committed
+            # the deletion, so always perform the independent read below.
+            pass
+        try:
+            observed = kubectl(
+                "get",
+                "secret",
+                secret.name,
+                "--ignore-not-found",
+                "-o",
+                "name",
+                timeout=15,
+            )
+            if isinstance(observed.stdout, bytes) and not observed.stdout.strip():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def create_trial_secret(material, *, run_id: str | None = None) -> TrialSecret:
+    """Create a unique Secret from in-memory ``CredentialMaterial``.
+
+    An apply failure is ambiguous because the API server may have committed the
+    object before the client timed out. Retain the generated identity and do not
+    return until deletion and absence have been confirmed, or an operator-safe
+    remediation command can be reported.
+    """
+
+    name = f"agent-credential-{uuid.uuid4().hex}"
+    secret = TrialSecret(name)
+    labels = {
+        "app": "agent-eval",
+        "agent-eval-resource": "trial-credential",
+    }
+    annotations = {}
+    if run_id is not None:
+        run_digest = hashlib.sha256(run_id.encode()).hexdigest()
+        labels["agent-eval-run-sha256"] = run_digest[:32]
+        annotations["agent-eval-run-sha256"] = run_digest
     manifest = {
         "apiVersion": "v1",
         "kind": "Secret",
-        "metadata": {"name": name, "labels": {"app": "agent-eval"}},
+        "metadata": {
+            "name": name,
+            "labels": labels,
+            **({"annotations": annotations} if annotations else {}),
+        },
         "type": "Opaque",
         "stringData": material.values,
     }
-    kubectl("apply", "-f", "-", input=json.dumps(manifest).encode(), timeout=30)
-    return TrialSecret(name)
+    failure_type: str | None = None
+    try:
+        kubectl(
+            "apply", "-f", "-", input=json.dumps(manifest).encode(), timeout=30
+        )
+    except Exception as exc:
+        failure_type = type(exc).__name__
+    if failure_type is not None:
+        if _rollback_trial_secret(secret):
+            raise KubeError(
+                "credential Secret creation failed "
+                f"({failure_type}); rollback confirmed for Secret {name}"
+            )
+        raise KubeError(
+            "credential Secret creation failed "
+            f"({failure_type}); rollback could not be confirmed for Secret {name} "
+            f"after {TRIAL_SECRET_ROLLBACK_ATTEMPTS} attempts. "
+            f"Run: {secret.cleanup_command}"
+        )
+    return secret
 
 
 def egress_proxy_manifests(
@@ -668,14 +1161,24 @@ def egress_proxy_manifests(
 
     if not allowed_domains:
         raise ValueError("proxy mode requires at least one allowed domain")
+    configured_runtime_class = runtime_class_name()
     acl = " ".join(sorted(set(allowed_domains)))
+    blocked_destinations = " ".join(
+        (*PROXY_BLOCKED_IPV4_CIDRS, *PROXY_BLOCKED_IPV6_CIDRS)
+    )
     config = (
         f"http_port {PROXY_PORT}\n"
         "acl SSL_ports port 443\n"
         "acl Safe_ports port 80 443\n"
-        f"acl allowed_domains dstdomain {acl}\n"
+        # A dst ACL is a DNS-resolving slow ACL. Evaluate it before the
+        # non-resolving hostname allowlist and before any upstream connect.
+        f"acl blocked_destination_ips dst {blocked_destinations}\n"
+        # Disable reverse DNS so a direct IP request cannot acquire an allowed
+        # hostname after the destination-IP checks.
+        f"acl allowed_domains dstdomain -n {acl}\n"
         "http_access deny !Safe_ports\n"
         "http_access deny CONNECT !SSL_ports\n"
+        "http_access deny blocked_destination_ips\n"
         "http_access allow allowed_domains\n"
         "http_access deny all\n"
         "access_log stdio:/dev/stdout\n"
@@ -696,6 +1199,11 @@ def egress_proxy_manifests(
             "kind": "Pod",
             "metadata": {"name": name, "labels": labels},
             "spec": {
+                **(
+                    {"runtimeClassName": configured_runtime_class}
+                    if configured_runtime_class is not None
+                    else {}
+                ),
                 "automountServiceAccountToken": False,
                 "enableServiceLinks": False,
                 "activeDeadlineSeconds": PROXY_ACTIVE_DEADLINE_SECONDS,
@@ -735,8 +1243,16 @@ def egress_proxy_manifests(
                             {"name": "tmp", "mountPath": "/tmp"},
                         ],
                         "resources": {
-                            "requests": {"cpu": "25m", "memory": "64Mi"},
-                            "limits": {"cpu": "500m", "memory": "256Mi"},
+                            "requests": {
+                                "cpu": "25m",
+                                "memory": "64Mi",
+                                "ephemeral-storage": "64Mi",
+                            },
+                            "limits": {
+                                "cpu": "500m",
+                                "memory": "256Mi",
+                                "ephemeral-storage": "512Mi",
+                            },
                         },
                     }
                 ],
@@ -765,7 +1281,7 @@ def egress_proxy_manifests(
             "metadata": {"name": name, "labels": labels},
             "spec": {
                 "podSelector": {"matchLabels": {"proxy-id": name}},
-                "policyTypes": ["Ingress"],
+                "policyTypes": ["Ingress", "Egress"],
                 "ingress": [
                     {
                         "from": [
@@ -778,6 +1294,61 @@ def egress_proxy_manifests(
                         "ports": [{"protocol": "TCP", "port": PROXY_PORT}],
                     }
                 ],
+                "egress": [
+                    {
+                        "to": [
+                            {
+                                "namespaceSelector": {
+                                    "matchLabels": {
+                                        "kubernetes.io/metadata.name": "kube-system"
+                                    }
+                                },
+                                "podSelector": {
+                                    "matchLabels": {"k8s-app": "kube-dns"}
+                                },
+                            },
+                            {
+                                "ipBlock": {
+                                    "cidr": K3S_CLUSTER_DNS_SERVICE_CIDR
+                                }
+                            },
+                        ],
+                        "ports": [
+                            {"protocol": "UDP", "port": 53},
+                            {"protocol": "TCP", "port": 53},
+                        ],
+                    },
+                    {
+                        "to": [
+                            {
+                                "ipBlock": {
+                                    "cidr": "0.0.0.0/0",
+                                    "except": list(PROXY_BLOCKED_IPV4_CIDRS),
+                                }
+                            }
+                        ],
+                        "ports": [
+                            {"protocol": "TCP", "port": 80},
+                            {"protocol": "TCP", "port": 443},
+                        ],
+                    },
+                    {
+                        "to": [
+                            {
+                                "ipBlock": {
+                                    "cidr": PROXY_PUBLIC_IPV6_CIDR,
+                                    "except": list(
+                                        PROXY_PUBLIC_IPV6_EXCEPT_CIDRS
+                                    ),
+                                }
+                            }
+                        ],
+                        "ports": [
+                            {"protocol": "TCP", "port": 80},
+                            {"protocol": "TCP", "port": 443},
+                        ],
+                    },
+                ],
             },
         },
     ]
@@ -785,8 +1356,9 @@ def egress_proxy_manifests(
 
 def create_egress_proxy(image: str, allowed_domains: list[str]) -> EgressProxy:
     name = f"egress-{uuid.uuid4().hex[:8]}"
+    manifests = egress_proxy_manifests(name, image, allowed_domains)
     try:
-        for manifest in egress_proxy_manifests(name, image, allowed_domains):
+        for manifest in manifests:
             kubectl(
                 "apply", "-f", "-", input=json.dumps(manifest).encode(), timeout=60
             )
@@ -831,6 +1403,101 @@ def sandbox_egress_policy_manifest(
     }
 
 
+def black_box_link_policy_manifests(
+    evaluator_name: str,
+    submission_name: str,
+    port: int,
+) -> tuple[dict, dict]:
+    """Allow one evaluator pod to connect only to one submission TCP port."""
+
+    for label, value in (
+        ("evaluator", evaluator_name),
+        ("submission", submission_name),
+    ):
+        if _DNS_LABEL_RE.fullmatch(value) is None:
+            raise ValueError(f"{label} pod name must be a lowercase DNS label")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
+        raise ValueError("black-box submission port must be between 1024 and 65535")
+
+    egress_name = f"black-box-egress-{evaluator_name}"
+    ingress_name = f"black-box-ingress-{submission_name}"
+    if len(egress_name) > 63 or len(ingress_name) > 63:
+        raise ValueError("black-box pod names are too long for policy names")
+    peer_port = [{"protocol": "TCP", "port": port}]
+    evaluator = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {"name": egress_name},
+        "spec": {
+            "podSelector": {"matchLabels": {"sandbox-id": evaluator_name}},
+            "policyTypes": ["Egress"],
+            "egress": [
+                {
+                    "to": [
+                        {
+                            "podSelector": {
+                                "matchLabels": {"sandbox-id": submission_name}
+                            }
+                        }
+                    ],
+                    "ports": peer_port,
+                }
+            ],
+        },
+    }
+    submission = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {"name": ingress_name},
+        "spec": {
+            "podSelector": {"matchLabels": {"sandbox-id": submission_name}},
+            "policyTypes": ["Ingress"],
+            "ingress": [
+                {
+                    "from": [
+                        {
+                            "podSelector": {
+                                "matchLabels": {"sandbox-id": evaluator_name}
+                            }
+                        }
+                    ],
+                    "ports": peer_port,
+                }
+            ],
+        },
+    }
+    return evaluator, submission
+
+
+def create_black_box_link(
+    evaluator_name: str,
+    submission_name: str,
+    port: int,
+) -> SandboxLink:
+    """Apply the two additive policies for an isolated black-box evaluation."""
+
+    manifests = black_box_link_policy_manifests(
+        evaluator_name, submission_name, port
+    )
+    link = SandboxLink(
+        tuple(manifest["metadata"]["name"] for manifest in manifests)
+    )
+    try:
+        for manifest in manifests:
+            kubectl(
+                "apply",
+                "-f",
+                "-",
+                input=json.dumps(manifest).encode(),
+                timeout=60,
+            )
+    except Exception:
+        with suppress(Exception):
+            link.delete()
+        raise
+    return link
+
+
 def sandbox_pod_manifest(
     name: str,
     prefix: str,
@@ -845,6 +1512,7 @@ def sandbox_pod_manifest(
     security: dict | None = None,
     image_pull_policy: str = "IfNotPresent",
     proxy_id: str | None = None,
+    container_command: list[str] | None = None,
 ) -> dict:
     """Return the auditable pod manifest used for agent and eval sandboxes.
 
@@ -855,6 +1523,15 @@ def sandbox_pod_manifest(
     """
     if image_pull_policy not in {"IfNotPresent", "Never"}:
         raise ValueError("image pull policy must be IfNotPresent or Never")
+    if container_command is not None and (
+        not container_command
+        or any(
+            not isinstance(value, str) or not value or "\x00" in value
+            for value in container_command
+        )
+    ):
+        raise ValueError("container command must contain nonempty strings without NULs")
+    configured_runtime_class = runtime_class_name()
     security = {**DEFAULT_SECURITY, **(security or {})}
     container_security = {
         "allowPrivilegeEscalation": False,
@@ -897,6 +1574,11 @@ def sandbox_pod_manifest(
             },
         },
         "spec": {
+            **(
+                {"runtimeClassName": configured_runtime_class}
+                if configured_runtime_class is not None
+                else {}
+            ),
             "automountServiceAccountToken": False,
             "enableServiceLinks": False,
             "securityContext": {
@@ -914,7 +1596,7 @@ def sandbox_pod_manifest(
                     "name": "sandbox",
                     "image": image,
                     "imagePullPolicy": image_pull_policy,
-                    "command": ["sh", "-c", "sleep infinity"],
+                    "command": container_command or ["sleep", "infinity"],
                     "workingDir": "/workspace",
                     "env": env,
                     "securityContext": container_security,
@@ -976,9 +1658,12 @@ def create_sandbox_pod(
     image_pull_policy: str = "IfNotPresent",
     egress_mode: str = "open",
     proxy_id: str | None = None,
+    container_command: list[str] | None = None,
 ) -> Pod:
-    """Create a sleeping pod we can copy files into and exec commands in."""
-    name = f"{prefix}-{uuid.uuid4().hex[:8]}"
+    """Create a sandbox pod, sleeping by default for copy/exec workflows."""
+    # Keep enough entropy that an orphaned exact-selector NetworkPolicy cannot
+    # plausibly match a later sandbox after a cleanup failure.
+    name = f"{prefix}-{uuid.uuid4().hex[:16]}"
     spec = sandbox_pod_manifest(
         name,
         prefix,
@@ -992,6 +1677,7 @@ def create_sandbox_pod(
         security=security,
         image_pull_policy=image_pull_policy,
         proxy_id=proxy_id,
+        container_command=container_command,
     )
     policy = sandbox_egress_policy_manifest(name, egress_mode, proxy_id=proxy_id)
     policy_name = policy["metadata"]["name"]

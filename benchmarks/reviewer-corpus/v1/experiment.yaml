@@ -1,5 +1,6 @@
-version: 1
+version: 2
 benchmark: benchmark.yaml
+benchmark_sha256: da8d418f70431d361f701c78f0983f76ee88403a37f8ad5bb650d75a6ad71afa
 baseline: single
 budgets:
   max_fp_per_case: 0.5

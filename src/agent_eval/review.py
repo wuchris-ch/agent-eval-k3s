@@ -30,6 +30,8 @@ import stat
 import subprocess
 import tempfile
 import time
+import uuid
+from contextlib import nullcontext
 from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, Field
@@ -43,6 +45,48 @@ from .graders import (GraderResult, _git, _safe_injection_target,
 from .metrics import DiffStats, ScanResults, now_iso
 
 console = Console()
+
+
+def _private_text(path: Path, value: str) -> None:
+    from .paths import atomic_write_private
+
+    atomic_write_private(path, value.encode("utf-8"))
+
+
+def _prepare_review_output(repo: Path, out_dir: Path | None) -> Path:
+    """Create or validate a private, no-follow report destination."""
+
+    from .paths import ensure_private_directory
+
+    if out_dir is not None:
+        destination = Path(os.path.abspath(out_dir.expanduser()))
+        try:
+            return ensure_private_directory(
+                destination,
+                parents=True,
+                exist_ok=False,
+            )
+        except FileExistsError as exc:
+            raise RuntimeError(
+                f"review output directory already exists: {destination}"
+            ) from exc
+
+    state_dir = ensure_private_directory(repo / ".agent-eval")
+    ignore_path = state_dir / ".gitignore"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(ignore_path, flags, 0o600)
+    except FileExistsError:
+        # This file belongs to the reviewed repository. Never replace its
+        # existing ignore rules or follow a change-controlled symlink.
+        pass
+    else:
+        with os.fdopen(descriptor, "w") as ignore_file:
+            ignore_file.write("*\n")
+
+    reviews = ensure_private_directory(state_dir / "reviews")
+    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:12]}"
+    return ensure_private_directory(reviews / name, exist_ok=False)
 MAX_DIFF_CHARS = 60_000
 MAX_GEN_CONTEXT_FILES = 5
 MAX_GEN_FILE_CHARS = 6_000
@@ -207,21 +251,181 @@ _GEN_TEST_SCHEMA = {
 
 # ---------------------------------------------------------------- git plumbing
 
+_MAX_GIT_REF_BYTES = 1024
+_COMMIT_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _validate_git_ref(ref: str, label: str) -> str:
+    if not isinstance(ref, str) or not ref:
+        raise RuntimeError(f"{label} ref must be non-empty text")
+    if len(ref) > _MAX_GIT_REF_BYTES:
+        raise RuntimeError(
+            f"{label} ref must not exceed {_MAX_GIT_REF_BYTES} UTF-8 bytes"
+        )
+    if ref.startswith("-"):
+        raise RuntimeError(f"{label} ref must not start with '-'")
+    if "\0" in ref:
+        raise RuntimeError(f"{label} ref must not contain NUL bytes")
+    try:
+        ref_bytes = len(ref.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise RuntimeError(f"{label} ref must be valid UTF-8") from exc
+    if ref_bytes > _MAX_GIT_REF_BYTES:
+        raise RuntimeError(
+            f"{label} ref must not exceed {_MAX_GIT_REF_BYTES} UTF-8 bytes"
+        )
+    return ref
+
+
+def _require_commit_oid(value: str, label: str) -> str:
+    if _COMMIT_OID.fullmatch(value) is None:
+        raise RuntimeError(f"{label} is not a resolved commit object ID")
+    return value
+
+
+def _resolve_commit(repo: Path, ref: str, label: str) -> str:
+    ref = _validate_git_ref(ref, label)
+    process = subprocess.run(
+        [
+            "git",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{ref}^{{commit}}",
+        ],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        cwd=repo,
+        env=_read_only_git_environment(),
+    )
+    if process.returncode != 0:
+        raise RuntimeError(f"{label} ref does not resolve to a commit")
+    return _require_commit_oid(process.stdout.strip(), f"resolved {label} ref")
+
+
 def resolve_base(repo: Path, base: str | None) -> str:
-    if base:
-        return base
+    if base is not None:
+        return _resolve_commit(repo, base, "base")
     for cand in ("origin/HEAD", "origin/main", "origin/master", "main", "master"):
-        proc = subprocess.run(["git", "rev-parse", "--verify", "--quiet", cand],
-                              capture_output=True, text=True, cwd=repo)
-        if proc.returncode == 0:
-            return cand
+        try:
+            return _resolve_commit(repo, cand, "base")
+        except RuntimeError:
+            continue
     raise RuntimeError("could not auto-detect a base branch; pass --base")
 
 
 def _merge_base(repo: Path, base: str, head: str) -> str:
-    proc = subprocess.run(["git", "merge-base", base, head],
-                          capture_output=True, text=True, cwd=repo)
-    return proc.stdout.strip() if proc.returncode == 0 else base
+    base = _require_commit_oid(base, "base")
+    head = _require_commit_oid(head, "head")
+    process = subprocess.run(
+        ["git", "merge-base", "--", base, head],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        cwd=repo,
+        env=_read_only_git_environment(),
+    )
+    if process.returncode != 0:
+        detail = process.stderr.strip()[:500]
+        raise RuntimeError(
+            "git merge-base failed" + (f": {detail}" if detail else "")
+        )
+    return _require_commit_oid(process.stdout.strip(), "merge base")
+
+
+def _read_only_git_environment() -> dict[str, str]:
+    environment = {
+        key: value
+        for key in (
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "PATH",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+        )
+        if (value := os.environ.get(key)) is not None
+    }
+    environment.update(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+        }
+    )
+    return environment
+
+
+def _disabled_local_filter_config(repo: Path) -> list[str]:
+    """Override every locally configured content filter with no commands."""
+
+    process = subprocess.run(
+        [
+            "git",
+            "config",
+            "--local",
+            "--includes",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process|required)$",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=repo,
+        env=_read_only_git_environment(),
+    )
+    if process.returncode not in (0, 1):
+        raise RuntimeError("git local filter configuration could not be inspected")
+    drivers = {
+        key.rsplit(".", 1)[0]
+        for key in process.stdout.splitlines()
+        if key.startswith("filter.") and "." in key.removeprefix("filter.")
+    }
+    overrides: list[str] = []
+    for driver in sorted(drivers):
+        for suffix, value in (
+            ("clean", ""),
+            ("smudge", ""),
+            ("process", ""),
+            ("required", "false"),
+        ):
+            overrides.extend(("-c", f"{driver}.{suffix}={value}"))
+    return overrides
+
+
+def _read_only_git(repo: Path, *args: str, check: bool = True) -> str:
+    """Run Git plumbing without hooks, external diffs, textconv, or host config."""
+
+    process = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.quotePath=false",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "diff.algorithm=myers",
+            *_disabled_local_filter_config(repo),
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=repo,
+        env=_read_only_git_environment(),
+    )
+    if check and process.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args[:2])} failed: {process.stderr.strip()[:500]}"
+        )
+    return process.stdout
 
 
 def _worktree_entry(repo: Path, path: str) -> tuple[Path, int] | None:
@@ -257,7 +461,7 @@ def _head_file_content(repo: Path, head: str | None, path: str) -> str | None:
             if stat.S_ISLNK(mode):
                 return os.readlink(src)
             return src.read_text() if stat.S_ISREG(mode) else None
-        return _git(repo, "show", f"{head}:{path}")
+        return _read_only_git(repo, "show", f"{head}:{path}")
     except (RuntimeError, OSError, UnicodeDecodeError):
         return None  # binary or vanished
 
@@ -419,19 +623,41 @@ def _parse_numstat(output: str) -> list[tuple[int, int, str]]:
 def collect_changes(repo: Path, base: str, head: str | None,
                     ) -> tuple[list[ChangedFile], DiffStats, str]:
     """Changed files + stats + unified diff for base...head (or base...worktree)."""
-    anchor = _merge_base(repo, base, head or "HEAD")
-    diff_args = [anchor, head, *_EXCLUDE_PATHSPECS] if head \
+    base_commit = _resolve_commit(repo, base, "base")
+    head_ref = head if head is not None else "HEAD"
+    head_commit = _resolve_commit(repo, head_ref, "head")
+    anchor = _merge_base(repo, base_commit, head_commit)
+    diff_args = [anchor, head_commit, *_EXCLUDE_PATHSPECS] if head is not None \
         else [anchor, *_EXCLUDE_PATHSPECS]
-    diff_text = _git(repo, "diff", "-M", *diff_args)
+    safe_diff_flags = ("--no-ext-diff", "--no-textconv", "--no-color")
+    diff_text = _read_only_git(
+        repo, "diff", *safe_diff_flags, "-M", *diff_args
+    )
 
     status = _parse_name_status(
-        _git(repo, "diff", "--name-status", "-z", "-M", *diff_args)
+        _read_only_git(
+            repo,
+            "diff",
+            *safe_diff_flags,
+            "--name-status",
+            "-z",
+            "-M",
+            *diff_args,
+        )
     )
 
     files: list[ChangedFile] = []
     stats = DiffStats()
     for added, removed, path in _parse_numstat(
-        _git(repo, "diff", "--numstat", "-z", "-M", *diff_args)
+        _read_only_git(
+            repo,
+            "diff",
+            *safe_diff_flags,
+            "--numstat",
+            "-z",
+            "-M",
+            *diff_args,
+        )
     ):
         files.append(ChangedFile(path=path, status=status.get(path, "M"),
                                  lines_added=added, lines_removed=removed,
@@ -443,7 +669,7 @@ def collect_changes(repo: Path, base: str, head: str | None,
     if head is None:  # untracked files never show in git diff
         junk = ("*.pyc", "*__pycache__*", ".agent-eval/*", "*node_modules*",
                 "*.venv/*")
-        untracked = _git(
+        untracked = _read_only_git(
             repo, "ls-files", "-z", "--others", "--exclude-standard"
         ).split("\0")
         for path in untracked:
@@ -769,9 +995,10 @@ def run_generated_test_graders(repo: Path, head: str | None, anchor: str,
         except Exception as e:
             console.print(f"[yellow]adaptive repair failed: {e}[/yellow]")
 
-    gen_dir = out_dir / "generated-tests"
-    gen_dir.mkdir(parents=True, exist_ok=True)
-    (gen_dir / Path(filename).name).write_text(gen.code)
+    from .paths import ensure_private_directory
+
+    gen_dir = ensure_private_directory(out_dir / "generated-tests")
+    _private_text(gen_dir / Path(filename).name, gen.code)
 
     label = "generated test on head" + (" (adapted)" if adapted else "")
     if code_exit is None:
@@ -1148,6 +1375,8 @@ def review_change(repo: Path, base: str | None = None, head: str | None = None,
                   allow_local_execution: bool = False) -> ChangeReport:
     repo = repo.resolve()
     base = resolve_base(repo, base)
+    head = _resolve_commit(repo, head, "head") if head is not None else None
+    comparison_head = head or _resolve_commit(repo, "HEAD", "head")
     policy = load_policy(
         repo,
         policy_path,
@@ -1166,15 +1395,10 @@ def review_change(repo: Path, base: str | None = None, head: str | None = None,
 
     files, stats, diff_text = collect_changes(repo, base, head)
     report.files, report.diff = files, stats
-    anchor = _merge_base(repo, base, head or "HEAD")
-    if out_dir is None:
-        out_dir = repo / ".agent-eval" / "reviews" / time.strftime("%Y%m%d-%H%M%S")
-        # keep our reports out of the user's version control
-        (repo / ".agent-eval").mkdir(exist_ok=True)
-        (repo / ".agent-eval" / ".gitignore").write_text("*\n")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    anchor = _merge_base(repo, base, comparison_head)
+    out_dir = _prepare_review_output(repo, out_dir)
     report.report_dir = str(out_dir)
-    (out_dir / "change.diff").write_text(diff_text)
+    _private_text(out_dir / "change.diff", diff_text)
 
     if not files:
         report.signals = [f"no changes between {base} and {report.head}"]
@@ -1217,7 +1441,7 @@ def review_change(repo: Path, base: str | None = None, head: str | None = None,
                 *checks,
                 policy.model_dump_json(),
                 *(file.path for file in files),
-                *_git(
+                *_read_only_git(
                     repo, "ls-files", "*test*", "*spec*", check=False
                 ).splitlines()[:20],
             ]
@@ -1270,7 +1494,12 @@ def review_change(repo: Path, base: str | None = None, head: str | None = None,
         )
 
     head_tests_pass: bool | None = None
-    with head_workspace(repo, head) as ws:
+    workspace = (
+        head_workspace(repo, head)
+        if checks or test_cmd or gen_tests
+        else nullcontext(repo)
+    )
+    with workspace as ws:
         for cmd in checks:
             console.print(f"command grader: [bold]{cmd}[/bold]")
             report.graders.append(command_grader(cmd, ws))
@@ -1344,8 +1573,8 @@ def review_change(repo: Path, base: str | None = None, head: str | None = None,
 def _persist(report: ChangeReport, out_dir: Path) -> None:
     from .sarif import write_sarif
 
-    (out_dir / "review.json").write_text(report.model_dump_json(indent=2))
-    (out_dir / "review.md").write_text(markdown_review(report))
+    _private_text(out_dir / "review.json", report.model_dump_json(indent=2))
+    _private_text(out_dir / "review.md", markdown_review(report))
     write_sarif(report, out_dir / "review.sarif")
 
 

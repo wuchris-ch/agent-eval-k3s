@@ -5,11 +5,13 @@ from pydantic import ValidationError
 from rich.text import Text
 from typer.testing import CliRunner
 
+import agent_eval.review_benchmark as review_benchmark_module
 from agent_eval.cli import app
 from agent_eval.review_benchmark import (
     BenchmarkCase,
     BenchmarkManifest,
     ExpectedFinding,
+    PredictedFinding,
     load_manifest,
     score_benchmark,
 )
@@ -77,6 +79,62 @@ cases:
         )
     with pytest.raises(ValidationError, match="letters, digits"):
         BenchmarkCase(id="../outside")
+
+
+def test_manifest_and_prediction_inputs_are_bounded(monkeypatch, tmp_path):
+    manifest_path = tmp_path / "benchmark.yaml"
+    manifest_path.write_text("cases:\n  - id: case\n", encoding="utf-8")
+    monkeypatch.setattr(review_benchmark_module, "MAX_BENCHMARK_BYTES", 4)
+
+    with pytest.raises(ValueError, match="safe byte limit"):
+        load_manifest(manifest_path)
+
+    manifest = BenchmarkManifest(cases=[BenchmarkCase(id="case")])
+    reviews = tmp_path / "reviews"
+    _write_predictions(reviews, "case", [])
+    monkeypatch.setattr(review_benchmark_module, "MAX_PREDICTION_BYTES", 4)
+
+    with pytest.raises(ValueError, match="safe byte limit"):
+        score_benchmark(manifest, reviews)
+
+
+def test_prediction_loader_does_not_follow_file_symlinks(tmp_path):
+    manifest = BenchmarkManifest(cases=[BenchmarkCase(id="case")])
+    reviews = tmp_path / "reviews"
+    reviews.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"findings": []}', encoding="utf-8")
+    (reviews / "case.json").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="could not load prediction file"):
+        score_benchmark(manifest, reviews)
+
+
+@pytest.mark.parametrize("confidence", [float("nan"), float("inf"), -0.1, 1.1])
+def test_prediction_confidence_must_be_finite_probability(confidence):
+    with pytest.raises(ValidationError, match="confidence"):
+        PredictedFinding(
+            severity="major",
+            category="correctness",
+            file="src/app.py",
+            line=10,
+            confidence=confidence,
+        )
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_prediction_json_rejects_nonstandard_numeric_constants(tmp_path, constant):
+    manifest = BenchmarkManifest(cases=[BenchmarkCase(id="case")])
+    reviews = tmp_path / "reviews"
+    reviews.mkdir()
+    (reviews / "case.json").write_text(
+        '{"findings":[{"severity":"major","category":"correctness",'
+        f'"file":"src/app.py","line":10,"confidence":{constant}}}]',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="non-finite JSON number"):
+        score_benchmark(manifest, reviews)
 
 
 @pytest.mark.parametrize(

@@ -38,6 +38,18 @@ def test_cluster_up_starts_an_existing_stopped_cluster(monkeypatch):
         "serversRunning": 0,
         "agentsCount": 1,
         "agentsRunning": 0,
+        "nodes": [
+            {
+                "name": "server",
+                "role": "server",
+                "image": cluster.K3S_IMAGE_DIGEST,
+            },
+            {
+                "name": "agent",
+                "role": "agent",
+                "image": cluster.K3S_IMAGE_DIGEST,
+            },
+        ],
     }
     commands = []
     namespace_calls = []
@@ -51,3 +63,48 @@ def test_cluster_up_starts_an_existing_stopped_cluster(monkeypatch):
 
     assert commands == [["k3d", "cluster", "start", "agent-eval", "--wait"]]
     assert namespace_calls == [True]
+
+
+def test_cluster_up_creates_with_digest_pinned_k3s_image(monkeypatch):
+    commands = []
+    monkeypatch.setattr(cluster, "_cluster_record", lambda: None)
+    monkeypatch.setattr(cluster, "_run", lambda command: commands.append(command))
+    monkeypatch.setattr(cluster, "ensure_namespace", lambda: None)
+
+    cluster.cluster_up()
+
+    assert commands == [
+        [
+            "k3d",
+            "cluster",
+            "create",
+            "agent-eval",
+            "--image",
+            cluster.K3S_IMAGE,
+            "--agents",
+            "1",
+            "--wait",
+        ]
+    ]
+
+
+def test_cluster_up_rejects_existing_cluster_with_different_node_image(monkeypatch):
+    existing = {
+        "name": "agent-eval",
+        "nodes": [
+            {"name": "server", "role": "server", "image": "sha256:" + "0" * 64}
+        ],
+    }
+    monkeypatch.setattr(cluster, "_cluster_record", lambda: existing)
+    monkeypatch.setattr(
+        cluster,
+        "_run",
+        lambda command: (_ for _ in ()).throw(AssertionError(command)),
+    )
+
+    try:
+        cluster.cluster_up()
+    except cluster.KubeError as exc:
+        assert "does not use the required k3s image" in str(exc)
+    else:
+        raise AssertionError("mismatched cluster image was accepted")

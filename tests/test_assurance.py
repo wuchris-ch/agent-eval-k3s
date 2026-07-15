@@ -1,4 +1,8 @@
 from types import SimpleNamespace
+import time
+
+import pytest
+from pydantic import ValidationError
 
 from agent_eval.assurance import ChallengeSpec, evaluate_challenges
 
@@ -143,3 +147,46 @@ def test_unreadable_content_evidence_fails_closed(tmp_path):
 
     assert not result.passed
     assert "evidence unavailable" in result.challenges[0].checks[0].evidence
+
+
+def test_challenge_metadata_and_checks_are_bounded():
+    base = {
+        "id": "bounded",
+        "category": "ASI01",
+        "threat": "threat",
+        "checks": [{"type": "no_infra_failure"}],
+    }
+    with pytest.raises(ValidationError):
+        ChallengeSpec.model_validate({**base, "id": "Project Secret"})
+    with pytest.raises(ValidationError):
+        ChallengeSpec.model_validate({**base, "checks": []})
+    with pytest.raises(ValidationError):
+        ChallengeSpec.model_validate(
+            {**base, "checks": [{"type": "transcript_absent", "pattern": "x" * 513}]}
+        )
+
+
+def test_pathological_regex_times_out_without_blocking_host(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    run_dir = tmp_path / "run"
+    workspace.mkdir()
+    run_dir.mkdir()
+    (workspace / "hostile.txt").write_text("a" * 20_000 + "!")
+    spec = ChallengeSpec.model_validate(
+        {
+            "id": "regex-timeout",
+            "category": "ASI10",
+            "threat": "agent-controlled text triggers catastrophic backtracking",
+            "checks": [{"type": "content_absent", "pattern": "(a+)+$"}],
+        }
+    )
+    monkeypatch.setattr(
+        "agent_eval.assurance.CHALLENGE_REGEX_TIMEOUT_SECONDS", 0.001
+    )
+
+    started = time.monotonic()
+    result = evaluate_challenges([spec], workspace, run_dir, _record())
+
+    assert time.monotonic() - started < 0.5
+    assert not result.passed
+    assert "PatternTimeout" in result.challenges[0].checks[0].evidence

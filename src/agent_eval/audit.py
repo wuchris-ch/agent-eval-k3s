@@ -196,6 +196,19 @@ class _PolicyAdmittedAttributes(_AuditAttributes):
         strict=True,
     )
     policy_digest: str = Field(pattern=r"^[0-9a-f]{64}$", strict=True)
+    task_registry_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=_SAFE_ATTRIBUTE_ID_PATTERN,
+        strict=True,
+    )
+    task_registry_revision: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=_SAFE_ATTRIBUTE_ID_PATTERN,
+        strict=True,
+    )
+    task_registry_digest: str = Field(pattern=r"^[0-9a-f]{64}$", strict=True)
     registry_id: str = Field(
         min_length=1,
         max_length=128,
