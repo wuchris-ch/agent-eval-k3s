@@ -15,12 +15,12 @@ classifiers = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "anthropic>=0.115.1",
+    "anthropic>=0.116.0",
     "pydantic>=2.13.4",
     "pyyaml>=6.0.3",
-    "regex==2026.6.28",
+    "regex==2026.7.10",
     "rich>=15.0.0",
-    "typer>=0.26.8",
+    "typer>=0.27.0",
 ]
 
 [project.optional-dependencies]
@@ -40,13 +40,13 @@ Security = "https://github.com/wuchris-ch/agent-eval-k3s/security/policy"
 agent-eval = "agent_eval.cli:app"
 
 [build-system]
-requires = ["uv_build==0.11.28"]
+requires = ["uv_build==0.11.29"]
 build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
-    "ruff>=0.15.20",
+    "ruff>=0.15.21",
 ]
 security = [
     "pip-audit==2.10.1",
