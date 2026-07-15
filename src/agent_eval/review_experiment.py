@@ -23,8 +23,11 @@ plurality with a conservative severity tie-break.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import unicodedata
 from collections import Counter
 from itertools import combinations
 from math import isfinite
@@ -43,6 +46,7 @@ from pydantic import (
     model_validator,
 )
 
+from .limits import read_stable_bounded_file
 from .review_benchmark import (
     BenchmarkManifest,
     BenchmarkResult,
@@ -50,16 +54,21 @@ from .review_benchmark import (
     PredictedFinding,
     _DuplicateJsonKeyError,
     _UniqueKeySafeLoader,
-    _load_predictions,
     _normalize_file,
+    _predictions_from_raw,
+    _reject_json_constant,
     _unique_json_object,
-    load_manifest,
+    parse_manifest_bytes,
     score_benchmark,
 )
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _URI_OR_DRIVE_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _SEVERITY_RANK = {"nit": 1, "minor": 2, "major": 3, "blocker": 4}
+MAX_BENCHMARK_BYTES = 16 * 1024 * 1024
+MAX_EXPERIMENT_BYTES = 4 * 1024 * 1024
+MAX_REVIEW_OUTPUT_BYTES = 16 * 1024 * 1024
 
 
 def _validate_id(value: str) -> str:
@@ -95,6 +104,101 @@ def _resolve_inside(root: Path, relative: str) -> Path:
             f"path {relative!r} resolves outside the experiment root"
         ) from exc
     return resolved
+
+
+def _stable_file_bytes(path: Path, *, maximum_bytes: int) -> bytes:
+    """Read one bounded regular file from a single stable inode."""
+
+    return read_stable_bounded_file(
+        path,
+        maximum_bytes=maximum_bytes,
+    )
+
+
+_OwnershipKey = tuple[str, str] | tuple[str, int, int]
+
+
+def _ownership_keys(path: Path, root: Path) -> tuple[_OwnershipKey, ...]:
+    """Return conservative planned identity plus inode identity when available."""
+
+    relative = path.relative_to(root.resolve()).as_posix()
+    planned = unicodedata.normalize("NFC", relative).casefold()
+    keys: list[_OwnershipKey] = [("planned", planned)]
+    try:
+        metadata = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return tuple(keys)
+    keys.append(("inode", metadata.st_dev, metadata.st_ino))
+    return tuple(keys)
+
+
+def _resolved_output_roots(
+    spec: ExperimentSpec,
+    root: Path,
+    manifest: BenchmarkManifest,
+) -> dict[tuple[str, str], Path]:
+    """Resolve roots and reject any concrete source-output reuse."""
+
+    resolved_by_trial: dict[tuple[str, str], Path] = {}
+    owners: dict[_OwnershipKey, tuple[str, str]] = {}
+    source_owners: dict[_OwnershipKey, tuple[str, str, str, str]] = {}
+    for system in spec.systems:
+        for trial in system.trials:
+            owner = (system.id, trial.id)
+            resolved_output = _resolve_inside(root, trial.outputs)
+            root_keys = _ownership_keys(resolved_output, root)
+            for key in root_keys:
+                if previous := owners.get(key):
+                    previous_system, previous_trial = previous
+                    raise ValueError(
+                        "experiment reuses a resolved trial output directory across "
+                        "systems or trials: "
+                        f"{previous_system}/{previous_trial} and "
+                        f"{system.id}/{trial.id}"
+                    )
+            for key in root_keys:
+                owners[key] = owner
+            resolved_by_trial[owner] = resolved_output
+            source_roots = (
+                [("single", resolved_output)]
+                if system.mode == "single"
+                else [
+                    (member, _resolve_inside(resolved_output, member))
+                    for member in system.members
+                ]
+            )
+            for source_id, source_root in source_roots:
+                for case in manifest.cases:
+                    source_path = _resolve_inside(
+                        root,
+                        (source_root / f"{case.id}.json")
+                        .relative_to(root.resolve())
+                        .as_posix(),
+                    )
+                    source_keys = _ownership_keys(source_path, root)
+                    for key in source_keys:
+                        if previous := source_owners.get(key):
+                            (
+                                previous_system,
+                                previous_trial,
+                                previous_source,
+                                previous_case,
+                            ) = previous
+                            raise ValueError(
+                                "experiment reuses a concrete source output across "
+                                "systems, trials, or cases: "
+                                f"{previous_system}/{previous_trial}/"
+                                f"{previous_source}/{previous_case} and "
+                                f"{system.id}/{trial.id}/{source_id}/{case.id}"
+                            )
+                    for key in source_keys:
+                        source_owners[key] = (
+                            system.id,
+                            trial.id,
+                            source_id,
+                            case.id,
+                        )
+    return resolved_by_trial
 
 
 class _StrictModel(BaseModel):
@@ -194,10 +298,11 @@ class BudgetSpec(_StrictModel):
 
 
 class ExperimentSpec(_StrictModel):
-    """Strict schema for a version 1 reviewer experiment."""
+    """Strict schema for a digest-bound version 2 reviewer experiment."""
 
-    version: int = Field(ge=1, le=1, strict=True)
+    version: Literal[2]
     benchmark: str
+    benchmark_sha256: str
     baseline: str
     budgets: BudgetSpec = Field(default_factory=BudgetSpec)
     systems: list[SystemSpec] = Field(min_length=1)
@@ -207,6 +312,13 @@ class ExperimentSpec(_StrictModel):
     @classmethod
     def _valid_benchmark(cls, value: str) -> str:
         return _safe_relative_path(value)
+
+    @field_validator("benchmark_sha256")
+    @classmethod
+    def _valid_benchmark_sha256(cls, value: str) -> str:
+        if not _SHA256.fullmatch(value):
+            raise ValueError("must be a lowercase SHA-256 digest")
+        return value
 
     @field_validator("baseline")
     @classmethod
@@ -377,8 +489,9 @@ class EfficiencyFrontierPoint(_StrictModel):
 
 
 class ReviewExperimentResult(_StrictModel):
-    version: Literal[1]
+    version: Literal[2]
     benchmark: str
+    benchmark_sha256: str
     baseline: str
     systems: list[SystemExperimentResult]
     paired_comparisons: list[PairedComparison]
@@ -394,10 +507,18 @@ class _LoadedOutput(BaseModel):
 
 
 def load_experiment(path: str | Path) -> ExperimentSpec:
-    """Load and validate a strict version 1 experiment YAML file."""
+    """Load and validate a strict version 2 experiment YAML file."""
 
-    experiment_path = Path(path).resolve()
-    raw = yaml.load(experiment_path.read_text(), Loader=_UniqueKeySafeLoader)
+    experiment_path = Path(os.path.abspath(Path(path).expanduser()))
+    encoded = _stable_file_bytes(
+        experiment_path,
+        maximum_bytes=MAX_EXPERIMENT_BYTES,
+    )
+    try:
+        experiment_text = encoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("experiment must be valid UTF-8") from exc
+    raw = yaml.load(experiment_text, Loader=_UniqueKeySafeLoader)
     if raw is None:
         raw = {}
     spec = ExperimentSpec.model_validate(raw)
@@ -405,20 +526,32 @@ def load_experiment(path: str | Path) -> ExperimentSpec:
     benchmark = _resolve_inside(root, spec.benchmark)
     if not benchmark.is_file():
         raise ValueError(f"benchmark file not found: {spec.benchmark}")
-    for system in spec.systems:
-        for trial in system.trials:
-            _resolve_inside(root, trial.outputs)
+    benchmark_bytes = _stable_file_bytes(
+        benchmark, maximum_bytes=MAX_BENCHMARK_BYTES
+    )
+    if hashlib.sha256(benchmark_bytes).hexdigest() != spec.benchmark_sha256:
+        raise ValueError("benchmark SHA-256 does not match the experiment spec")
+    manifest = parse_manifest_bytes(benchmark_bytes)
+    _resolved_output_roots(spec, root, manifest)
     spec._source_path = experiment_path
     return spec
 
 
 def _load_output(path: Path) -> _LoadedOutput:
-    if not path.is_file():
-        return _LoadedOutput(issue="output file not found")
-
     try:
-        predictions, incomplete_reason = _load_predictions(path)
+        encoded = _stable_file_bytes(path, maximum_bytes=MAX_REVIEW_OUTPUT_BYTES)
+    except FileNotFoundError:
+        return _LoadedOutput(issue="output file not found")
     except (OSError, ValueError) as exc:
+        return _LoadedOutput(issue=f"could not read output: {type(exc).__name__}")
+    try:
+        raw = json.loads(
+            encoded,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        predictions, incomplete_reason = _predictions_from_raw(raw, path)
+    except (json.JSONDecodeError, _DuplicateJsonKeyError, ValueError) as exc:
         return _LoadedOutput(issue=str(exc).replace(str(path), path.name))
     if incomplete_reason is None:
         try:
@@ -436,16 +569,12 @@ def _load_output(path: Path) -> _LoadedOutput:
     metrics = OutputMetrics()
     metric_issue = None
     try:
-        raw = json.loads(path.read_text(), object_pairs_hook=_unique_json_object)
         if not isinstance(raw, dict):
             raise ValueError("output must contain a JSON object")
         metrics_raw = raw.get("metrics")
         if metrics_raw is not None:
             metrics = OutputMetrics.model_validate(metrics_raw)
     except (
-        OSError,
-        json.JSONDecodeError,
-        _DuplicateJsonKeyError,
         ValueError,
     ) as exc:
         metric_issue = f"invalid metrics: {exc}"
@@ -677,7 +806,11 @@ def _panel_trial(
                 issues=issues,
             )
         )
-        _write_normalized_output(normalized_dir, case.id, findings)
+        _write_normalized_output(
+            normalized_dir,
+            case.id,
+            findings if complete_count == len(system.members) else None,
+        )
 
     benchmark = score_benchmark(manifest, normalized_dir)
     _rewrite_prediction_paths(benchmark, trial.outputs)
@@ -698,6 +831,8 @@ def _rewrite_prediction_paths(result: BenchmarkResult, logical_root: str) -> Non
 def _quality_values(trials: list[ExperimentTrialResult], attribute: str) -> list[float]:
     values = []
     for trial in trials:
+        if any(not case.complete for case in trial.cases):
+            continue
         value = getattr(trial.benchmark.metrics, attribute)
         if value is not None:
             values.append(value)
@@ -1048,7 +1183,13 @@ def run_experiment(
         )
 
     benchmark_path = _resolve_inside(root, spec.benchmark)
-    manifest = load_manifest(benchmark_path)
+    benchmark_bytes = _stable_file_bytes(
+        benchmark_path, maximum_bytes=MAX_BENCHMARK_BYTES
+    )
+    if hashlib.sha256(benchmark_bytes).hexdigest() != spec.benchmark_sha256:
+        raise ValueError("benchmark changed after experiment validation")
+    manifest = parse_manifest_bytes(benchmark_bytes)
+    output_roots = _resolved_output_roots(spec, root, manifest)
     system_results: list[SystemExperimentResult] = []
 
     with TemporaryDirectory(prefix="agent-eval-review-experiment-") as temp:
@@ -1056,7 +1197,7 @@ def run_experiment(
         for system_index, system in enumerate(spec.systems):
             trial_results: list[ExperimentTrialResult] = []
             for trial_index, trial in enumerate(system.trials):
-                outputs_root = _resolve_inside(root, trial.outputs)
+                outputs_root = output_roots[(system.id, trial.id)]
                 normalized_dir = temp_root / str(system_index) / str(trial_index)
                 if system.mode == "single":
                     result = _single_trial(
@@ -1090,8 +1231,9 @@ def run_experiment(
         if system.system_id != spec.baseline
     ]
     return ReviewExperimentResult(
-        version=1,
+        version=2,
         benchmark=spec.benchmark,
+        benchmark_sha256=spec.benchmark_sha256,
         baseline=spec.baseline,
         systems=system_results,
         paired_comparisons=paired,

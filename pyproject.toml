@@ -1,31 +1,55 @@
 [project]
 name = "agent-eval"
-version = "0.2.0"
+version = "0.3.0"
 description = "Enterprise coding-agent and pull-request-review evaluation harness with isolated trials, evidence gates, benchmarks, and attestations"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     { name = "Chris", email = "chriswu.ca@gmail.com" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.115.1",
     "pydantic>=2.13.4",
     "pyyaml>=6.0.3",
+    "regex==2026.6.28",
     "rich>=15.0.0",
     "typer>=0.26.8",
 ]
+
+[project.optional-dependencies]
+observability = [
+    "opentelemetry-api==1.43.0",
+    "opentelemetry-exporter-otlp==1.43.0",
+    "opentelemetry-sdk==1.43.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/wuchris-ch/agent-eval-k3s"
+Repository = "https://github.com/wuchris-ch/agent-eval-k3s"
+Issues = "https://github.com/wuchris-ch/agent-eval-k3s/issues"
+Security = "https://github.com/wuchris-ch/agent-eval-k3s/security/policy"
 
 [project.scripts]
 agent-eval = "agent_eval.cli:app"
 
 [build-system]
-requires = ["uv_build>=0.9.16,<0.10.0"]
+requires = ["uv_build==0.11.28"]
 build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
     "ruff>=0.15.20",
+]
+security = [
+    "pip-audit==2.10.1",
 ]
 
 [tool.pytest.ini_options]

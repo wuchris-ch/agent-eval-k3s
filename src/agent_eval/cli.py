@@ -8,6 +8,7 @@ import math
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import typer
 import yaml
@@ -38,11 +39,87 @@ corpus_app = typer.Typer(
 audit_app = typer.Typer(
     help="Verify tamper-evident lifecycle audit trails.", no_args_is_help=True
 )
+state_app = typer.Typer(
+    help="Inspect or explicitly migrate local run state.", no_args_is_help=True
+)
+scanners_app = typer.Typer(
+    help="Prepare and inspect the policy-bound scanner runtime.", no_args_is_help=True
+)
 app.add_typer(cluster_app, name="cluster")
 app.add_typer(tasks_app, name="tasks")
 app.add_typer(corpus_app, name="corpus")
 app.add_typer(audit_app, name="audit")
+app.add_typer(state_app, name="state")
+app.add_typer(scanners_app, name="scanners")
 console = Console()
+
+
+def _print_scanner_identity(identity: Any) -> None:
+    console.print_json(data=identity.model_dump(mode="json"))
+
+
+@scanners_app.command("prepare")
+def scanners_prepare() -> None:
+    """Explicitly hydrate locked scanners and Trivy data for offline runs."""
+
+    from .evaluators.scanners import prepare_scanner_runtime
+
+    try:
+        identity = prepare_scanner_runtime()
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]scanner preparation failed: {str(exc)[:1000]}[/red]")
+        raise typer.Exit(2) from None
+    _print_scanner_identity(identity)
+    if not identity.promotion_ready:
+        console.print(
+            "[red]scanner runtime is not promotion-ready: "
+            + ", ".join(identity.promotion_blockers)
+            + "[/red]"
+        )
+        raise typer.Exit(3)
+    console.print("[green]scanner runtime is promotion-ready[/green]")
+
+
+@scanners_app.command("identity")
+def scanners_identity() -> None:
+    """Print the exact local scanner identity without downloading materials."""
+
+    from .evaluators.scanners import scanner_preflight_assurance_identity
+
+    try:
+        identity = scanner_preflight_assurance_identity()
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]scanner identity failed: {str(exc)[:1000]}[/red]")
+        raise typer.Exit(2) from None
+    _print_scanner_identity(identity)
+    if not identity.promotion_ready:
+        raise typer.Exit(3)
+
+
+def _governed_usage_stop_reason(record: Any, limits: Any) -> str | None:
+    """Return why another provider call must not start after this trial."""
+
+    observed_tokens = (
+        record.efficiency.tokens_in + record.efficiency.tokens_out
+        if record.efficiency.tokens_in is not None
+        and record.efficiency.tokens_out is not None
+        else None
+    )
+    if observed_tokens is None:
+        return "token usage evidence is unavailable"
+    if observed_tokens > limits.max_observed_total_tokens:
+        return (
+            f"observed token usage {observed_tokens} exceeds "
+            f"{limits.max_observed_total_tokens}"
+        )
+    if record.efficiency.cost_usd is None:
+        return "cost evidence is unavailable"
+    if record.efficiency.cost_usd > limits.max_observed_cost_usd:
+        return (
+            f"observed cost {record.efficiency.cost_usd} exceeds "
+            f"{limits.max_observed_cost_usd}"
+        )
+    return None
 
 
 @cluster_app.command("up")
@@ -61,6 +138,57 @@ def cluster_down() -> None:
 def cluster_status() -> None:
     """Show cluster nodes and eval pods."""
     cluster_mod.cluster_status()
+
+
+@state_app.command("path")
+def state_path() -> None:
+    """Print the active local run-state directory."""
+
+    from .paths import get_state_dir
+
+    console.print(str(get_state_dir()))
+
+
+@state_app.command("migrate")
+def state_migrate(
+    source: Path = typer.Option(
+        Path("runs"),
+        "--from",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        resolve_path=False,
+        help="Legacy checkout-local runs directory.",
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Perform the validated copy; omission is a read-only dry run.",
+    ),
+) -> None:
+    """Dry-run or atomically migrate legacy checkout-local run history."""
+
+    from . import metrics
+    from .state import inspect_legacy_state, migrate_legacy_state
+
+    try:
+        inventory = inspect_legacy_state(source)
+        if not apply:
+            console.print(
+                "[green]legacy state valid[/green]: "
+                f"{inventory.run_count} run(s), {inventory.file_count} file(s), "
+                f"{inventory.total_bytes} byte(s); destination {metrics.RUNS_ROOT}"
+            )
+            console.print("re-run with --apply to migrate")
+            return
+        migrated = migrate_legacy_state(source, metrics.RUNS_ROOT)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]state migration failed: {str(exc)[:1000]}[/red]")
+        raise typer.Exit(2) from None
+    console.print(
+        f"[green]state migrated[/green]: {migrated.run_count} run(s) to "
+        f"{metrics.RUNS_ROOT}"
+    )
 
 
 @tasks_app.command("list")
@@ -88,18 +216,66 @@ def tasks_validate(task_id: str) -> None:
         raise typer.Exit(1)
 
 
+@tasks_app.command("fingerprint")
+def tasks_fingerprint(
+    task_id: str,
+    scan: bool = typer.Option(True, "--scan/--no-scan"),
+    judge: bool = typer.Option(True, "--judge/--no-judge"),
+    all_recipes: bool = typer.Option(
+        False,
+        "--all-recipes",
+        help="Approve every admissible scanner and judge switch combination.",
+    ),
+) -> None:
+    """Print exact task content and execution-recipe fingerprints."""
+
+    from .runner import _governance_task_evidence
+
+    task = load_task(task_id)
+    recipes = (
+        [(False, False), (True, False), (True, True)]
+        if all_recipes
+        else [(scan, judge)]
+    )
+    tree_digest: str | None = None
+    execution_digests = set()
+    for run_scans, requested_judge in recipes:
+        current_tree, execution_digest = _governance_task_evidence(
+            task,
+            run_scans=run_scans,
+            run_judge=requested_judge and task.judge.enabled,
+        )
+        if tree_digest is not None and current_tree != tree_digest:
+            raise RuntimeError("task changed while its registry entry was generated")
+        tree_digest = current_tree
+        execution_digests.add(execution_digest)
+    assert tree_digest is not None
+    console.print_json(
+        data={
+            "task_id": task.id,
+            "task_tree_sha256": tree_digest,
+            "execution_spec_digests": sorted(execution_digests),
+        }
+    )
+
+
 @corpus_app.command("validate")
 def corpus_validate(
     manifest: Path = typer.Argument(..., exists=True, dir_okay=False),
-    execute: bool = typer.Option(
-        True, "--execute/--no-execute", help="Run base/head reproducers."
+    allow_local_execution: bool = typer.Option(
+        False,
+        "--allow-local-execution/--no-execute",
+        help=(
+            "Run trusted base/head reproducers with this user's local filesystem "
+            "permissions."
+        ),
     ),
 ) -> None:
-    """Validate corpus hashes, gold diff locations, and reproducers."""
+    """Statically validate corpus hashes and gold diff locations by default."""
     from .corpus import validate_corpus
 
     try:
-        result = validate_corpus(manifest, execute=execute)
+        result = validate_corpus(manifest, execute=allow_local_execution)
     except (OSError, ValueError) as exc:
         console.print(f"[red]could not validate corpus: {exc}[/red]")
         raise typer.Exit(1) from None
@@ -374,7 +550,7 @@ def doctor() -> None:
 
     checks = [
         ("git", sh.which("git") is not None, "review + diffing", "xcode-select --install"),
-        ("uv/uvx", sh.which("uvx") is not None, "ruff + semgrep scanners",
+        ("uv", sh.which("uv") is not None, "locked ruff + semgrep runtime",
          "brew install uv"),
         ("codex CLI", sh.which("codex") is not None, "codex agent + LLM review/judge",
          "npm i -g @openai/codex && codex login"),
@@ -406,7 +582,7 @@ def doctor() -> None:
     console.print(table)
     console.print(
         "\nDeterministic `agent-eval review` needs git. Scanner-backed external "
-        "LLM review also needs uvx, gitleaks, and an authenticated LLM backend. "
+        "LLM review also needs uv, gitleaks, and an authenticated LLM backend. "
         "`agent-eval run` needs docker/kubectl/k3d."
     )
 
@@ -437,13 +613,17 @@ def _persist_admission(request, bundle, decision) -> Path:
 
     from . import metrics as metrics_mod
     from .governance import write_canonical_json
+    from .paths import ensure_private_directory, secure_run_tree
 
-    destination = metrics_mod.RUNS_ROOT / "admissions" / str(decision.decision_id)
-    destination.mkdir(parents=True, mode=0o700)
-    os.chmod(destination, 0o700)
+    ensure_private_directory(metrics_mod.RUNS_ROOT, parents=True)
+    admissions = ensure_private_directory(metrics_mod.RUNS_ROOT / "admissions")
+    destination = ensure_private_directory(
+        admissions / str(decision.decision_id), exist_ok=False
+    )
     write_canonical_json(destination / "request.json", request)
     write_canonical_json(destination / "policy-bundle.json", bundle)
     write_canonical_json(destination / "preflight-decision.json", decision)
+    secure_run_tree(destination)
     return destination
 
 
@@ -482,28 +662,49 @@ def run(
     ),
 ) -> None:
     """Full harness: launch the coding agent in k3s, then evaluate its output."""
-    from .agents import get_adapter
+    from .agents import get_adapter, is_builtin_adapter
     from .runner import (
         _governance_judge_evidence,
         _governance_network_evidence,
+        _governance_scanner_evidence,
         _governance_task_evidence,
         prepare_governed_execution,
         run_agent_trial,
     )
 
-    task = load_task(task_id)
-    adapter = get_adapter(agent)
-    governance_request = None
-    governance_bundle = None
-    governance_decision = None
-    governance_execution_decision = None
-    admission_dir = None
     if (governance_request_path is None) != (governance_policy_path is None):
         console.print(
             "[red]--governance-request and --governance-policy must be supplied "
             "together[/red]"
         )
         raise typer.Exit(2)
+    governed = governance_request_path is not None
+    if governed:
+        try:
+            builtin = is_builtin_adapter(agent)
+        except ValueError as exc:
+            console.print(f"[red]invalid governed adapter: {exc}[/red]")
+            raise typer.Exit(2) from None
+        if not builtin:
+            console.print(
+                "[red]governed runs accept only built-in adapters; third-party "
+                "plugin code has no policy-bound artifact identity[/red]"
+            )
+            raise typer.Exit(2)
+
+    task = load_task(task_id)
+    if governed and task.evaluation.mode != "isolated-black-box":
+        console.print(
+            "[red]governed runs require isolated-black-box evaluation; "
+            "cooperative test execution cannot authenticate correctness evidence[/red]"
+        )
+        raise typer.Exit(2)
+    adapter = None if governed else get_adapter(agent)
+    governance_request = None
+    governance_bundle = None
+    governance_decision = None
+    governance_execution_decision = None
+    admission_dir = None
     if governance_request_path is not None and governance_policy_path is not None:
         from .governance import (
             evaluate_admission,
@@ -516,7 +717,7 @@ def run(
             governance_bundle = load_governance_bundle(governance_policy_path)
             selected_model = model or governance_request.model
             effective_domains, proxy_image = _governance_network_evidence(
-                task, adapter.name
+                task, agent
             )
             effective_judge = judge and task.judge.enabled
             judge_backend, judge_model = _governance_judge_evidence(
@@ -525,11 +726,14 @@ def run(
             task_tree_digest, execution_spec_digest = _governance_task_evidence(
                 task, run_scans=scan, run_judge=effective_judge
             )
+            scanner_identity, scanner_ready = _governance_scanner_evidence(
+                run_scans=scan
+            )
             governance_decision = evaluate_admission(
                 governance_request,
                 governance_bundle,
                 actual_task_id=task.id,
-                actual_agent=adapter.name,
+                actual_agent=agent,
                 actual_model=selected_model,
                 trials=trials,
                 network_mode=task.network.agent_mode,
@@ -537,6 +741,8 @@ def run(
                 eval_timeout_seconds=task.timeouts.eval_seconds,
                 broker_configured=bool(os.environ.get("AGENT_EVAL_CREDENTIAL_COMMAND")),
                 run_scans=scan,
+                scanner_identity_sha256=scanner_identity,
+                scanner_promotion_ready=scanner_ready,
                 run_judge=effective_judge,
                 judge_backend=judge_backend,
                 judge_model=judge_model,
@@ -561,6 +767,10 @@ def run(
                 console.print(f"[red]{reason.code}: {reason.message}[/red]")
             raise typer.Exit(3)
         model = selected_model
+        # Only built-ins can reach this point. Importing and initializing an
+        # external entry point before policy approval would execute unbound
+        # third-party code in the host trust domain.
+        adapter = get_adapter(agent)
         console.print(
             "[green]governance preflight admitted[/green]: "
             f"{governance_decision.policy_id}@"
@@ -571,6 +781,7 @@ def run(
         and governance_bundle is not None
         and governance_decision is not None
     ):
+        assert adapter is not None
         try:
             governance_execution_decision = prepare_governed_execution(
                 task,
@@ -597,6 +808,7 @@ def run(
             raise typer.Exit(2) from None
     else:
         cluster_mod.ensure_cluster()
+    assert adapter is not None
     records = []
     for trial in range(1, trials + 1):
         console.rule(f"trial {trial}/{trials}")
@@ -620,6 +832,15 @@ def run(
             f"trial {trial}: [bold]{status}[/bold] "
             f"({record.correctness.passed}/{record.correctness.total} tests)"
         )
+        if governance_execution_decision is not None and trial < trials:
+            limits = governance_execution_decision.effective_limits
+            stop_reason = _governed_usage_stop_reason(record, limits)
+            if stop_reason is not None:
+                console.print(
+                    "[yellow]stopping before the next governed trial: "
+                    f"{stop_reason}[/yellow]"
+                )
+                break
     print_runs_table(task_id, limit=trials + 5)
     print_trial_summary(records)
     if gate and any(
@@ -658,13 +879,18 @@ def compare(
     result = compare_agents(records)
     table = Table(title="Coding-agent comparison", show_edge=False)
     for column in (
-        "agent/model", "n", "resolved", "accepted", "95% CI", "infra",
+        "cohort", "agent/model", "n", "resolved", "accepted", "95% CI", "infra",
         "time p50/p95", "tokens p50", "cost p50", "judge p50",
     ):
         table.add_column(column)
     for summary in result.summaries:
         interval = summary.resolved_wilson_95
         table.add_row(
+            (
+                summary.cohort.cohort_id[:12]
+                if summary.cohort.binding == "bound"
+                else f"unbound/{summary.cohort.cohort_id[:8]}"
+            ),
             f"{summary.agent}/{summary.model}",
             str(summary.sample_size),
             (
@@ -693,7 +919,7 @@ def compare(
     if not result.paired:
         console.print(
             "[yellow]no paired comparison: use the same --experiment-id and "
-            "trial numbers for each agent[/yellow]"
+            "trial numbers for each agent within one bound evaluation cohort[/yellow]"
         )
     if out:
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -1054,6 +1280,14 @@ def _audit_lifecycle_failures(record, audit_path: Path) -> list[str]:
                 failures.append(
                     "scanner lifecycle does not match the admitted grader recipe"
                 )
+            if not scanners_skipped:
+                from .runner import _governed_scanner_assurance_error
+
+                scanner_error = _governed_scanner_assurance_error(
+                    record, require_evidence=True
+                )
+                if scanner_error is not None:
+                    failures.append(scanner_error)
         judge_events = [
             event
             for event in events
@@ -1097,6 +1331,14 @@ def _audit_lifecycle_failures(record, audit_path: Path) -> list[str]:
             "registry_revision": governance.registry_revision,
             "registry_digest": governance.registry_digest,
         }
+        if governance.schema_version == "agent-eval.governance-evidence/v2":
+            expected_admission.update(
+                {
+                    "task_registry_id": governance.task_registry_id,
+                    "task_registry_revision": governance.task_registry_revision,
+                    "task_registry_digest": governance.task_registry_digest,
+                }
+            )
         if any(admitted.get(key) != value for key, value in expected_admission.items()):
             failures.append("policy.admitted does not match governance evidence")
     return failures
@@ -1113,12 +1355,16 @@ def _decision_replay_view(decision) -> dict:
         "policy_id",
         "policy_revision",
         "policy_digest",
+        "task_registry_id",
+        "task_registry_revision",
+        "task_registry_digest",
         "registry_id",
         "registry_revision",
         "registry_digest",
         "sanitized_input",
         "reasons",
         "effective_limits",
+        "matched_task",
         "matched_model",
         "matched_judge",
     }
@@ -1157,11 +1403,13 @@ def verify_run(
 ) -> None:
     """Recompute attestation, audit, and governance evidence for one run."""
     from .attestation import verify_attestation
+    from .assessments import derive_assessments
     from .audit import verify_audit_chain
     from .governance import (
         EvaluationRequest,
         GovernanceBundle,
         GovernanceEvidence,
+        LegacyGovernanceEvidenceV1,
         PolicyDecision,
         evaluate_admission,
         sha256_json,
@@ -1169,9 +1417,14 @@ def verify_run(
     )
     from .metrics import RunRecord, load_run
     from .outcome import evaluate_outcome
+    from .runner import _governed_scanner_assurance_error
 
     try:
-        record = load_run(run_id, forbid_extra=True)
+        record = load_run(
+            run_id,
+            forbid_extra=True,
+            validate_assessments=True,
+        )
     except ValueError as exc:
         console.print(f"[red]persisted run schema is invalid: {str(exc)[:1000]}[/red]")
         raise typer.Exit(2) from None
@@ -1308,8 +1561,14 @@ def verify_run(
             "local image": disk_record.provenance.local_image_digest,
             "agent pod provenance": disk_record.provenance.agent_image_digest,
             "evaluator pod provenance": disk_record.provenance.eval_image_digest,
+            "submission pod provenance": (
+                disk_record.provenance.submission_image_digest
+            ),
             "agent runtime": disk_record.efficiency.runtime_image_digest,
             "evaluator runtime": disk_record.correctness.runtime_image_digest,
+            "submission runtime": (
+                disk_record.correctness.submission_runtime_image_digest
+            ),
         }
         for label, observed_digest in observed_image_digests.items():
             if observed_digest is not None and observed_digest != expected_image_digest:
@@ -1334,6 +1593,29 @@ def verify_run(
                     failures.append(
                         f"completed evaluator phase is missing {label} digest evidence"
                     )
+            if disk_record.correctness.evaluation_mode == "isolated-black-box":
+                for label in (
+                    "submission pod provenance",
+                    "submission runtime",
+                ):
+                    if observed_image_digests[label] is None:
+                        failures.append(
+                            "completed evaluator phase is missing "
+                            f"{label} digest evidence"
+                        )
+        if disk_record.correctness.evaluation_mode != "isolated-black-box":
+            failures.append(
+                "governed correctness evidence is not isolated-black-box"
+            )
+        scanner_error = _governed_scanner_assurance_error(
+            disk_record,
+            require_evidence=(
+                disk_record.outcome is None
+                or disk_record.outcome.status != "infra_error"
+            ),
+        )
+        if scanner_error is not None:
+            failures.append(scanner_error)
 
     audit_fields = (
         disk_record.provenance.audit_trace_id,
@@ -1387,7 +1669,12 @@ def verify_run(
                 failures.extend(_audit_lifecycle_failures(disk_record, audit_path))
             except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
                 failures.append(f"audit lifecycle is unreadable: {str(exc)[:1000]}")
-        if disk_record.governance is not None:
+        if isinstance(disk_record.governance, LegacyGovernanceEvidenceV1):
+            failures.append(
+                "legacy governance evidence v1 is readable but does not bind "
+                "an approved task-registry entry"
+            )
+        elif disk_record.governance is not None:
             if (
                 not disk_record.governance.allowed
                 or disk_record.governance.reason_codes != ["admitted"]
@@ -1472,6 +1759,12 @@ def verify_run(
                         "broker_configured"
                     ),
                     run_scans=disk_record.governance.run_scans,
+                    scanner_identity_sha256=(
+                        disk_record.governance.scanner_identity_sha256
+                    ),
+                    scanner_promotion_ready=(
+                        disk_record.governance.scanner_promotion_ready
+                    ),
                     run_judge=disk_record.governance.run_judge,
                     judge_backend=judge_backend,
                     judge_model=judge_model,
@@ -1498,6 +1791,12 @@ def verify_run(
                     eval_timeout_seconds=verified_task.timeouts.eval_seconds,
                     broker_configured=decision.sanitized_input.get("broker_configured"),
                     run_scans=disk_record.governance.run_scans,
+                    scanner_identity_sha256=(
+                        disk_record.governance.scanner_identity_sha256
+                    ),
+                    scanner_promotion_ready=(
+                        disk_record.governance.scanner_promotion_ready
+                    ),
                     run_judge=disk_record.governance.run_judge,
                     judge_backend=judge_backend,
                     judge_model=judge_model,
@@ -1522,6 +1821,18 @@ def verify_run(
     else:
         console.print(
             "[yellow]legacy run: no governed lifecycle audit was recorded[/yellow]"
+        )
+
+    recomputed_assessments = derive_assessments(disk_record, effective_task)
+    if [
+        assessment.model_dump(mode="json")
+        for assessment in disk_record.assessments
+    ] != [
+        assessment.model_dump(mode="json")
+        for assessment in recomputed_assessments
+    ]:
+        failures.append(
+            "normalized assessment envelope does not recompute from run evidence"
         )
 
     recomputed_outcome = evaluate_outcome(disk_record, effective_task.acceptance)

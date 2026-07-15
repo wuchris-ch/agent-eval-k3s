@@ -203,7 +203,11 @@ def run_judge(
     model: str | None = None,
 ) -> JudgeResult:
     diff_path = run_dir / "workspace.diff"
-    diff = diff_path.read_text() if diff_path.is_file() else ""
+    if diff_path.is_file():
+        with diff_path.open(encoding="utf-8", errors="replace") as stream:
+            diff = stream.read(MAX_DIFF_CHARS + 1)
+    else:
+        diff = ""
     if not diff.strip():
         return JudgeResult(
             backend=backend,

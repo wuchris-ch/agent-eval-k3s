@@ -10,8 +10,8 @@ teams. It answers two practical questions:
 1. **Should this pull request merge?** `agent-eval review` checks the diff with
    policy rules, commands, tests, scanners, and evidence-verified AI findings.
 2. **How well did this coding agent perform?** `agent-eval run` gives the agent
-   a repeatable task in Kubernetes, grades the result in a fresh pod, and saves
-   a comparable scorecard.
+   a repeatable task in Kubernetes, grades the result against hidden tests, and
+   saves a comparable scorecard.
 
 Both paths use the same principle: important claims need machine-checkable
 evidence. Missing evidence stays missing. It is never silently converted to a
@@ -25,11 +25,14 @@ clean result or a zero.
 - Low, medium, or high risk reports for pull requests, plus JSON and SARIF.
 - Hidden-test correctness, scanner findings, coverage, latency, token use,
   cost, tool use, diff size, and judge results when those values are observable.
+- Versioned, queryable assessments with exact dataset and evaluator identity.
 - Repeatable reviewer benchmarks with precision, recall, F1, false positives,
   stability, latency, tokens, and cost.
 - Optional enterprise governance before a cluster, credential, or model is
   touched.
 - Local audit and provenance evidence that can be verified after a run.
+- Optional, content-minimized OpenTelemetry export to any OTLP-compatible
+  backend.
 
 ### The two modes
 
@@ -57,11 +60,10 @@ infrastructure error, not an agent-quality failure.
 On macOS:
 
 ```sh
-brew install k3d gitleaks trivy
+brew install uv k3d gitleaks trivy
 ```
 
-You also need Docker, `kubectl`, [`uv`](https://docs.astral.sh/uv/), and at least
-one authenticated agent backend:
+You also need Docker, `kubectl`, and at least one authenticated agent backend:
 
 - `ANTHROPIC_API_KEY` for Claude Code and the Claude judge.
 - A logged-in Codex CLI for Codex: `codex login`.
@@ -143,18 +145,29 @@ uv run agent-eval evaluate --task example-todo-api \
    hidden tests.
 3. Claude Code or Codex edits the workspace. The harness captures the transcript
    and any observable usage data.
-4. The resulting workspace is copied out and the agent pod is removed.
-5. A different, network-isolated evaluator pod receives the result and hidden
-   tests.
+4. Remaining agent processes are stopped. Only after three clean process scans
+   is the resulting workspace copied out and the agent pod removed.
+5. In `isolated-black-box` mode, a submission pod receives only the produced
+   workspace and starts the declared service. A separate evaluator pod receives
+   only the hidden tests and result volume. The evaluator can reach one declared
+   submission TCP port through an exact directional NetworkPolicy pair.
 6. Host-side scanners and an optional approved judge add more evidence.
 7. The acceptance policy turns all evidence into an explicit outcome.
 8. The run is saved in JSON and SQLite. Complete runs also receive local
    provenance evidence.
 
-The fresh evaluator pod prevents agent-phase filesystem changes and background
-processes from carrying into grading. It does not make the grader fully hostile-
-code-proof: submitted code and hidden tests still share the evaluator process
-and result volume.
+Governed runs require `isolated-black-box` mode and reject the legacy
+`cooperative` mode before cluster, credential, or model side effects. Submitted
+code cannot read the evaluator's hidden-test or result volumes, and hidden
+tests do not import or execute the submitted workspace in their process. They
+exercise only the task's declared HTTP interface through
+`AGENT_EVAL_SUBMISSION_URL`.
+
+This is a protected grader boundary, not a complete hostile-code sandbox. The
+submission and evaluator pods still run on the same local k3s worker and, unless
+an operator configures a hardened RuntimeClass, share its kernel. Ordinary
+trusted tasks may retain `cooperative` mode for compatibility, where the
+workspace and hidden tests do share one evaluator pod.
 
 ### Pull-request path
 
@@ -169,6 +182,11 @@ and result volume.
 An unverifiable AI finding remains visible in `review.json`, but it cannot raise
 risk. Deterministic blocking evidence and confirmed blocker or major findings
 can fail the review.
+
+An explicit `--head` is reviewed from resolved commit objects. Static diff and
+file collection do not check out that ref or run repository hooks, external
+diff drivers, text conversion, or content filters. Local test and check
+commands remain a separate, explicit `--allow-local-execution` boundary.
 
 ### Reviewer benchmark path
 
@@ -185,14 +203,32 @@ The scorer reports:
 - Finding stability across repeated trials.
 - Latency, tokens, cost, budget eligibility, and the efficiency frontier.
 
-The checked-in demonstration can be reproduced without an LLM:
+Static validation does not execute corpus-controlled commands. It is the
+default; scripts can pass `--no-execute` to make the choice explicit:
 
 ```sh
 uv run agent-eval corpus validate benchmarks/reviewer-corpus/v1/corpus.yaml
+```
+
+Execute base/head reproducers only for a trusted corpus. This runs local code
+with your user's filesystem permissions, using a minimal environment that does
+not forward host credentials:
+
+```sh
+uv run agent-eval corpus validate \
+  benchmarks/reviewer-corpus/v1/corpus.yaml \
+  --allow-local-execution
 uv run agent-eval benchmark-experiment \
   --experiment benchmarks/reviewer-corpus/v1/experiment.yaml \
   --out reviewer-experiment.json
 ```
+
+Corpus schema 1.0 binds each case's base tree, head tree, canonical diff,
+labels, reproducer polarity, and artifact hashes. Validation works from a
+bounded private snapshot and fails if an opt-in reproducer mutates that
+snapshot. Reviewer experiment schema 2 pins the exact benchmark SHA-256 and
+rejects output reuse across systems or trials. Incomplete single or panel
+outputs stay incomplete and do not contribute quality scores.
 
 The small fixture corpus proves the evaluation and CI path. It is not evidence
 that one reviewer architecture is generally better than another.
@@ -276,13 +312,17 @@ analysis.
 
 ### Runtime stack
 
+Governed isolated black-box runs use this stack:
+
 ```text
 macOS
 └── Docker
     └── k3d
         └── k3s
             ├── agent pod
-            └── evaluator pod
+            └── isolated evaluation
+                ├── submission pod (produced workspace only)
+                └── evaluator pod (hidden tests and results only)
 ```
 
 - **Docker image:** the repeatable task filesystem and toolchain.
@@ -290,7 +330,10 @@ macOS
 - **k3s:** supplies the Kubernetes API, scheduling, resource limits, Secrets,
   and NetworkPolicy.
 - **Agent pod:** the disposable environment where the model edits code.
-- **Evaluator pod:** a new environment where hidden tests grade the result.
+- **Submission pod:** the disposable target that runs the produced workspace in
+  isolated black-box evaluation.
+- **Evaluator pod:** the trusted environment that owns hidden tests and results
+  and reaches only the submission's declared port.
 
 Ordinary runs use an environment-context hash in the image tag and compare the
 host Docker image ID with every k3d node. Governed runs use the stricter image
@@ -298,7 +341,7 @@ identity described below.
 
 ### Sandbox profile
 
-Agent and evaluator pods:
+Agent, submission, and evaluator pods:
 
 - Run as a non-root UID.
 - Use a read-only root filesystem and ephemeral writable volumes.
@@ -307,31 +350,127 @@ Agent and evaluator pods:
 - Receive no Kubernetes service-account token.
 - Have CPU, memory, storage, and time bounds.
 
-Evaluator pods deny all network egress. In proxy mode, agent pods have no
-direct DNS or Internet path and can connect only to a per-trial Squid proxy.
-The proxy resolves names and enforces provider-domain suffixes.
+The namespace enforces the Kubernetes `restricted` Pod Security Standard at
+the pinned k3s v1.35 API level and has bounded pod, object, CPU, memory, and
+ephemeral-storage quotas. Set `AGENT_EVAL_RUNTIME_CLASS` to a preinstalled
+RuntimeClass such as a reviewed gVisor or Kata configuration to apply that
+runtime to agent, submission, evaluator, and egress-proxy pods. The default k3d
+cluster does not install a hardened RuntimeClass.
+
+Evaluator and submission pods deny external network egress. During isolated
+black-box grading, additive policies allow only evaluator-to-submission TCP on
+the declared port. The harness uses the target Pod IP directly, without a
+Service or DNS grant. In proxy mode, agent pods have no direct DNS or Internet
+path and can connect only to a per-trial Squid proxy. The proxy resolves names,
+enforces provider-domain suffixes, and rejects local, private, link-local,
+metadata, multicast, and reserved destination addresses.
 
 These are strong local guardrails, not a claim that a shared-kernel container
 can safely contain fully malicious code.
 
 ### Scanner evidence
 
-- Ruff runs as pinned `ruff==0.15.20` with `--isolated`.
-- Semgrep runs as pinned `semgrep==1.169.0`, but `--config auto` still uses a
-  mutable remote ruleset.
-- Gitleaks and Trivy use the locally installed binaries and record their
-  observed versions.
-- The Trivy vulnerability database is not content-pinned.
+The frozen scanner lock currently has one documented, time-limited
+[PYSEC-2026-2132 reachability exception](https://github.com/wuchris-ch/agent-eval-k3s/blob/main/docs/security-exceptions/PYSEC-2026-2132.md).
+CI verifies its exact Semgrep and Click versions, source archive digest, and
+2026-08-14 review deadline while continuing to block every other advisory.
 
-For formal cross-machine or cross-time gates, pin scanner binaries, rulesets,
-and vulnerability databases.
+- Ruff and Semgrep run through the bundled Python 3.12 scanner project with
+  `uv run --frozen --offline`. The wheel contains the exact project, complete
+  transitive lock, and local scanner configuration. Separate SHA-256 values
+  bind the complete runtime bundle, project, lockfile, scanner invocation
+  policy, Semgrep ruleset, and Gitleaks configuration.
+- Ruff runs as exact `ruff==0.15.20` with `--isolated`, `--ignore-noqa`, and
+  `--no-respect-gitignore`. A bounded no-follow inventory passes every
+  classified Python source as an explicit target with `--no-force-exclude`,
+  including sources under `.venv` and other normally excluded directories.
+  Unknown-extension UTF-8 text that parses as Python is included, so moving a
+  Python entry point to a `.txt` file does not suppress Ruff or Semgrep.
+  Target-controlled Ruff configuration, inline `noqa` comments, Git ignore
+  rules, default directory exclusions, and ordinary extension filtering cannot
+  suppress those classified sources.
+- Semgrep runs as exact `semgrep==1.169.0` with metrics disabled and the
+  first-party Python security baseline packaged in `semgrep.yml`. It does not
+  fetch registry rules or perform a version check during a scan. The pinned
+  invocation disables inline `nosem` suppression, Git ignore filtering,
+  `.semgrepignore` filtering, binary detection, and the default target-size
+  cutoff. It receives that same explicit source inventory with
+  `--scan-unknown-extensions`, and the reported scanned-path set must cover
+  every target. Semgrep report errors, skipped rules, reported skipped targets,
+  and missing target coverage fail closed instead of producing partial
+  security metrics.
+- Scanner processes receive a credential-minimized environment. Host API keys
+  and cloud credentials are not inherited; only the executable path,
+  certificate and unauthenticated proxy settings are retained. HOME, temporary
+  files, caches, and the `uv` environment are private and keyed by the bundled
+  project and lock SHA-256.
+- Every scan binds a full-tree SHA-256 for the prepared Python environment and
+  executable SHA-256 values for `uv`, Python, Ruff, Semgrep, Gitleaks, and
+  Trivy. This covers installed Python package files rather than trusting only
+  launcher scripts. Gitleaks' embedded rules are bound to its executable
+  identity, and its packaged configuration forces those defaults so a target
+  `.gitleaks.toml` cannot suppress findings. Gitleaks scans a private, bounded,
+  no-follow mirror that recursively neutralizes scanner-native `.git` and
+  `node_modules` skip names, treats target `.gitleaksignore` files as ordinary
+  scan data, maps findings back to their original paths, disables
+  `gitleaks:allow` comments, and sets the file-size cutoff to unlimited. The
+  mirror is removed before redacted results are persisted.
+- Trivy disables database updates during the scan. Its identity includes
+  bounded database metadata and an exact SHA-256 over the local database file
+  names and bytes. Any database change creates a different scanner identity.
+  Both `--config` and `--ignorefile` point to the hash-bound evaluator-owned
+  empty policy, so caller or target `trivy.yaml` and `.trivyignore` files cannot
+  suppress vulnerability results. Trivy scans the same kind of bounded
+  no-follow mirror with recursive native skip-name neutralization, and its
+  database metadata and content identity must be unchanged across the scan.
+
+Prepare the private environment and Trivy database explicitly before governed
+or otherwise promotion-grade scans:
+
+```sh
+uv run agent-eval scanners prepare
+uv run agent-eval scanners identity
+```
+
+`prepare` performs a bounded frozen sync, downloads the Trivy vulnerability
+database when the separately installed Trivy binary is present, prints the
+resulting identity, and exits nonzero until the stack is promotion-ready.
+Gitleaks and Trivy binaries must be installed separately. `identity` is
+read-only and never downloads materials. Actual Ruff and Semgrep scans use
+`--frozen --offline --no-sync`, and Trivy uses `--skip-db-update`, so evaluation
+never mutates the admitted package or database inputs. Missing artifacts remain
+unavailable evidence. No `.venv` is written into the source checkout or
+installed package. Runtime state is stored beside the configured application
+state directory as `<state-name>-scanner-runtime/`.
+
+CI verifies checksum-pinned Gitleaks 8.30.1 and Trivy 0.72.0 archives, scans the
+repository for secrets with a narrow fixture-hash allowlist, and requires a
+promotion-ready four-scanner smoke run. Its real-binary adversarial checks also
+prove that inline and file-based Gitleaks suppression, default `.git` skipping,
+size cutoffs, and Trivy ignore/config files do not hide the pinned fixtures.
+
+A scanner preflight creates one canonical identity over all of those inputs and
+marks it promotion-ready only when every required scanner reports the exact
+supported version and every executable and Trivy database content digest is
+complete. A governed policy must allowlist
+that exact identity. The completed scan recomputes the identity and the run
+fails closed if readiness or identity differs from admission. The bundled Ruff
+and Semgrep rules currently provide a Python-focused baseline; broader
+language-specific scanner coverage remains future work.
 
 ## Governed runs
 
 Governance is optional. When enabled, it adds a strict request and policy gate
 before cluster setup, image work, credential loading, or a model call.
 
-Use the checked-in example:
+The checked-in governance files are schema templates, not runnable production
+policy. Before use, replace every placeholder scanner identity, task-tree and
+execution digest, image reference and manifest digest, builder assertion,
+source revision, and provenance digest with reviewed values from your own
+promotion process. The all-zero and all-`f` values are deliberately invalid as
+operational approvals.
+
+After replacing those placeholders, a governed command has this shape:
 
 ```sh
 uv run agent-eval run --task example-todo-api --agent claude-code \
@@ -341,7 +480,19 @@ uv run agent-eval run --task example-todo-api --agent claude-code \
 ```
 
 Both governance flags are required together. Unknown and duplicate YAML keys
-are rejected.
+are rejected. New requests use `agent-eval.request/v2` and the explicit
+`max_observed_total_tokens` and `max_observed_cost_usd` names. The loader accepts
+strict historical v1 requests with `max_total_tokens` and `max_cost_usd` and
+normalizes them visibly to v2; it does not accept a mixture of schemas.
+
+Policy v1 is not normalized because it lacks security-critical approvals that
+cannot be inferred. To migrate, create an `agent-eval.policy/v2` document, add
+an exact `task_registry` with task-tree and execution-recipe digests, add a
+reviewed `approved_images` entry for every permitted platform, rename policy
+and model limits to `max_observed_total_tokens` and
+`max_observed_cost_usd`, and populate `allowed_scanner_identities` from a
+promotion-ready `agent-eval scanners identity` result. The loader emits an
+explicit migration error for policy v1 instead of manufacturing approvals.
 
 ### Admission
 
@@ -349,31 +500,61 @@ The request identifies:
 
 - Tenant, project, actor, task, adapter, and exact model.
 - Data classification and retention class.
-- Optional token and cost limits.
+- Optional post-run observed token and cost thresholds.
 
 The policy controls:
 
-- Allowed tenants, projects, tasks, models, and judge identities.
+- Allowed tenants and projects, plus an exact task registry that binds the task
+  tree and each approved execution-specification digest.
+- Exact coding-model and judge-model identities.
 - Data and retention classes.
 - Network mode, proxy domains, and digest-pinned proxy images.
 - Trial count, timeouts, scanner and judge phases.
-- Credential-broker requirements and coding-agent budgets.
+- Credential-broker requirements and post-run observed coding-agent
+  thresholds.
+- Exact promotion-ready scanner identities when scans are required.
 
 Model matching is exact. Prefixes and wildcards are not accepted. A governed
 judge also requires scanning because gitleaks must screen its outbound input.
 
-The effective coding-agent budget is the strictest limit from the policy,
-request, registered model, and task acceptance contract. Missing required usage
-evidence rejects rather than passing.
+The admitted governance threshold is the strictest value from the policy,
+request, and registered model. Outcome evaluation then intersects it with any
+stricter task acceptance threshold. Missing required usage evidence rejects
+rather than passing. After each governed trial, the CLI checks that trial's
+observed tokens and cost against the admitted governance thresholds. Missing
+evidence or an exceeded threshold stops the CLI before it starts the next
+trial.
 
-Judge spend is not included in the local budget ledger, and a limit does not
-interrupt an in-flight provider generation. A production control plane still
-needs provider limits and an atomic multi-trial ledger.
+These are outcome and next-trial gates. They do not reserve spend, aggregate an
+atomic ledger across processes, or interrupt an in-flight provider generation.
+Judge spend is not included. A production control plane still needs provider
+limits, reservations, and an atomic tenant ledger for hard budget enforcement.
 
 ### Immutable execution identity
 
-After preflight, the harness copies the admitted task into a private snapshot
-and builds one Linux image. The final execution decision binds:
+Generate the task-registry entry for one recipe, or every supported scanner and
+judge switch combination:
+
+```sh
+uv run agent-eval tasks fingerprint example-todo-api --scan --judge
+uv run agent-eval tasks fingerprint example-todo-api --all-recipes
+```
+
+The execution digest covers the complete task manifest and tree, grader
+switches, scanner runtime, configured RuntimeClass, and exact k3s image digest.
+Changing any of those inputs requires an explicit registry update. Policy
+schema v2 requires a task registry and rejects unregistered, changed, retired,
+or suspended tasks before image import or credential access. The fingerprint
+command prints task and execution-recipe digests only. It neither builds nor
+approves an image.
+
+Each task-registry entry must separately preapprove one image for every allowed
+Linux platform. The approval binds the reference, single-platform manifest
+digest, builder ID, build type, source revision, and provenance SHA-256. Image
+construction and promotion happen outside governed evaluation. After preflight,
+the harness copies the admitted task into a private snapshot and selects only
+the image approved for the Docker server platform. The final execution decision
+binds:
 
 ```text
 content-derived image reference
@@ -381,15 +562,22 @@ content-derived image reference
 + Linux platform
 ```
 
-The exact reference is imported into every k3d node. Governed agent and
-evaluator pods use `imagePullPolicy: Never`, so a missing local image fails
-instead of falling back to a registry. Runtime evidence must match the admitted
-manifest.
+The local Docker manifest must already match the approval. The exact reference
+is imported into every k3d node, and the agent, submission, and evaluator pods
+use `imagePullPolicy: Never`. A missing image fails instead of triggering a
+runtime build or registry fallback. Runtime evidence from both isolated grading
+pods must match the admitted manifest. On each pinned k3s node, verification
+hashes the exact containerd reference target. If Docker imported an OCI index,
+it selects exactly one real Linux child whose digest equals the expected Docker
+platform manifest, hashes that child, and ignores non-platform attestations.
+The child's config digest must be both the CRI image config and the running
+pod's image ID. This does not depend on optional CRI `repoDigests` metadata.
 
-The private snapshot prevents tag-cache substitution. It does not make an
-untrusted Dockerfile safe or make the build hermetic. A production service
-should use an isolated builder and promote signed digests through a trusted
-registry.
+The private snapshot and runtime checks prevent tag-cache substitution inside
+the local workflow. Builder and provenance fields are policy assertions, not a
+cryptographic verification of a registry artifact. A production service still
+needs an isolated builder, signed policy and provenance, and authenticated
+digest promotion through a trusted registry.
 
 ### Exact model evidence
 
@@ -444,11 +632,31 @@ style command that returns:
 ```
 
 The expiry must cover the agent timeout plus 300 seconds. Secret values and
-broker stdout are not written to errors or run records.
+broker stdout are not written to errors or run records. Broker output,
+credential value counts and sizes, JSON depth, and redaction material are
+bounded. The broker runs in a private process group that is terminated after
+the result, including descendants that remain in that group. The broker command
+is trusted operator configuration, not a sandbox for hostile native code; a
+process that deliberately creates a new session can escape portable process-
+group cleanup. Run untrusted broker implementations inside a separately
+supervised service or hardened worker boundary.
+
+Before a durable write, the runner redacts the exact projected environment
+values, complete projected auth files, sensitive JSON leaves, and JSON-escaped
+forms from transcripts, stderr, proxy logs, and run records. The returned
+workspace first lands in an owner-only temporary directory. Bounded no-follow
+inspection covers regular-file contents and relative path names; a credential
+hit deletes the staged snapshot and blocks evaluation. A final containment gate
+rejects late derived artifacts before persistence or attestation.
 
 The evaluated agent can read whichever provider credential reaches its pod.
 Use a narrowly scoped credential and dedicated test account for adversarial
-tasks. A host crash can also leave Kubernetes objects until manual cleanup.
+tasks. Exact containment cannot recognize a deliberately fragmented, encrypted,
+hashed, or independently encoded credential. Environments that require that
+control need a separate DLP boundary. Secret creation retains its generated
+name and confirms rollback after an ambiguous API error; an unconfirmed cleanup
+reports the exact credential-free `kubectl` remediation command. A host crash
+can still leave Kubernetes objects until manual cleanup.
 
 ## Metrics and comparison
 
@@ -465,6 +673,14 @@ tasks. A host crash can also leave Kubernetes objects until manual cleanup.
 
 Unobserved values remain `null`.
 
+Every completed run also projects deterministic tests, scanners, model judges,
+adversarial challenges, governance, and the final outcome into one strict
+`agent-eval.assessment/v1` envelope. Assessments include typed values, status,
+direction, thresholds, evaluator identity and configuration digests, and the
+task's dataset revision and item ID. SQLite stores them in a normalized table
+for filtering without parsing result blobs. Prompts, source, diffs, rationales,
+commands, and transcripts are excluded from this envelope.
+
 `compare` groups runs by adapter and recorded model. It reports sample size,
 resolved rate with Wilson intervals, pass@k, infrastructure-failure rate,
 acceptance rate, completeness, time, tokens, cost, judge scores, and diff
@@ -473,34 +689,62 @@ summaries.
 Paired comparisons require the same experiment, task, trial number, task-tree
 digest, and runtime image digest. Missing metrics do not become zero deltas.
 
+Aggregation also requires an exact match on evaluation-specification digest,
+task-tree digest, runtime image digest, harness version, complete Git commit and
+worktree identity. The evaluation-specification digest binds the configured
+evaluator recipe and dataset identity before execution. Observed assessment
+availability and evaluator identity remain result evidence and never change a
+run's cohort or denominator. Third-party adapter runs also need distribution,
+version, and installed-artifact identity. Runs missing any required binding are
+shown as distinct legacy-unbound single-run cohorts and are never paired or
+pooled.
+
 ## Enterprise controls and honest limits
 
 Implemented controls include:
 
 1. Versioned, fail-closed request and policy admission.
 2. Exact coding and judge model identities when the provider exposes them.
-3. Content-bound task snapshots and governed image identity.
-4. Non-root, resource-bounded, network-controlled sandbox pods.
-5. Secret screening before external model review.
-6. Evidence-verified AI findings and trusted-base review policy.
-7. Itemized outcomes that separate rejection from infrastructure failure.
-8. Hash-locked reviewer fixtures with executable reproducers.
-9. Content-minimized audit chains and locally verifiable provenance.
-10. JSON and SARIF outputs for CI and code-scanning systems.
+3. Governed isolated black-box grading with separate submission and evaluator
+   pods, directional network policy, and evaluator-owned results.
+4. Content-bound task snapshots and preapproved per-platform task images.
+5. Frozen, offline scanner recipes with exact executable and Trivy database
+   identity, policy allowlisting, and post-scan identity verification.
+6. Non-root, resource-bounded, network-controlled sandbox pods.
+7. Secret screening before external model review.
+8. Evidence-verified AI findings and trusted-base review policy.
+9. Itemized outcomes that separate rejection from infrastructure failure.
+10. Hash-locked reviewer fixtures with executable reproducers.
+11. Content-minimized audit chains and locally verifiable provenance.
+12. JSON and SARIF outputs for CI and code-scanning systems.
 
 Important remaining boundaries:
 
-- Submitted code and hidden tests still share the evaluator process.
+- Submission and evaluator pods still share a local worker kernel unless a
+  reviewed gVisor, Kata, or other hardened RuntimeClass is configured.
 - Review test and check commands run trusted change-controlled code on the Mac.
-- Local attestations are unsigned.
-- Scanner rules and vulnerability data are not fully immutable.
-- Provider budgets are outcome gates, not generation-time interruption.
+- Local policy, image-builder assertions, audit bundles, and attestations are
+  unsigned. The harness does not verify registry signatures, trusted time, or a
+  transparency log.
+- Governed token and cost controls are observed outcome and next-trial gates,
+  not provider-side reservations or atomic generation-time limits.
+- Ruff and the packaged Semgrep baseline are Python-focused. Equivalent
+  language-specific lint and static-analysis profiles are not yet bundled for
+  JavaScript, TypeScript, Go, Rust, Java, or other ecosystems.
+- Operators must run the explicit scanner preparation and identity-promotion
+  workflow before offline governed scans. Evaluation does not fetch missing
+  packages or vulnerability data.
 - Cleanup is best effort if the harness or host crashes.
 - The seed reviewer corpus is too small for general model-ranking claims.
-- Task Dockerfiles are trusted by the local host build path.
+- Ordinary, non-governed task Dockerfiles are trusted by the local host build
+  path. Governed execution consumes a preapproved image but still trusts the
+  unsigned policy assertion that describes its builder and provenance.
+- SQLite is a single-user workstation store, not a multi-tenant production
+  control-plane database.
 
-The next strong security boundary is protected out-of-process grading and
-result capture. The next measurement boundary is a larger public PR corpus.
+The next strong security boundaries are hardened workers, signed policy and
+registry verification, and an authenticated multi-tenant control plane. The
+next measurement boundary is a larger reviewed public PR corpus.
 
 ## Writing a task
 
@@ -516,10 +760,30 @@ tasks/<task-id>/
 
 Rules:
 
+- Declare `schema_version: agent-eval.task/v1` and an exact task `version`.
+- Manifests created before task schemas existed remain readable with the
+  explicit `legacy-unversioned` binding. A manifest that declares only one of
+  `schema_version` or `version` is rejected.
+- When a task belongs to a dataset, declare exact `dataset.id`,
+  `dataset.revision`, and `dataset.item_id` values.
 - The directory and `task.yaml` ID must be the same lowercase DNS-style label.
-- `test_command` runs from `/workspace`; hidden tests are mounted at `/tests`.
+- Remove generated host state before fingerprinting. Task loading rejects
+  Python bytecode, `__pycache__`, common Python tool caches, coverage state,
+  and `.DS_Store` so those files cannot alter an approval or enter an image
+  context accidentally.
+- Governed tasks must use `evaluation.mode: isolated-black-box` and declare a
+  bounded submission command, TCP port, and HTTP readiness path. Cooperative
+  mode is available only for ordinary compatibility runs with trusted tasks.
+- In isolated mode, hidden tests are mounted only into the evaluator pod and
+  must exercise the documented remote interface through
+  `AGENT_EVAL_SUBMISSION_URL`. They must not import the submitted workspace.
+- `test_command` runs in the evaluator pod; hidden tests are mounted at
+  `/tests`.
 - Write JUnit XML to `/results/junit.xml` and optional coverage JSON to
   `/results/coverage.json`.
+- Do not set a coverage acceptance threshold for black-box tasks unless the
+  evaluator has a separately trusted way to measure target coverage. Coverage
+  of the hidden-test client is not submission coverage.
 - Hidden tests should cover only the interface promised by the prompt.
 - Declare every scanner required by acceptance.
 - The image must include the selected agent CLI and `tar`, and support the
@@ -542,8 +806,28 @@ resources:
 Task acceptance and sandbox policy live in `task.yaml`:
 
 ```yaml
+schema_version: agent-eval.task/v1
+version: 1.0.0
+id: example-todo-api
+prompt: Implement the approved todo API change without modifying evaluator controls.
+dataset:
+  id: company/engineering-evals
+  revision: 2026-07-14.1
+  item_id: example-todo-api
+
+evaluation:
+  mode: isolated-black-box
+  submission_command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8080
+  submission_port: 8080
+  readiness:
+    path: /openapi.json
+    timeout_seconds: 30
+
+test_command: >-
+  python -m pytest /tests -q
+  --junitxml=/results/junit.xml
+
 acceptance:
-  min_coverage_percent: 85
   min_judge_score: 3.5
   required_scanners: [ruff, semgrep, gitleaks]
   max_lint_errors: 0
@@ -570,18 +854,113 @@ Once a threshold is present, missing evidence fails closed.
 
 ## Adding an agent adapter
 
-Implement `AgentAdapter` in `src/agent_eval/agents/base.py`:
+Built-in adapters remain reserved. A third-party distribution registers an
+adapter class, instance, or zero-argument factory with this entry point:
+
+```toml
+[project.entry-points."agent_eval.agents"]
+my-agent = "my_agent.adapter:MyAdapter"
+```
+
+The adapter must implement the `AgentAdapter` surface from
+`src/agent_eval/agents/base.py`:
 
 1. Produce a shell command that runs the agent against the prompt file.
 2. Request a machine-readable transcript on stdout.
 3. Parse the transcript into `AgentMetrics`.
-4. Register the adapter in `src/agent_eval/agents/__init__.py`.
+4. Expose a string-to-string `env` mapping and, optionally, callable `prepare`.
+
+The entry-point name and adapter `name` must match and use a lowercase DNS
+label of at most 63 characters. Plugins cannot use the reserved `codex` or
+`claude-code` names. Environment keys must be valid variable names, and static
+`env` values must not embed secrets. Third-party adapter credentials require
+`AGENT_EVAL_CREDENTIAL_COMMAND`.
+
+`get_adapter(name)` imports and initializes only the selected plugin.
+`list_adapters()` returns built-in and installed entry-point metadata without
+importing plugin modules, and marks invalid, duplicate, or shadowing entries as
+unavailable. Selected plugins execute in the host process, so install only
+reviewed and trusted distributions.
+
+Governed runs currently accept built-in adapters only. A third-party entry
+point is executable host code, and this policy schema does not bind its
+distribution version, installed-file digest, or signature. The CLI rejects it
+before entry-point discovery or import rather than pretending an adapter name
+is an artifact identity. Ordinary plugin runs without that exact artifact
+identity remain usable as individual evidence but are never pooled or paired
+by `compare`.
+
+## Local state and task discovery
+
+Run records no longer default to a checkout-relative `runs/` directory. On
+macOS they live at:
+
+```text
+~/Library/Application Support/agent-eval
+```
+
+Inspect the active path and safely migrate an existing checkout-local store:
+
+```sh
+uv run agent-eval state path
+uv run agent-eval state migrate --from ./runs
+uv run agent-eval state migrate --from ./runs --apply
+```
+
+Migration is a dry run unless `--apply` is present. It rejects links and
+special files, pins the source root and traverses every component through
+no-follow directory descriptors, and detects changes using inode, full mode,
+size, mtime, ctime, and link-count evidence. It reconciles SQLite rows with
+their run artifacts and applies additive schema migrations to a private copy.
+The destination must not exist, so cutover is one same-filesystem atomic
+directory rename and no existing state is ever replaced. The source is never
+deleted. If parent-directory `fsync` reports a durability failure after the
+rename, the destination still contains only the complete validated tree and
+the source remains available for recovery.
+
+Set `AGENT_EVAL_STATE_DIR` before starting the process to use a different state
+root. Set `AGENT_EVAL_TASKS_DIR` to a directory containing organization-owned
+tasks. Source checkouts also discover the repository's `tasks/` directory. The
+Python wheel intentionally contains no benchmark tasks, so wheel installations
+need `AGENT_EVAL_TASKS_DIR` for `run`, `evaluate`, and task commands.
+
+## OpenTelemetry export
+
+Canonical JSON, SQLite, audit, and attestation records remain authoritative.
+Telemetry is an optional, lossy projection and an exporter failure never
+changes the saved outcome.
+
+Install the optional SDK and enable export explicitly:
+
+```sh
+uv sync --extra observability
+export AGENT_EVAL_OTEL_ENABLED=1
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example.com:4317
+export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+```
+
+`http/protobuf` is also supported through
+`OTEL_EXPORTER_OTLP_PROTOCOL` or `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`.
+Standard OpenTelemetry authentication headers remain exporter configuration.
+Only allowlisted low-cardinality run attributes and content-free assessment
+events are emitted. Set `AGENT_EVAL_ENVIRONMENT` to one of `development`,
+`staging`, `production`, or `test`. `AGENT_EVAL_OTEL_FLUSH_TIMEOUT_MS` is
+bounded from 100 to 10000 milliseconds and defaults to 3000.
 
 ## Configuration
 
+- `AGENT_EVAL_STATE_DIR`: local JSON, SQLite, audit, and attestation root.
+- `AGENT_EVAL_TASKS_DIR`: organization-owned task directory.
+- `AGENT_EVAL_RUNTIME_CLASS`: preinstalled Kubernetes RuntimeClass applied to
+  all evaluation workloads and included in governance fingerprints.
 - `AGENT_EVAL_JUDGE`: `claude`, `codex`, or `auto`.
 - `AGENT_EVAL_JUDGE_MODEL`: judge model override for an unpinned task.
 - `AGENT_EVAL_CREDENTIAL_COMMAND`: credential broker command.
+- `AGENT_EVAL_QUOTA_*`: bounded namespace object and compute quota overrides;
+  see `src/agent_eval/kube.py` for names and hard maximums.
+- `AGENT_EVAL_OTEL_ENABLED`: explicit opt-in for the OTLP projection.
+- `AGENT_EVAL_ENVIRONMENT`: bounded deployment environment telemetry value.
+- `AGENT_EVAL_OTEL_FLUSH_TIMEOUT_MS`: bounded best-effort flush timeout.
 - `--model` on `run`: coding-agent model override.
 
 A task-level `judge.backend` and `judge.model` pair takes precedence. Governed
@@ -594,6 +973,10 @@ runs require an exact task-pinned judge identity and approved registry entry.
 | `src/agent_eval/cli.py` | Commands and CI exit behavior |
 | `src/agent_eval/runner.py` | Coding-agent and evaluator pipeline |
 | `src/agent_eval/kube.py` | Pod manifests and Kubernetes operations |
+| `src/agent_eval/assessments.py` | Normalized, content-minimized assessment schema |
+| `src/agent_eval/observability.py` | Optional privacy-safe OpenTelemetry projection |
+| `src/agent_eval/paths.py` | Portable task discovery and private local state paths |
+| `src/agent_eval/state.py` | Validated legacy-state migration |
 | `src/agent_eval/review.py` | Pull-request evidence and risk calculation |
 | `src/agent_eval/review_benchmark.py` | Gold-label reviewer scoring |
 | `src/agent_eval/review_experiment.py` | Repeated single and panel experiments |
@@ -606,6 +989,10 @@ runs require an exact task-pinned judge identity and approved registry entry.
 | `tasks/` | Coding-agent tasks and oracle solutions |
 
 ## Design influences
+
+The complete landscape review, architecture decision, verified project
+versions, primary sources, and remaining production roadmap are in
+[`docs/enterprise-direction-2026-07-14.md`](docs/enterprise-direction-2026-07-14.md).
 
 The July 14, 2026 design review adapted patterns from pinned revisions of
 [Harbor](https://github.com/harbor-framework/harbor/tree/d8c3140be1a0d7f4d2cb164fc7011dce40d3f0d8),

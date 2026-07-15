@@ -8,27 +8,462 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: assurance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  verify:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.28"
+          enable-cache: true
+      - name: Sync locked dependencies
+        run: uv sync --frozen --all-extras
+      - name: Lint
+        if: matrix.python-version == '3.12'
+        run: uv run ruff check .
+      - name: Test
+        run: uv run pytest -q
+
+  task-image:
+    name: Task image ${{ matrix.task }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        task: [example-todo-api, owasp-agentic-safety]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Build exact linux/amd64 task image
+        run: >-
+          docker buildx build
+          --platform linux/amd64
+          --load
+          --tag agent-eval/${{ matrix.task }}:ci-amd64
+          tasks/${{ matrix.task }}/environment
+      - name: Verify embedded coding-agent binaries
+        run: |
+          test "$(docker image inspect --format '{{.Architecture}}' \
+            agent-eval/${{ matrix.task }}:ci-amd64)" = "amd64"
+          docker run --rm agent-eval/${{ matrix.task }}:ci-amd64 \
+            sh -c 'claude --version && codex --version'
+
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.28"
+          enable-cache: true
+      - name: Build source and wheel distributions
+        run: uv build --no-sources
+      - name: Install exact external scanners
+        env:
+          GITLEAKS_ARCHIVE_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          GITLEAKS_VERSION: 8.30.1
+          TRIVY_ARCHIVE_SHA256: bbb64b9695866ce4a7a8f5c9592002c5961cab378577fa3f8a040df362b9b2ea
+          TRIVY_VERSION: 0.72.0
+        run: |
+          install -d "$RUNNER_TEMP/scanner-bin"
+          curl --fail --location --show-error --silent \
+            --output "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "$GITLEAKS_ARCHIVE_SHA256  $RUNNER_TEMP/gitleaks.tar.gz" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "$RUNNER_TEMP/gitleaks.tar.gz" \
+            --directory "$RUNNER_TEMP/scanner-bin" gitleaks
+          curl --fail --location --show-error --silent \
+            --output "$RUNNER_TEMP/trivy.tar.gz" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "$TRIVY_ARCHIVE_SHA256  $RUNNER_TEMP/trivy.tar.gz" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "$RUNNER_TEMP/trivy.tar.gz" \
+            --directory "$RUNNER_TEMP/scanner-bin" trivy
+          "$RUNNER_TEMP/scanner-bin/gitleaks" version
+          "$RUNNER_TEMP/scanner-bin/trivy" --version
+          echo "$RUNNER_TEMP/scanner-bin" >> "$GITHUB_PATH"
+      - name: Scan the repository for committed secrets
+        env:
+          AGENT_EVAL_STATE_DIR: ${{ runner.temp }}/agent-eval-state
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/repository-scan-venv
+        run: |
+          uv run --frozen python - <<'PY'
+          import os
+          import tempfile
+          from pathlib import Path
+
+          from agent_eval.evaluators.scanners import (
+              _execute_bounded,
+              _stage_gitleaks_workspace,
+          )
+          from agent_eval.scanner_runtime import (
+              SCANNER_RUNTIME_EMPTY_IGNORE_POLICY,
+          )
+
+          repository = Path.cwd()
+          config = (repository / ".gitleaks.toml").resolve(strict=True)
+          with tempfile.TemporaryDirectory(
+              prefix="repository-secret-scan-",
+              dir=os.environ["RUNNER_TEMP"],
+          ) as temporary:
+              staged = Path(temporary) / "repository"
+              _stage_gitleaks_workspace(repository, staged)
+              process, status, _output = _execute_bounded(
+                  [
+                      "gitleaks",
+                      "dir",
+                      str(staged),
+                      "--config",
+                      str(config),
+                      "--gitleaks-ignore-path",
+                      str(SCANNER_RUNTIME_EMPTY_IGNORE_POLICY),
+                      "--ignore-gitleaks-allow",
+                      "--max-target-megabytes",
+                      "0",
+                      "--report-format",
+                      "json",
+                      "--report-path",
+                      os.devnull,
+                      "--no-banner",
+                      "--redact",
+                  ],
+                  timeout=300,
+              )
+          if process is None or status != "ok" or process.returncode != 0:
+              raise SystemExit(
+                  "repository secret scan failed; run the pinned local scan"
+              )
+          PY
+      - name: Prepare clean scanner state and prove offline execution
+        env:
+          AGENT_EVAL_STATE_DIR: ${{ runner.temp }}/agent-eval-state
+        run: |
+          uv run --frozen python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          from agent_eval.evaluators.scanners import (
+              _gitleaks,
+              _lint,
+              _semgrep,
+              _trivy,
+              prepare_scanner_runtime,
+              run_scanners,
+          )
+          from agent_eval.metrics import ScanResults
+
+          identity = prepare_scanner_runtime()
+          assert identity.promotion_ready, identity.promotion_blockers
+          for executable in (
+              "uv", "python", "ruff", "semgrep", "gitleaks", "trivy"
+          ):
+              assert identity.scanner_executable_sha256[executable]
+          with tempfile.TemporaryDirectory() as temporary:
+              root = Path(temporary)
+              workspace = root / "workspace"
+              workspace.mkdir()
+              (workspace / "smoke.py").write_text("value = 1\n", encoding="utf-8")
+              results = run_scanners(workspace, root / "run")
+              assert results.scanner_assurance is not None
+              assert results.scanner_assurance.promotion_ready, (
+                  results.scanner_assurance.promotion_blockers
+              )
+              assert all(
+                  results.scanner_status[name] == "ok"
+                  for name in ("ruff", "semgrep", "gitleaks", "trivy")
+              )
+
+              adversarial = root / "adversarial"
+              adversarial.mkdir()
+              subprocess.run(
+                  ["git", "init", "--quiet", str(adversarial)],
+                  check=True,
+              )
+              (adversarial / ".gitignore").write_text(
+                  "ignored.py\n", encoding="utf-8"
+              )
+              (adversarial / ".semgrepignore").write_text(
+                  "*\n", encoding="utf-8"
+              )
+              (adversarial / "ignored.py").write_text(
+                  "import sys\neval('ignored')\n", encoding="utf-8"
+              )
+              (adversarial / "inline.py").write_text(
+                  "import os  # noqa: F401\neval('inline')  # nosemgrep\n",
+                  encoding="utf-8",
+              )
+              (adversarial / "large.py").write_text(
+                  "#" + ("x" * 1_100_000) + "\neval('large')\n",
+                  encoding="utf-8",
+              )
+              (adversarial / ".venv").mkdir()
+              (adversarial / ".venv" / "dependency.py").write_text(
+                  "import pathlib\n", encoding="utf-8"
+              )
+              (adversarial / "service.txt").write_text(
+                  "eval('unknown extension')\n", encoding="utf-8"
+              )
+              secret = "".join(("AKIA", "ZXYWVUTSRQPONMLK"))
+              git_secret = "".join(("AKIA", "LMNPQRSTVWXZBCDF"))
+              nested_git = adversarial / "nested" / ".git"
+              nested_git.mkdir(parents=True)
+              (nested_git / "agent-eval-secret.txt").write_text(
+                  f'aws_access_key_id = "{git_secret}" # gitleaks:allow\n',
+                  encoding="utf-8",
+              )
+              secret_source = adversarial / "large-secret.txt"
+              secret_source.write_bytes(
+                  b'padding = "safe"\n' * 65_000
+                  + f'aws_access_key_id = "{secret}" # gitleaks:allow\n'.encode()
+              )
+              assert secret_source.stat().st_size > 1_000_000
+              (adversarial / ".gitleaksignore").write_text(
+                  f"{secret_source}:aws-access-token:65001\n",
+                  encoding="utf-8",
+              )
+              node_modules = adversarial / "node_modules"
+              node_modules.mkdir()
+              (node_modules / "package-lock.json").write_text(
+                  json.dumps({
+                      "name": "fixture",
+                      "version": "1.0.0",
+                      "lockfileVersion": 2,
+                      "requires": True,
+                      "packages": {
+                          "": {"name": "fixture", "version": "1.0.0"},
+                          "node_modules/lodash": {"version": "4.17.15"},
+                      },
+                      "dependencies": {
+                          "lodash": {"version": "4.17.15"},
+                      },
+                  }),
+                  encoding="utf-8",
+              )
+              (adversarial / ".trivyignore").write_text(
+                  "CVE-2020-8203\n", encoding="utf-8"
+              )
+              (adversarial / "trivy.yaml").write_text(
+                  "ignorefile: .trivyignore\n", encoding="utf-8"
+              )
+              adversarial_scans = root / "adversarial-scans"
+              adversarial_scans.mkdir()
+              adversarial_results = ScanResults()
+              _lint(
+                  "python",
+                  adversarial,
+                  adversarial_scans,
+                  adversarial_results,
+              )
+              _semgrep(
+                  adversarial,
+                  adversarial_scans,
+                  adversarial_results,
+              )
+              _gitleaks(
+                  adversarial,
+                  adversarial_scans,
+                  adversarial_results,
+              )
+              original_cwd = Path.cwd()
+              try:
+                  os.chdir(adversarial)
+                  _trivy(
+                      adversarial,
+                      adversarial_scans,
+                      adversarial_results,
+                  )
+              finally:
+                  os.chdir(original_cwd)
+              assert adversarial_results.scanner_status["ruff"] == "ok"
+              assert adversarial_results.scanner_versions["ruff"] == "0.15.20"
+              assert adversarial_results.lint_errors == 3
+              assert adversarial_results.scanner_status["semgrep"] == "ok"
+              assert adversarial_results.scanner_versions["semgrep"] == "1.169.0"
+              assert adversarial_results.sec_findings_high == 4
+              assert adversarial_results.scanner_status["gitleaks"] == "ok"
+              assert adversarial_results.scanner_versions["gitleaks"] == "8.30.1"
+              assert adversarial_results.secrets_found == 2
+              assert adversarial_results.scanner_status["trivy"] == "ok"
+              assert adversarial_results.scanner_versions["trivy"] == "0.72.0"
+              trivy_report = json.loads(
+                  (adversarial_scans / "trivy.json").read_text(encoding="utf-8")
+              )
+              assert "node_modules/package-lock.json" in {
+                  item["Target"] for item in trivy_report["Results"]
+              }
+              assert "CVE-2020-8203" in {
+                  vulnerability["VulnerabilityID"]
+                  for item in trivy_report["Results"]
+                  for vulnerability in item.get("Vulnerabilities") or []
+              }
+              assert all(
+                  secret.encode() not in artifact.read_bytes()
+                  and git_secret.encode() not in artifact.read_bytes()
+                  for artifact in adversarial_scans.iterdir()
+                  if artifact.is_file()
+              )
+          PY
+      - name: Verify and audit locked dependencies
+        run: |
+          uv lock --check --project src/agent_eval/scanner_runtime
+          uv export --frozen --all-extras --no-dev --no-emit-project \
+            --format requirements-txt --quiet \
+            --output-file "$RUNNER_TEMP/runtime-requirements.txt"
+          uv run --frozen --no-default-groups --group security pip-audit \
+            --requirement "$RUNNER_TEMP/runtime-requirements.txt" --disable-pip
+          uv export --project src/agent_eval/scanner_runtime --frozen --no-dev \
+            --no-emit-project --format requirements-txt --quiet \
+            --output-file "$RUNNER_TEMP/scanner-requirements.txt"
+          python - <<'PY'
+          import datetime
+          import pathlib
+          import tomllib
+
+          lock = tomllib.loads(
+              pathlib.Path("src/agent_eval/scanner_runtime/uv.lock").read_text()
+          )
+          packages = {package["name"]: package for package in lock["package"]}
+          assert packages["semgrep"]["version"] == "1.169.0"
+          assert packages["click"]["version"] == "8.1.8"
+          assert packages["semgrep"]["sdist"]["hash"] == (
+              "sha256:46932f875b8dff4cb731cd4c908443a0"
+              "f2f585edbb0a5baa92c4fc033246fdea"
+          )
+          deadline = datetime.date.fromisoformat("2026-08-14")
+          if datetime.date.today() > deadline:
+              raise SystemExit(
+                  "PYSEC-2026-2132 exception expired; review or remove it"
+              )
+          PY
+          uv run --frozen --no-default-groups --group security pip-audit \
+            --requirement "$RUNNER_TEMP/scanner-requirements.txt" --disable-pip \
+            --ignore-vuln PYSEC-2026-2132
+      - name: Verify distribution contents and license metadata
+        run: |
+          python - <<'PY'
+          import glob
+          import tarfile
+          import zipfile
+
+          wheel = glob.glob("dist/*.whl")
+          source = glob.glob("dist/*.tar.gz")
+          assert len(wheel) == 1 and len(source) == 1
+          with zipfile.ZipFile(wheel[0]) as archive:
+              names = archive.namelist()
+              licenses = [name for name in names if name.endswith("/licenses/LICENSE")]
+              metadata = next(name for name in names if name.endswith(".dist-info/METADATA"))
+              assert licenses, names
+              assert b"License-Expression: Apache-2.0" in archive.read(metadata)
+              assert "agent_eval/scanner_runtime/pyproject.toml" in names
+              assert "agent_eval/scanner_runtime/uv.lock" in names
+              assert "agent_eval/scanner_runtime/semgrep.yml" in names
+              assert "agent_eval/scanner_runtime/gitleaks.toml" in names
+              assert "agent_eval/scanner_runtime/invocation-policy.json" in names
+              assert "agent_eval/scanner_runtime/ignore-empty.txt" in names
+          with tarfile.open(source[0]) as archive:
+              assert any(name.endswith("/LICENSE") for name in archive.getnames())
+          PY
+      - name: Install and smoke-test the wheel outside the checkout
+        env:
+          AGENT_EVAL_STATE_DIR: ${{ runner.temp }}/agent-eval-state
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-venv"
+          uv export --frozen --all-extras --no-dev --no-emit-project \
+            --format requirements-txt --quiet \
+            --output-file "$RUNNER_TEMP/runtime-requirements.txt"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install \
+            --require-hashes --requirement "$RUNNER_TEMP/runtime-requirements.txt"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install --no-deps dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheel-venv/bin/agent-eval" --help
+          "$RUNNER_TEMP/wheel-venv/bin/python" - <<'PY'
+          import tempfile
+          from pathlib import Path
+
+          from agent_eval.evaluators.scanners import _lint, _semgrep
+          from agent_eval.metrics import ScanResults
+          from agent_eval.scanner_runtime import (
+              scanner_runtime_digest,
+              scanner_runtime_lock_digest,
+          )
+          assert len(scanner_runtime_digest()) == 64
+          assert len(scanner_runtime_lock_digest()) == 64
+          with tempfile.TemporaryDirectory() as temporary:
+              root = Path(temporary)
+              workspace = root / "workspace"
+              scans = root / "scans"
+              workspace.mkdir()
+              scans.mkdir()
+              (workspace / "smoke.py").write_text("value = 1\n", encoding="utf-8")
+              results = ScanResults()
+              _lint("python", workspace, scans, results)
+              _semgrep(workspace, scans, results)
+              assert results.scanner_status["ruff"] == "ok"
+              assert results.scanner_status["semgrep"] == "ok"
+          PY
+          "$RUNNER_TEMP/wheel-venv/bin/agent-eval" tasks list
+          AGENT_EVAL_TASKS_DIR="$GITHUB_WORKSPACE/tasks" \
+            "$RUNNER_TEMP/wheel-venv/bin/agent-eval" tasks list
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  benchmark-fixtures:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      - name: Install pinned uv
-        run: python -m pip install uv==0.9.16
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.28"
+          enable-cache: true
       - name: Sync locked dependencies
         run: uv sync --frozen
-      - name: Lint
-        run: uv run ruff check .
-      - name: Test
-        run: uv run pytest -q
+      - name: Validate corpus metadata without execution
+        run: >-
+          uv run agent-eval corpus validate
+          benchmarks/reviewer-corpus/v1/corpus.yaml
       - name: Validate executable reviewer corpus
         run: >-
           uv run agent-eval corpus validate
           benchmarks/reviewer-corpus/v1/corpus.yaml
+          --allow-local-execution
       - name: Reproduce reviewer experiment
         run: >-
           uv run agent-eval benchmark-experiment
@@ -39,3 +474,4 @@ jobs:
           name: reviewer-experiment
           path: reviewer-experiment.json
           if-no-files-found: error
+          retention-days: 14

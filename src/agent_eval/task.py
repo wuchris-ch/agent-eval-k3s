@@ -4,19 +4,25 @@ image, hidden tests, and an optional oracle solution overlay."""
 from __future__ import annotations
 
 import hashlib
+import math
+import os
 import re
 import stat
+from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .assurance import ChallengeSpec
 from .outcome import AcceptancePolicy
+from .paths import BUNDLED_TASKS_DIR, task_search_paths
+from .yaml_utils import load_unique_yaml
 
-DEFAULT_TASKS_ROOT = Path(__file__).resolve().parents[2] / "tasks"
+TASK_SCHEMA_VERSION = "agent-eval.task/v1"
+LEGACY_TASK_VERSION = "legacy-unversioned"
+DEFAULT_TASKS_ROOT = BUNDLED_TASKS_DIR
 
 DEFAULT_SANDBOX_RESOURCES = {
     "requests": {"cpu": "100m", "memory": "128Mi", "ephemeral-storage": "256Mi"},
@@ -28,6 +34,18 @@ _QUANTITY_RE = re.compile(
     r"(?P<suffix>m|[kMGTPE]|[KMGTPE]i|[eE][+-]?\d+)?$"
 )
 _TASK_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+~-]{0,127}$")
+_DATASET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@~-]{0,255}$")
+_GENERATED_TASK_DIRECTORY_NAMES = {
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+}
+_GENERATED_TASK_FILE_NAMES = {".coverage", ".DS_Store"}
+_GENERATED_TASK_FILE_SUFFIXES = {".pyc", ".pyo"}
+_MAX_TASK_TREE_ENTRIES = 50_000
+_MAX_TASK_TREE_DEPTH = 64
 _DECIMAL_SUFFIXES = {
     "m": Decimal("0.001"),
     "k": Decimal("1000"),
@@ -146,10 +164,22 @@ class JudgeConfig(BaseModel):
 
     @model_validator(mode="after")
     def _valid_weights(self) -> "JudgeConfig":
-        if not self.weights or any(
-            not name.strip() or weight <= 0 for name, weight in self.weights.items()
-        ):
-            raise ValueError("judge weights must have names and positive values")
+        if not self.weights or len(self.weights) > 32:
+            raise ValueError("judge weights must contain between 1 and 32 dimensions")
+        for name, weight in self.weights.items():
+            if (
+                not isinstance(name, str)
+                or not 1 <= len(name) <= 64
+                or not name.isprintable()
+                or not name.strip()
+                or isinstance(weight, bool)
+                or not math.isfinite(weight)
+                or weight <= 0
+            ):
+                raise ValueError(
+                    "judge weight names must be bounded printable text and values "
+                    "must be finite positive numbers"
+                )
         if (self.backend is None) != (self.model is None):
             raise ValueError("judge backend and model must be configured together")
         if self.model is not None and (
@@ -206,15 +236,110 @@ class SandboxNetwork(BaseModel):
 
     @field_validator("proxy_image")
     @classmethod
-    def _nonempty_image(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("proxy_image must not be empty")
-        return value.strip()
+    def _digest_pinned_image(cls, value: str) -> str:
+        normalized = value.strip()
+        if re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", normalized) is None:
+            raise ValueError("proxy_image must use an exact sha256 image digest")
+        return normalized
+
+
+class EvaluationReadiness(BaseModel):
+    """Bounded HTTP readiness probe used before isolated hidden tests."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(strict=True, min_length=1, max_length=512)
+    timeout_seconds: int = Field(default=30, ge=1, le=300, strict=True)
+
+    @field_validator("path")
+    @classmethod
+    def _safe_absolute_http_path(cls, value: str) -> str:
+        if (
+            not value.startswith("/")
+            or value.startswith("//")
+            or "?" in value
+            or "#" in value
+            or "\\" in value
+            or re.fullmatch(r"/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*", value) is None
+            or any(segment in {".", ".."} for segment in value.split("/"))
+        ):
+            raise ValueError(
+                "evaluation readiness path must be a safe absolute HTTP path"
+            )
+        return value
+
+
+class EvaluationConfig(BaseModel):
+    """How trusted tests communicate with the submitted workspace.
+
+    ``cooperative`` preserves the legacy in-process contract. In
+    ``isolated-black-box`` mode the submitted workspace runs in a separate pod
+    and trusted tests can reach only its declared TCP port.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["cooperative", "isolated-black-box"] = "cooperative"
+    submission_command: str | None = Field(default=None, max_length=4096)
+    submission_port: int | None = Field(
+        default=None, ge=1024, le=65535, strict=True
+    )
+    readiness: EvaluationReadiness | None = None
+
+    @model_validator(mode="after")
+    def _complete_black_box_contract(self) -> "EvaluationConfig":
+        command = self.submission_command
+        if command is not None and (not command.strip() or "\x00" in command):
+            raise ValueError(
+                "evaluation submission_command must be nonempty text without NULs"
+            )
+        if self.mode == "isolated-black-box":
+            if (
+                command is None
+                or self.submission_port is None
+                or self.readiness is None
+            ):
+                raise ValueError(
+                    "isolated-black-box evaluation requires submission_command "
+                    "submission_port, and readiness"
+                )
+        elif (
+            command is not None
+            or self.submission_port is not None
+            or self.readiness is not None
+        ):
+            raise ValueError(
+                "cooperative evaluation cannot configure submission or readiness"
+            )
+        return self
+
+
+class DatasetMetadata(BaseModel):
+    """Optional immutable identity for a task sourced from a dataset."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    id: str = Field(strict=True, min_length=1, max_length=256)
+    revision: str = Field(strict=True, min_length=1, max_length=256)
+    item_id: str = Field(strict=True, min_length=1, max_length=256)
+
+    @field_validator("id", "revision", "item_id")
+    @classmethod
+    def _safe_identity(cls, value: str) -> str:
+        if _DATASET_ID_RE.fullmatch(value) is None:
+            raise ValueError(
+                "dataset id, revision, and item_id must be exact safe identifiers"
+            )
+        return value
 
 
 class Task(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    schema_version: Literal["agent-eval.task/v1"]
+    version: str = Field(strict=True, min_length=1, max_length=128)
+    manifest_binding: Literal["versioned", "legacy-unversioned"] = "versioned"
+    dataset: DatasetMetadata | None = None
     id: str
     prompt: str
     language: str = "python"
@@ -223,8 +348,10 @@ class Task(BaseModel):
     resources: SandboxResources = Field(default_factory=SandboxResources)
     security: SandboxSecurity = Field(default_factory=SandboxSecurity)
     network: SandboxNetwork = Field(default_factory=SandboxNetwork)
-    # Runs inside the eval pod with cwd=/workspace; hidden tests are mounted at
-    # /tests and machine-readable output must be written under /results.
+    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
+    # In cooperative mode this runs with cwd=/workspace. In isolated black-box
+    # mode it runs with cwd=/tests and receives AGENT_EVAL_SUBMISSION_URL.
+    # Machine-readable output must be written under /results in either mode.
     test_command: str
     judge: JudgeConfig = Field(default_factory=JudgeConfig)
     acceptance: AcceptancePolicy = Field(default_factory=AcceptancePolicy)
@@ -241,12 +368,31 @@ class Task(BaseModel):
             )
         return value
 
+    @field_validator("version")
+    @classmethod
+    def _safe_version(cls, value: str) -> str:
+        if _VERSION_RE.fullmatch(value) is None:
+            raise ValueError("task version must be an exact safe version identifier")
+        return value
+
     @field_validator("prompt")
     @classmethod
     def _prompt_nonempty(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("task prompt must not be empty")
         return v
+
+    @field_validator("challenges")
+    @classmethod
+    def _bounded_unique_challenges(
+        cls, value: list[ChallengeSpec]
+    ) -> list[ChallengeSpec]:
+        if len(value) > 64:
+            raise ValueError("tasks may define at most 64 challenges")
+        identifiers = [challenge.id for challenge in value]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("challenge ids must be unique")
+        return value
 
     @property
     def image_tag(self) -> str:
@@ -330,17 +476,75 @@ class Task(BaseModel):
                 path.resolve(strict=True).relative_to(root)
             except (OSError, ValueError):
                 problems.append(f"{label} must stay beneath the task directory")
+        hygiene_error = self._task_tree_hygiene_error()
+        if hygiene_error is not None:
+            problems.append(hygiene_error)
         return problems
 
+    def _task_tree_hygiene_error(self) -> str | None:
+        """Reject generated host state before it can enter task identity."""
 
-def load_task(task_id: str, tasks_root: Path = DEFAULT_TASKS_ROOT) -> Task:
+        if not self.path.is_dir():
+            return None
+        entries_seen = 0
+        pending = [(self.path, 0)]
+        while pending:
+            directory, depth = pending.pop()
+            if depth > _MAX_TASK_TREE_DEPTH:
+                return "task tree exceeds the maximum depth"
+            try:
+                entries = os.scandir(directory)
+            except OSError as exc:
+                return f"task tree is unreadable: {type(exc).__name__}"
+            with entries:
+                try:
+                    ordered = sorted(entries, key=lambda entry: os.fsencode(entry.name))
+                except OSError as exc:
+                    return f"task tree is unreadable: {type(exc).__name__}"
+            for entry in ordered:
+                entries_seen += 1
+                if entries_seen > _MAX_TASK_TREE_ENTRIES:
+                    return f"task tree exceeds {_MAX_TASK_TREE_ENTRIES} entries"
+                relative = Path(entry.path).relative_to(self.path).as_posix()
+                if entry.name in _GENERATED_TASK_DIRECTORY_NAMES:
+                    return f"generated task directory is not allowed: {relative}"
+                if (
+                    entry.name in _GENERATED_TASK_FILE_NAMES
+                    or Path(entry.name).suffix in _GENERATED_TASK_FILE_SUFFIXES
+                ):
+                    return f"generated task file is not allowed: {relative}"
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    return (
+                        f"task tree path {relative} is unreadable: "
+                        f"{type(exc).__name__}"
+                    )
+                if stat.S_ISDIR(metadata.st_mode):
+                    pending.append((Path(entry.path), depth + 1))
+        return None
+
+
+def _task_roots(tasks_root: Path | None) -> tuple[Path, ...]:
+    return (Path(tasks_root),) if tasks_root is not None else task_search_paths()
+
+
+def load_task(task_id: str, tasks_root: Path | None = None) -> Task:
     if not _TASK_ID_RE.fullmatch(task_id):
         raise ValueError(
             "task id must be a lowercase DNS-style path segment with at most "
             "63 characters"
         )
-    root = tasks_root.resolve()
-    task_dir = root / task_id
+    roots = _task_roots(tasks_root)
+    task_dir: Path | None = None
+    for tasks_directory in roots:
+        candidate = tasks_directory.resolve() / task_id
+        if candidate.exists() or candidate.is_symlink():
+            task_dir = candidate
+            break
+    if task_dir is None:
+        searched = ", ".join(str(root / task_id) for root in roots)
+        raise FileNotFoundError(f"no task directory found; searched: {searched}")
     if task_dir.is_symlink():
         raise ValueError("task directory must not be a symlink")
     yaml_path = task_dir / "task.yaml"
@@ -348,7 +552,28 @@ def load_task(task_id: str, tasks_root: Path = DEFAULT_TASKS_ROOT) -> Task:
         raise ValueError("task manifest must not be a symlink")
     if not yaml_path.is_file():
         raise FileNotFoundError(f"no task.yaml at {yaml_path}")
-    data = yaml.safe_load(yaml_path.read_text())
+    data = load_unique_yaml(yaml_path.read_text(encoding="utf-8"))
+    if not isinstance(data, Mapping):
+        raise ValueError(f"task manifest must be a YAML mapping: {yaml_path}")
+    data = dict(data)
+    internal_fields = {"path", "manifest_binding"} & data.keys()
+    if internal_fields:
+        raise ValueError(
+            "task manifest must not define internal fields: "
+            + ", ".join(sorted(internal_fields))
+        )
+    has_schema = "schema_version" in data
+    has_version = "version" in data
+    if has_schema != has_version:
+        raise ValueError(
+            "task manifest must define schema_version and version together"
+        )
+    if not has_schema:
+        data["schema_version"] = TASK_SCHEMA_VERSION
+        data["version"] = LEGACY_TASK_VERSION
+        data["manifest_binding"] = "legacy-unversioned"
+    else:
+        data["manifest_binding"] = "versioned"
     data["path"] = task_dir
     task = Task.model_validate(data)
     if task.id != task_id:
@@ -361,11 +586,16 @@ def load_task(task_id: str, tasks_root: Path = DEFAULT_TASKS_ROOT) -> Task:
     return task
 
 
-def list_tasks(tasks_root: Path = DEFAULT_TASKS_ROOT) -> list[Task]:
-    tasks = []
-    if not tasks_root.is_dir():
-        return tasks
-    for entry in sorted(tasks_root.iterdir()):
-        if (entry / "task.yaml").is_file():
-            tasks.append(load_task(entry.name, tasks_root))
+def list_tasks(tasks_root: Path | None = None) -> list[Task]:
+    tasks: list[Task] = []
+    discovered: set[str] = set()
+    for root in _task_roots(tasks_root):
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            if entry.name in discovered:
+                continue
+            if (entry / "task.yaml").is_file():
+                tasks.append(load_task(entry.name, root))
+                discovered.add(entry.name)
     return tasks

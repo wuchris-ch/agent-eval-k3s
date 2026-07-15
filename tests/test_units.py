@@ -1,26 +1,244 @@
 import json
 import os
+import shlex
+import stat
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from agent_eval.agents.claude_code import ClaudeCodeAdapter
-from agent_eval.evaluators.tests import parse_coverage, parse_junit
+from agent_eval.evaluators import tests as evaluator_tests
+from agent_eval.evaluators.tests import (
+    parse_coverage,
+    parse_coverage_artifact,
+    parse_junit,
+)
 from agent_eval.report import pass_at_k
-from agent_eval.task import load_task
+from agent_eval.task import EvaluationConfig, JudgeConfig, SandboxNetwork, load_task
 
 REPO = Path(__file__).resolve().parents[1]
 
 
 def test_load_example_task():
     task = load_task("example-todo-api")
+    assert task.schema_version == "agent-eval.task/v1"
+    assert task.version == "2.0.0"
+    assert task.manifest_binding == "versioned"
+    assert task.dataset is not None
+    assert task.dataset.id == "agent-eval/bundled"
+    assert task.dataset.revision == "2.0.0"
+    assert task.dataset.item_id == task.id
     assert task.image_tag.startswith("agent-eval/example-todo-api:")
     assert task.image_tag != "agent-eval/example-todo-api:latest"
     assert len(task.image_tag.rsplit(":", 1)[1]) == 12
     assert "junit.xml" in task.test_command
+    assert task.evaluation.mode == "isolated-black-box"
+    assert task.evaluation.submission_port == 8080
+    assert task.evaluation.readiness is not None
+    assert task.evaluation.readiness.path == "/openapi.json"
     assert task.validate_layout() == []
     assert abs(sum(task.judge.weights.values()) - 1.0) < 1e-9
+
+
+def test_evaluation_config_defaults_to_cooperative_for_legacy_tasks():
+    configuration = EvaluationConfig.model_validate({})
+
+    assert configuration.mode == "cooperative"
+    assert configuration.submission_command is None
+    assert configuration.submission_port is None
+    assert configuration.readiness is None
+
+
+@pytest.mark.parametrize(
+    "configuration",
+    [
+        {"mode": "isolated-black-box"},
+        {
+            "mode": "isolated-black-box",
+            "submission_command": "python service.py",
+            "submission_port": 1023,
+            "readiness": {"path": "/ready"},
+        },
+        {
+            "mode": "isolated-black-box",
+            "submission_command": "python service.py",
+            "submission_port": 8080,
+            "readiness": {"path": "//other-host/ready"},
+        },
+        {
+            "mode": "isolated-black-box",
+            "submission_command": "python service.py",
+            "submission_port": 8080,
+            "readiness": {"path": "/../ready"},
+        },
+        {
+            "mode": "cooperative",
+            "submission_command": "python service.py",
+        },
+    ],
+)
+def test_evaluation_config_rejects_incomplete_or_unsafe_contract(configuration):
+    with pytest.raises(ValidationError):
+        EvaluationConfig.model_validate(configuration)
+
+
+def test_load_task_rejects_non_mapping_yaml(tmp_path):
+    task_dir = tmp_path / "not-a-mapping"
+    task_dir.mkdir()
+    (task_dir / "task.yaml").write_text("- this\n- is\n- a-list\n")
+
+    with pytest.raises(ValueError, match="task manifest must be a YAML mapping"):
+        load_task("not-a-mapping", tmp_path)
+
+
+def test_load_task_rejects_duplicate_yaml_keys(tmp_path):
+    task_dir = tmp_path / "duplicate-key"
+    task_dir.mkdir()
+    (task_dir / "task.yaml").write_text(
+        "schema_version: agent-eval.task/v1\n"
+        "version: 1.0.0\n"
+        "id: duplicate-key\n"
+        "prompt: first\n"
+        "prompt: second\n"
+        "test_command: pytest\n"
+    )
+
+    with pytest.raises(ValueError, match="duplicate YAML key 'prompt'"):
+        load_task("duplicate-key", tmp_path)
+
+
+def test_task_rejects_duplicate_challenge_ids(tmp_path):
+    task_dir = tmp_path / "duplicate-challenges"
+    task_dir.mkdir()
+    challenge = (
+        "  - id: duplicate\n"
+        "    category: ASI01\n"
+        "    threat: bounded threat\n"
+        "    checks:\n"
+        "      - type: no_infra_failure\n"
+    )
+    (task_dir / "task.yaml").write_text(
+        "schema_version: agent-eval.task/v1\n"
+        "version: 1.0.0\n"
+        "id: duplicate-challenges\n"
+        "prompt: Test\n"
+        "test_command: pytest\n"
+        "challenges:\n"
+        f"{challenge}{challenge}"
+    )
+
+    with pytest.raises(ValidationError, match="challenge ids must be unique"):
+        load_task("duplicate-challenges", tmp_path)
+
+
+def test_judge_weights_are_bounded_and_finite():
+    with pytest.raises(ValidationError, match="between 1 and 32"):
+        JudgeConfig(weights={f"dimension-{index}": 1.0 for index in range(33)})
+    with pytest.raises(ValidationError, match="finite positive"):
+        JudgeConfig(weights={"quality": float("nan")})
+    with pytest.raises(ValidationError, match="finite positive"):
+        JudgeConfig(weights={"x" * 65: 1.0})
+
+
+def test_proxy_image_requires_exact_digest():
+    with pytest.raises(ValidationError, match="exact sha256"):
+        SandboxNetwork(proxy_image="ubuntu/squid:latest")
+    with pytest.raises(ValidationError, match="exact sha256"):
+        SandboxNetwork(proxy_image="ubuntu/squid@sha256:not-a-digest")
+
+
+def test_load_task_normalizes_legacy_manifest_with_visible_identity(tmp_path):
+    task_dir = tmp_path / "unversioned"
+    task_dir.mkdir()
+    (task_dir / "task.yaml").write_text(
+        "id: unversioned\nprompt: Test\ntest_command: pytest\n"
+    )
+
+    task = load_task("unversioned", tmp_path)
+
+    assert task.schema_version == "agent-eval.task/v1"
+    assert task.version == "legacy-unversioned"
+    assert task.manifest_binding == "legacy-unversioned"
+
+
+@pytest.mark.parametrize(
+    "version_lines",
+    ["schema_version: agent-eval.task/v1\n", "version: 1.0.0\n"],
+)
+def test_load_task_rejects_partially_versioned_manifest(tmp_path, version_lines):
+    task_dir = tmp_path / "partially-versioned"
+    task_dir.mkdir()
+    (task_dir / "task.yaml").write_text(
+        version_lines
+        + "id: partially-versioned\n"
+        + "prompt: Test\n"
+        + "test_command: pytest\n"
+    )
+
+    with pytest.raises(ValueError, match="define schema_version and version together"):
+        load_task("partially-versioned", tmp_path)
+
+
+def test_load_task_rejects_unknown_schema_version(tmp_path):
+    task_dir = tmp_path / "future-schema"
+    task_dir.mkdir()
+    (task_dir / "task.yaml").write_text(
+        "schema_version: agent-eval.task/v2\n"
+        "version: 1.0.0\n"
+        "id: future-schema\n"
+        "prompt: Test\n"
+        "test_command: pytest\n"
+    )
+
+    with pytest.raises(ValidationError, match="agent-eval.task/v1"):
+        load_task("future-schema", tmp_path)
+
+
+def test_load_task_rejects_internal_path_field(tmp_path):
+    task_dir = tmp_path / "forged-path"
+    task_dir.mkdir()
+    (task_dir / "task.yaml").write_text(
+        "schema_version: agent-eval.task/v1\n"
+        "version: 1.0.0\n"
+        "id: forged-path\n"
+        "prompt: Test\n"
+        "test_command: pytest\n"
+        "path: /tmp/other-task\n"
+    )
+
+    with pytest.raises(ValueError, match="must not define internal fields: path"):
+        load_task("forged-path", tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("dataset", "field"),
+    [
+        ("id: source\n    revision: rev", "item_id"),
+        ("id: source\n    revision: 7\n    item_id: item", "revision"),
+        (
+            "id: source\n    revision: rev\n    item_id: item\n    unexpected: true",
+            "unexpected",
+        ),
+    ],
+)
+def test_load_task_dataset_metadata_is_strict(tmp_path, dataset, field):
+    task_dir = tmp_path / "dataset-task"
+    task_dir.mkdir()
+    (task_dir / "task.yaml").write_text(
+        "schema_version: agent-eval.task/v1\n"
+        "version: 1.0.0\n"
+        "id: dataset-task\n"
+        "prompt: Test\n"
+        "test_command: pytest\n"
+        f"dataset:\n    {dataset}\n"
+    )
+
+    with pytest.raises(ValidationError, match=field):
+        load_task("dataset-task", tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -36,6 +254,8 @@ def test_load_task_rejects_symlinked_task_directory(tmp_path):
     target = tmp_path / "target"
     target.mkdir()
     (target / "task.yaml").write_text(
+        "schema_version: agent-eval.task/v1\n"
+        "version: 1.0.0\n"
         "id: linked-task\nprompt: Test\ntest_command: pytest\n"
     )
     (tmp_path / "linked-task").symlink_to(target, target_is_directory=True)
@@ -48,7 +268,11 @@ def test_load_task_rejects_symlinked_manifest(tmp_path):
     task_dir = tmp_path / "linked-manifest"
     task_dir.mkdir()
     manifest = tmp_path / "outside.yaml"
-    manifest.write_text("id: linked-manifest\nprompt: Test\ntest_command: pytest\n")
+    manifest.write_text(
+        "schema_version: agent-eval.task/v1\n"
+        "version: 1.0.0\n"
+        "id: linked-manifest\nprompt: Test\ntest_command: pytest\n"
+    )
     (task_dir / "task.yaml").symlink_to(manifest)
 
     with pytest.raises(ValueError, match="manifest must not be a symlink"):
@@ -62,6 +286,8 @@ def test_load_task_rejects_symlinked_workspace_root(tmp_path):
     environment.mkdir(parents=True)
     tests_dir.mkdir()
     (task_dir / "task.yaml").write_text(
+        "schema_version: agent-eval.task/v1\n"
+        "version: 1.0.0\n"
         "id: linked-workspace\nprompt: Test\ntest_command: pytest\n"
     )
     (environment / "Dockerfile").write_text("FROM scratch\n")
@@ -83,6 +309,8 @@ def test_task_image_tag_changes_with_build_context(tmp_path):
     workspace.mkdir(parents=True)
     tests.mkdir()
     (task_dir / "task.yaml").write_text(
+        "schema_version: agent-eval.task/v1\n"
+        "version: 1.0.0\n"
         "id: content-task\nprompt: Change it\ntest_command: pytest\n"
     )
     (task_dir / "environment" / "Dockerfile").write_text("FROM python:3.12\n")
@@ -97,13 +325,15 @@ def test_task_image_tag_changes_with_build_context(tmp_path):
     assert first != second
 
 
-def test_task_image_tag_binds_file_modes_and_generated_context_files(tmp_path):
+def test_task_image_tag_binds_modes_and_rejects_generated_context_files(tmp_path):
     task_dir = tmp_path / "content-task"
     workspace = task_dir / "environment" / "workspace"
     tests = task_dir / "tests"
     workspace.mkdir(parents=True)
     tests.mkdir()
     (task_dir / "task.yaml").write_text(
+        "schema_version: agent-eval.task/v1\n"
+        "version: 1.0.0\n"
         "id: content-task\nprompt: Change it\ntest_command: pytest\n"
     )
     (task_dir / "environment" / "Dockerfile").write_text("FROM python:3.12\n")
@@ -119,8 +349,8 @@ def test_task_image_tag_binds_file_modes_and_generated_context_files(tmp_path):
     cache = workspace / "__pycache__"
     cache.mkdir()
     (cache / "tool.pyc").write_bytes(b"generated")
-    with_generated_file = load_task("content-task", tmp_path).image_tag
-    assert with_generated_file != executable
+    with pytest.raises(ValueError, match="generated task directory is not allowed"):
+        load_task("content-task", tmp_path)
 
 
 def test_parse_junit(tmp_path):
@@ -134,12 +364,14 @@ def test_parse_junit(tmp_path):
     )
     r = parse_junit(junit)
     assert (r.total, r.passed, r.failed) == (3, 2, 1)
+    assert r.counts_observed is True
     assert r.failures == ["t::bad"]
     assert not r.resolved
 
 
 def test_parse_junit_missing_is_infra_error(tmp_path):
     r = parse_junit(tmp_path / "nope.xml")
+    assert r.counts_observed is False
     assert r.infra_error and not r.resolved
 
 
@@ -180,10 +412,10 @@ def test_parse_junit_fails_closed_for_unreadable_or_unicode_invalid_artifacts(
     assert invalid_encoding.infra_error
     assert not invalid_encoding.resolved
 
-    def unreadable(_path):
+    def unreadable(*_args, **_kwargs):
         raise PermissionError("untrusted artifact is not readable")
 
-    monkeypatch.setattr("agent_eval.evaluators.tests.ET.parse", unreadable)
+    monkeypatch.setattr(evaluator_tests.ET, "iterparse", unreadable)
     unreadable_result = parse_junit(junit, command_exit_code=0)
     assert unreadable_result.infra_error == "junit xml unreadable: PermissionError"
     assert not unreadable_result.resolved
@@ -225,11 +457,106 @@ def test_parse_junit_requires_successful_command_and_a_passed_test(tmp_path):
     assert not all_skipped.resolved
 
 
+def test_parse_junit_rejects_symlink_and_oversized_artifacts(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "target.xml"
+    target.write_text('<testsuite tests="1"/>')
+    linked = tmp_path / "junit.xml"
+    linked.symlink_to(target)
+
+    linked_result = parse_junit(linked, command_exit_code=0)
+
+    assert linked_result.infra_error is None
+    assert "must not be a symbolic link" in (linked_result.integrity_error or "")
+    assert linked_result.failures == [linked_result.integrity_error]
+
+    oversized = tmp_path / "oversized.xml"
+    oversized.write_text('<testsuite tests="1"><testcase name="ok"/></testsuite>')
+    monkeypatch.setattr(evaluator_tests, "MAX_JUNIT_BYTES", 16)
+
+    oversized_result = parse_junit(oversized, command_exit_code=0)
+
+    assert oversized_result.infra_error is None
+    assert "exceeds 16 bytes" in (oversized_result.integrity_error or "")
+
+
+@pytest.mark.parametrize(
+    ("constant", "value", "contents", "error"),
+    [
+        (
+            "MAX_JUNIT_CASES",
+            1,
+            '<testsuite tests="1"><testcase name="one"/>'
+            '<testcase name="two"/></testsuite>',
+            "testcase elements exceed",
+        ),
+        (
+            "MAX_JUNIT_FAILURES",
+            1,
+            '<testsuite tests="2" failures="1"><testcase name="one">'
+            "<failure/></testcase><testcase name=\"two\"><failure/>"
+            "</testcase></testsuite>",
+            "failed testcase elements exceed",
+        ),
+        (
+            "MAX_JUNIT_IDENTITY_CHARS",
+            3,
+            '<testsuite tests="1"><testcase classname="case" name="long"/>'
+            "</testsuite>",
+            "testcase 'classname' exceeds",
+        ),
+    ],
+)
+def test_parse_junit_streaming_caps_are_integrity_evidence(
+    monkeypatch, tmp_path, constant, value, contents, error
+):
+    monkeypatch.setattr(evaluator_tests, constant, value)
+    junit = tmp_path / "junit.xml"
+    junit.write_text(contents)
+
+    result = parse_junit(junit, command_exit_code=0)
+
+    assert result.infra_error is None
+    assert error in (result.integrity_error or "")
+    assert not result.resolved
+
+
 def test_parse_coverage(tmp_path):
     cov = tmp_path / "coverage.json"
     cov.write_text(json.dumps({"totals": {"percent_covered": 87.5}}))
     assert parse_coverage(cov) == 87.5
     assert parse_coverage(tmp_path / "nope.json") is None
+
+
+def test_parse_coverage_rejects_symlink_oversize_and_duplicate_keys(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "target.json"
+    target.write_text('{"totals": {"percent_covered": 100}}')
+    linked = tmp_path / "coverage.json"
+    linked.symlink_to(target)
+
+    linked_result = parse_coverage_artifact(linked)
+
+    assert linked_result.infra_error is None
+    assert "must not be a symbolic link" in (linked_result.integrity_error or "")
+    assert parse_coverage(linked) is None
+
+    oversized = tmp_path / "oversized.json"
+    oversized.write_text('{"totals": {"percent_covered": 100}}')
+    monkeypatch.setattr(evaluator_tests, "MAX_COVERAGE_BYTES", 8)
+    oversized_result = parse_coverage_artifact(oversized)
+    assert "exceeds 8 bytes" in (oversized_result.integrity_error or "")
+
+    monkeypatch.setattr(evaluator_tests, "MAX_COVERAGE_BYTES", 1_024)
+    duplicate = tmp_path / "duplicate.json"
+    duplicate.write_text(
+        '{"totals": {"percent_covered": 10}, '
+        '"totals": {"percent_covered": 90}}'
+    )
+    duplicate_result = parse_coverage_artifact(duplicate)
+    assert "duplicate JSON key" in (duplicate_result.integrity_error or "")
 
 
 @pytest.mark.parametrize(
@@ -258,11 +585,13 @@ def test_parse_coverage_fails_closed_when_artifact_becomes_unreadable(
     coverage = tmp_path / "coverage.json"
     coverage.write_text('{"totals": {"percent_covered": 100}}')
 
-    def unreadable(_path):
+    def unreadable(*_args, **_kwargs):
         raise PermissionError("untrusted artifact is not readable")
 
-    monkeypatch.setattr(Path, "read_text", unreadable)
+    monkeypatch.setattr(evaluator_tests._BoundedReader, "read", unreadable)
     assert parse_coverage(coverage) is None
+    result = parse_coverage_artifact(coverage)
+    assert result.infra_error == "coverage json unreadable: PermissionError"
 
 
 def test_claude_transcript_parsing(tmp_path):
@@ -728,6 +1057,108 @@ def test_reverse_test_grader_does_not_credit_an_already_failing_base(
     assert not (tmp_path / "tests/test_new.py").exists()
 
 
+def test_review_command_environment_does_not_forward_host_secrets(
+    monkeypatch, tmp_path
+):
+    from agent_eval import graders
+
+    monkeypatch.setenv("AGENT_EVAL_TEST_SECRET", "must-not-leak")
+
+    code, output = graders._run_shell(
+        'test -z "$AGENT_EVAL_TEST_SECRET"',
+        tmp_path,
+        1,
+    )
+
+    assert code == 0, output
+
+
+def test_review_command_output_is_bounded(monkeypatch, tmp_path):
+    from agent_eval import graders
+
+    monkeypatch.setattr(graders, "COMMAND_OUTPUT_LIMIT_BYTES", 128)
+    command = " ".join(
+        (
+            shlex.quote(sys.executable),
+            "-c",
+            shlex.quote("print('x' * 10000)"),
+        )
+    )
+
+    code, output = graders._run_shell(command, tmp_path, 1)
+
+    assert code is None
+    assert output == "output exceeded the 128-byte limit"
+
+
+def test_review_command_timeout_kills_process_group(tmp_path):
+    from agent_eval import graders
+
+    pid_file = tmp_path / "command-child.pid"
+    child_program = "import time; time.sleep(30)"
+    parent_program = (
+        "import pathlib, subprocess, sys, time; "
+        f"child=subprocess.Popen([sys.executable, '-c', {child_program!r}]); "
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid)); "
+        "time.sleep(30)"
+    )
+    command = " ".join(
+        (
+            shlex.quote(sys.executable),
+            "-c",
+            shlex.quote(parent_program),
+        )
+    )
+
+    code, output = graders._run_shell(command, tmp_path, 0.5)
+
+    assert code is None
+    assert output == "timed out after 0.5s"
+    child_pid = int(pid_file.read_text())
+    for _ in range(50):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"review command descendant {child_pid} survived termination")
+
+
+def test_review_command_cannot_leave_redirected_background_process(tmp_path):
+    from agent_eval import graders
+
+    pid_file = tmp_path / "redirected-command-child.pid"
+    child_program = "import time; time.sleep(30)"
+    parent_program = (
+        "import pathlib, subprocess, sys; "
+        "sink=open('/dev/null', 'wb'); "
+        f"child=subprocess.Popen([sys.executable, '-c', {child_program!r}], "
+        "stdout=sink, stderr=sink); "
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))"
+    )
+    command = " ".join(
+        (
+            shlex.quote(sys.executable),
+            "-c",
+            shlex.quote(parent_program),
+        )
+    )
+
+    code, output = graders._run_shell(command, tmp_path, 2)
+
+    assert code == 0, output
+    child_pid = int(pid_file.read_text())
+    for _ in range(50):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"review command descendant {child_pid} survived termination")
+
+
 def test_judge_requires_every_configured_dimension_once(monkeypatch, tmp_path):
     from agent_eval.evaluators import judge
 
@@ -874,6 +1305,175 @@ def test_collect_changes_counts_untracked_files(tmp_path):
     assert "+def hello():" in diff
 
 
+def test_collect_changes_rejects_output_option_without_touching_files(tmp_path):
+    from agent_eval.review import collect_changes
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    source = repo / "app.py"
+    source.write_text("value = 1\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
+    source.write_text("value = 2\n")
+
+    created = tmp_path / "created-by-git-diff"
+    with pytest.raises(RuntimeError, match="base ref must not start"):
+        collect_changes(repo, f"--output={created}", None)
+    assert not created.exists()
+
+    existing = tmp_path / "existing-output"
+    existing.write_text("keep this content\n")
+    with pytest.raises(RuntimeError, match="base ref must not start"):
+        collect_changes(repo, f"--output={existing}", None)
+    assert existing.read_text() == "keep this content\n"
+
+
+@pytest.mark.parametrize(
+    ("head", "message"),
+    [
+        ("HEAD\0suffix", "must not contain NUL bytes"),
+        ("x" * 1025, "must not exceed 1024 UTF-8 bytes"),
+    ],
+)
+def test_collect_changes_rejects_malformed_head_refs(tmp_path, head, message):
+    from agent_eval.review import collect_changes
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True
+    )
+    (tmp_path / "app.py").write_text("value = 1\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "base"], cwd=tmp_path, check=True
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        collect_changes(tmp_path, "HEAD", head)
+
+
+def test_collect_changes_raises_when_commits_have_no_merge_base(tmp_path):
+    from agent_eval.review import collect_changes
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True
+    )
+    (tmp_path / "base.txt").write_text("base history\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "base"], cwd=tmp_path, check=True
+    )
+    base_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    subprocess.run(
+        ["git", "checkout", "-q", "--orphan", "unrelated"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(["git", "rm", "-q", "-rf", "."], cwd=tmp_path, check=True)
+    (tmp_path / "head.txt").write_text("unrelated history\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "head"], cwd=tmp_path, check=True
+    )
+
+    with pytest.raises(RuntimeError, match="git merge-base failed"):
+        collect_changes(tmp_path, base_commit, "HEAD")
+
+
+def test_collect_changes_never_executes_configured_external_diff(tmp_path):
+    from agent_eval.review import collect_changes
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    source = repo / "app.py"
+    source.write_text("value = 1\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
+    source.write_text("value = 2\n")
+    marker = tmp_path / "external-diff-ran"
+    external = tmp_path / "external-diff.sh"
+    external.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n", encoding="utf-8")
+    external.chmod(0o700)
+    subprocess.run(
+        ["git", "config", "diff.external", str(external)], cwd=repo, check=True
+    )
+
+    with pytest.raises(RuntimeError, match="head ref must not start"):
+        collect_changes(repo, "HEAD", "--ext-diff")
+    assert not marker.exists()
+
+    files, _, diff = collect_changes(repo, "HEAD", None)
+
+    assert [file.path for file in files] == ["app.py"]
+    assert "+value = 2" in diff
+    assert not marker.exists()
+
+
+def test_collect_changes_never_executes_repository_clean_filters(tmp_path):
+    from agent_eval.review import collect_changes
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    source = repo / "data.txt"
+    source.write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
+
+    marker = tmp_path / "clean-filter-ran"
+    filter_script = tmp_path / "filter.sh"
+    filter_script.write_text(
+        f"#!/bin/sh\ntouch {marker}\ncat\n",
+        encoding="utf-8",
+    )
+    filter_script.chmod(0o700)
+    subprocess.run(
+        ["git", "config", "filter.evil.clean", str(filter_script)],
+        cwd=repo,
+        check=True,
+    )
+    (repo / ".gitattributes").write_text("data.txt filter=evil\n")
+    source.write_text("changed\n")
+
+    files, _, diff = collect_changes(repo, "HEAD", None)
+
+    assert {file.path for file in files} == {".gitattributes", "data.txt"}
+    assert "+changed" in diff
+    assert not marker.exists()
+
+
 def test_working_tree_symlink_never_leaks_target_content(tmp_path):
     from agent_eval.review import collect_changes, snapshot_changed_files
 
@@ -925,6 +1525,129 @@ def test_changed_tracked_symlink_serializes_only_its_link_target(tmp_path):
     assert snapshot_changed_files(repo, files, None, snapshot) == 1
     assert "DO_NOT_EXFILTRATE" not in diff
     assert (snapshot / "config-link").read_text() == os.fspath(outside)
+
+
+def test_review_never_overwrites_repository_gitignore(tmp_path):
+    from agent_eval.review import review_change
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
+    state_dir = repo / ".agent-eval"
+    state_dir.mkdir()
+    ignore_path = state_dir / ".gitignore"
+    ignore_path.write_text("reviews/*\n!reviews/README.md\n")
+
+    review_change(repo, base="HEAD", run_scans=False, run_llm=False)
+
+    assert ignore_path.read_text() == "reviews/*\n!reviews/README.md\n"
+
+
+def test_static_explicit_head_review_never_checks_out_or_runs_hooks(tmp_path):
+    from agent_eval.review import review_change
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    source = repo / "app.py"
+    source.write_text("value = 1\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
+    source.write_text("value = 2\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "head"], cwd=repo, check=True)
+
+    marker = tmp_path / "post-checkout-ran"
+    hooks = repo / ".hooks"
+    hooks.mkdir()
+    post_checkout = hooks / "post-checkout"
+    post_checkout.write_text(
+        f"#!/bin/sh\ntouch {marker}\n",
+        encoding="utf-8",
+    )
+    post_checkout.chmod(0o700)
+    subprocess.run(
+        ["git", "config", "core.hooksPath", str(hooks)], cwd=repo, check=True
+    )
+
+    report = review_change(
+        repo,
+        base="HEAD~1",
+        head="HEAD",
+        run_scans=False,
+        run_llm=False,
+        out_dir=tmp_path / "report",
+        allow_local_execution=False,
+    )
+
+    assert [file.path for file in report.files] == ["app.py"]
+    assert not marker.exists()
+
+
+def test_review_rejects_symlinked_default_output_tree(tmp_path):
+    from agent_eval.paths import UnsafeStatePathError
+    from agent_eval.review import review_change
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / ".agent-eval").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(UnsafeStatePathError, match="symlink component"):
+        review_change(repo, base="HEAD", run_scans=False, run_llm=False)
+
+    assert list(outside.iterdir()) == []
+
+
+def test_review_refuses_existing_custom_output_without_mutating_it(tmp_path):
+    from agent_eval.review import review_change
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=repo, check=True)
+    output = tmp_path / "existing-output"
+    output.mkdir()
+    executable = output / "user-script"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="output directory already exists"):
+        review_change(
+            repo,
+            base="HEAD",
+            out_dir=output,
+            run_scans=False,
+            run_llm=False,
+        )
+
+    assert stat.S_IMODE(executable.stat().st_mode) == 0o755
 
 
 def test_reverse_test_injection_refuses_symlinked_parent(tmp_path):

@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from agent_eval.review_experiment import load_experiment, run_experiment
+import agent_eval.review_experiment as review_experiment_module
+from agent_eval.review_experiment import (
+    ExperimentSpec,
+    load_experiment,
+    run_experiment,
+)
 
 
 def _write_manifest(root: Path, *, clean_case: bool = True) -> None:
@@ -73,6 +80,14 @@ def _finding(
 
 
 def _write_experiment(root: Path, payload: dict) -> Path:
+    payload = dict(payload)
+    benchmark = root / payload["benchmark"]
+    if not benchmark.is_file():
+        benchmark = root / "benchmark.yaml"
+    payload.setdefault(
+        "benchmark_sha256",
+        hashlib.sha256(benchmark.read_bytes()).hexdigest(),
+    )
     path = root / "experiment.yaml"
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     return path
@@ -107,7 +122,7 @@ def test_repeated_single_reviewers_have_statistics_pairs_budgets_and_frontier(
     experiment = _write_experiment(
         tmp_path,
         {
-            "version": 1,
+            "version": 2,
             "benchmark": "benchmark.yaml",
             "baseline": "baseline",
             "budgets": {
@@ -186,6 +201,9 @@ def test_repeated_single_reviewers_have_statistics_pairs_budgets_and_frontier(
 
     assert [point.system_id for point in result.efficiency_frontier] == ["improved"]
     assert result.efficiency_frontier[0].budget_eligible is True
+    assert result.benchmark_sha256 == hashlib.sha256(
+        (tmp_path / "benchmark.yaml").read_bytes()
+    ).hexdigest()
     json.dumps(result.model_dump(mode="json"))
 
 
@@ -194,7 +212,7 @@ def test_panel_votes_once_per_member_and_combines_parallel_costs(tmp_path):
     experiment = _write_experiment(
         tmp_path,
         {
-            "version": 1,
+            "version": 2,
             "benchmark": "benchmark.yaml",
             "baseline": "solo",
             "budgets": {
@@ -279,12 +297,47 @@ def test_panel_votes_once_per_member_and_combines_parallel_costs(tmp_path):
     assert panel.finding_stability.mean_jaccard is None
 
 
+def test_incomplete_panel_case_is_not_counted_as_quality_evidence(tmp_path):
+    _write_manifest(tmp_path, clean_case=False)
+    experiment = _write_experiment(
+        tmp_path,
+        {
+            "version": 2,
+            "benchmark": "benchmark.yaml",
+            "baseline": "panel",
+            "systems": [
+                {
+                    "id": "panel",
+                    "mode": "panel",
+                    "members": ["alpha", "beta"],
+                    "quorum": 1,
+                    "trials": [{"id": "t1", "outputs": "outputs/panel"}],
+                }
+            ],
+        },
+    )
+    _write_output(tmp_path / "outputs/panel/alpha", "bug", [_finding()])
+
+    panel = run_experiment(experiment).systems[0]
+    output = panel.trials[0].cases[0]
+    scored = panel.trials[0].benchmark.cases[0]
+
+    assert output.complete is False
+    assert output.complete_source_outputs == 1
+    assert len(output.findings) == 1
+    assert scored.status == "incomplete_prediction"
+    assert panel.statistics.f1.count == 0
+    assert panel.statistics.f1.expected_count == 1
+    assert panel.statistics.f1.mean is None
+    assert panel.budget.eligible is False
+
+
 def test_efficiency_frontier_excludes_budget_ineligible_system(tmp_path):
     _write_manifest(tmp_path, clean_case=False)
     experiment = _write_experiment(
         tmp_path,
         {
-            "version": 1,
+            "version": 2,
             "benchmark": "benchmark.yaml",
             "baseline": "solo",
             "budgets": {"max_latency_s": 0.5},
@@ -317,7 +370,7 @@ def test_missing_malformed_outputs_and_metrics_are_visible_and_fail_closed(tmp_p
     experiment = _write_experiment(
         tmp_path,
         {
-            "version": 1,
+            "version": 2,
             "benchmark": "benchmark.yaml",
             "baseline": "complete",
             "budgets": {"max_latency_s": 10, "max_tokens": 1000},
@@ -376,7 +429,7 @@ def test_missing_malformed_outputs_and_metrics_are_visible_and_fail_closed(tmp_p
 def test_experiment_schema_is_strict_and_paths_cannot_escape(tmp_path):
     _write_manifest(tmp_path, clean_case=False)
     base = {
-        "version": 1,
+        "version": 2,
         "benchmark": "benchmark.yaml",
         "baseline": "solo",
         "systems": [
@@ -399,7 +452,7 @@ def test_experiment_schema_is_strict_and_paths_cannot_escape(tmp_path):
     with pytest.raises(ValidationError, match="safe relative path"):
         load_experiment(_write_experiment(tmp_path, traversal))
 
-    for invalid_version in (2, True, "1"):
+    for invalid_version in (1, 3, True, "2"):
         bad_version = dict(base, version=invalid_version)
         with pytest.raises(ValidationError, match="version"):
             load_experiment(_write_experiment(tmp_path, bad_version))
@@ -436,9 +489,40 @@ def test_experiment_schema_is_strict_and_paths_cannot_escape(tmp_path):
     outside_output = outside / "bug.json"
     outside_output.write_text(json.dumps({"findings": []}), encoding="utf-8")
     (output_dir / "bug.json").symlink_to(outside_output)
-    safe_spec = load_experiment(_write_experiment(tmp_path, base))
     with pytest.raises(ValueError, match="outside the experiment root"):
-        run_experiment(safe_spec)
+        load_experiment(_write_experiment(tmp_path, base))
+
+
+def test_experiment_input_is_bounded_and_no_follow(monkeypatch, tmp_path):
+    _write_manifest(tmp_path, clean_case=False)
+    payload = {
+        "version": 2,
+        "benchmark": "benchmark.yaml",
+        "baseline": "solo",
+        "systems": [
+            {
+                "id": "solo",
+                "mode": "single",
+                "trials": [{"id": "t1", "outputs": "outputs/solo"}],
+            }
+        ],
+    }
+    experiment = _write_experiment(tmp_path, payload)
+    monkeypatch.setattr(review_experiment_module, "MAX_EXPERIMENT_BYTES", 4)
+
+    with pytest.raises(ValueError, match="safe byte limit"):
+        load_experiment(experiment)
+
+    monkeypatch.setattr(
+        review_experiment_module,
+        "MAX_EXPERIMENT_BYTES",
+        4 * 1024 * 1024,
+    )
+    alias = tmp_path / "experiment-alias.yaml"
+    alias.symlink_to(experiment)
+
+    with pytest.raises(OSError):
+        load_experiment(alias)
 
 
 def test_experiment_rejects_duplicate_yaml_keys_and_unpaired_trial_sets(tmp_path):
@@ -446,8 +530,8 @@ def test_experiment_rejects_duplicate_yaml_keys_and_unpaired_trial_sets(tmp_path
     experiment = tmp_path / "experiment.yaml"
     experiment.write_text(
         """
-version: 1
-version: 1
+version: 2
+version: 2
 benchmark: benchmark.yaml
 baseline: a
 systems: []
@@ -460,8 +544,11 @@ systems: []
     experiment.write_text(
         yaml.safe_dump(
             {
-                "version": 1,
+                "version": 2,
                 "benchmark": "benchmark.yaml",
+                "benchmark_sha256": hashlib.sha256(
+                    (tmp_path / "benchmark.yaml").read_bytes()
+                ).hexdigest(),
                 "baseline": "a",
                 "systems": [
                     {
@@ -480,4 +567,215 @@ systems: []
         encoding="utf-8",
     )
     with pytest.raises(ValidationError, match="same trial ids"):
+        load_experiment(experiment)
+
+
+def test_experiment_binds_benchmark_before_and_during_scoring(tmp_path):
+    _write_manifest(tmp_path, clean_case=False)
+    payload = {
+        "version": 2,
+        "benchmark": "benchmark.yaml",
+        "baseline": "solo",
+        "systems": [
+            {
+                "id": "solo",
+                "mode": "single",
+                "trials": [{"id": "t1", "outputs": "outputs/solo"}],
+            }
+        ],
+    }
+    experiment = _write_experiment(tmp_path, payload)
+    spec = load_experiment(experiment)
+    benchmark = tmp_path / "benchmark.yaml"
+    benchmark.write_text(
+        benchmark.read_text(encoding="utf-8").replace(
+            "changed_lines: 10", "changed_lines: 999999"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="changed after experiment validation"):
+        run_experiment(spec)
+
+    with pytest.raises(ValueError, match="does not match the experiment spec"):
+        load_experiment(experiment)
+
+
+def test_experiment_hashes_and_parses_the_same_captured_benchmark_bytes(
+    tmp_path, monkeypatch
+):
+    _write_manifest(tmp_path, clean_case=False)
+    _write_output(tmp_path / "outputs/solo", "bug", [_finding()])
+    experiment = _write_experiment(
+        tmp_path,
+        {
+            "version": 2,
+            "benchmark": "benchmark.yaml",
+            "baseline": "solo",
+            "systems": [
+                {
+                    "id": "solo",
+                    "mode": "single",
+                    "trials": [{"id": "t1", "outputs": "outputs/solo"}],
+                }
+            ],
+        },
+    )
+    spec = load_experiment(experiment)
+    benchmark = tmp_path / "benchmark.yaml"
+    mutated = yaml.safe_load(benchmark.read_text(encoding="utf-8"))
+    mutated["cases"][0]["expected"] = []
+    mutated_text = yaml.safe_dump(mutated, sort_keys=False)
+    original_reader = review_experiment_module._stable_file_bytes
+    swapped = False
+
+    def capture_then_swap(path, *, maximum_bytes):
+        nonlocal swapped
+        captured = original_reader(path, maximum_bytes=maximum_bytes)
+        if Path(path) == benchmark and not swapped:
+            benchmark.write_text(mutated_text, encoding="utf-8")
+            swapped = True
+        return captured
+
+    monkeypatch.setattr(
+        review_experiment_module, "_stable_file_bytes", capture_then_swap
+    )
+
+    result = run_experiment(spec)
+    scored = result.systems[0].trials[0].benchmark.cases[0]
+
+    assert swapped is True
+    assert (scored.tp, scored.fp, scored.fn) == (1, 0, 0)
+    assert hashlib.sha256(benchmark.read_bytes()).hexdigest() != spec.benchmark_sha256
+
+
+def test_experiment_rejects_reused_resolved_output_directories(tmp_path):
+    _write_manifest(tmp_path, clean_case=False)
+    shared = tmp_path / "outputs/shared"
+    shared.mkdir(parents=True)
+    (tmp_path / "output-alias").symlink_to(shared, target_is_directory=True)
+    payload = {
+        "version": 2,
+        "benchmark": "benchmark.yaml",
+        "benchmark_sha256": hashlib.sha256(
+            (tmp_path / "benchmark.yaml").read_bytes()
+        ).hexdigest(),
+        "baseline": "baseline",
+        "systems": [
+            {
+                "id": "baseline",
+                "mode": "single",
+                "trials": [{"id": "t1", "outputs": "outputs/shared"}],
+            },
+            {
+                "id": "candidate",
+                "mode": "single",
+                "trials": [{"id": "t1", "outputs": "output-alias"}],
+            },
+        ],
+    }
+    experiment = _write_experiment(tmp_path, payload)
+
+    with pytest.raises(
+        ValueError,
+        match="reuses a resolved trial output directory across systems or trials",
+    ):
+        load_experiment(experiment)
+
+    spec = ExperimentSpec.model_validate(payload)
+    with pytest.raises(
+        ValueError,
+        match="reuses a resolved trial output directory across systems or trials",
+    ):
+        run_experiment(spec, base_dir=tmp_path)
+
+
+def test_experiment_rejects_panel_and_single_source_output_overlap(tmp_path):
+    _write_manifest(tmp_path, clean_case=False)
+    payload = {
+        "version": 2,
+        "benchmark": "benchmark.yaml",
+        "baseline": "panel",
+        "systems": [
+            {
+                "id": "panel",
+                "mode": "panel",
+                "members": ["m", "n"],
+                "quorum": 1,
+                "trials": [{"id": "t1", "outputs": "outputs"}],
+            },
+            {
+                "id": "single",
+                "mode": "single",
+                "trials": [{"id": "t1", "outputs": "outputs/m"}],
+            },
+        ],
+    }
+    experiment = _write_experiment(tmp_path, payload)
+
+    with pytest.raises(ValueError, match="reuses a concrete source output"):
+        load_experiment(experiment)
+
+    spec = ExperimentSpec.model_validate(
+        yaml.safe_load(experiment.read_text(encoding="utf-8"))
+    )
+    with pytest.raises(ValueError, match="reuses a concrete source output"):
+        run_experiment(spec, base_dir=tmp_path)
+
+
+def test_experiment_rejects_case_insensitive_planned_output_aliases(tmp_path):
+    _write_manifest(tmp_path, clean_case=False)
+    payload = {
+        "version": 2,
+        "benchmark": "benchmark.yaml",
+        "baseline": "upper",
+        "systems": [
+            {
+                "id": "upper",
+                "mode": "single",
+                "trials": [{"id": "t1", "outputs": "Outputs/shared"}],
+            },
+            {
+                "id": "lower",
+                "mode": "single",
+                "trials": [{"id": "t1", "outputs": "outputs/shared"}],
+            },
+        ],
+    }
+    experiment = _write_experiment(tmp_path, payload)
+
+    with pytest.raises(
+        ValueError,
+        match="reuses a resolved trial output directory across systems or trials",
+    ):
+        load_experiment(experiment)
+
+
+def test_experiment_rejects_hardlinked_source_outputs(tmp_path):
+    _write_manifest(tmp_path, clean_case=False)
+    first = tmp_path / "outputs/first"
+    second = tmp_path / "outputs/second"
+    _write_output(first, "bug", [_finding()])
+    second.mkdir(parents=True)
+    os.link(first / "bug.json", second / "bug.json")
+    payload = {
+        "version": 2,
+        "benchmark": "benchmark.yaml",
+        "baseline": "first",
+        "systems": [
+            {
+                "id": "first",
+                "mode": "single",
+                "trials": [{"id": "t1", "outputs": "outputs/first"}],
+            },
+            {
+                "id": "second",
+                "mode": "single",
+                "trials": [{"id": "t1", "outputs": "outputs/second"}],
+            },
+        ],
+    }
+    experiment = _write_experiment(tmp_path, payload)
+
+    with pytest.raises(ValueError, match="reuses a concrete source output"):
         load_experiment(experiment)

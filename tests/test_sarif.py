@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 from agent_eval.evaluators import scanners
@@ -499,17 +498,18 @@ def test_gitleaks_retains_redacted_item_locations(monkeypatch, tmp_path):
 
     def fake_run(cmd, out_file):
         del out_file
-        report = Path(cmd[cmd.index("--report-path") + 1])
-        report.write_text(json.dumps([{
+        assert cmd[cmd.index("--report-path") + 1] == "-"
+        stdout = json.dumps([{
             "RuleID": "generic-api-key",
             "Description": "Generic API key",
             "File": "src/app.py",
             "StartLine": 3,
             "Match": 'api_key = "do-not-persist-this"',
-        }]))
-        return SimpleNamespace(returncode=1), "ok"
+        }])
+        return SimpleNamespace(returncode=1, stdout=stdout), "ok"
 
     monkeypatch.setattr(scanners.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(scanners, "_installed_version", lambda command: "8.30.1")
     monkeypatch.setattr(scanners, "_run", fake_run)
     results = ScanResults()
 

@@ -31,6 +31,8 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from .yaml_utils import load_unique_yaml
+
 STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
 PREDICATE_TYPE = "https://github.com/wuchris-ch/agent-eval-k3s/attestation/v1"
 PREDICATE_SCHEMA_VERSION = 1
@@ -617,8 +619,8 @@ def _image_digest(value: str) -> str:
 
 def _task_identity(task_root: Path, task_id: str | None) -> str:
     try:
-        raw = yaml.safe_load(_read_regular_beneath(task_root, "task.yaml"))
-    except (OSError, yaml.YAMLError) as exc:
+        raw = load_unique_yaml(_read_regular_beneath(task_root, "task.yaml"))
+    except (OSError, ValueError, yaml.YAMLError) as exc:
         raise AttestationError(f"could not read task.yaml: {exc}") from exc
     manifest_id = raw.get("id") if isinstance(raw, dict) else None
     if not isinstance(manifest_id, str) or not manifest_id.strip():
@@ -1261,9 +1263,9 @@ def _verify_task(
                 actual=manifest_actual,
             )
         try:
-            raw = yaml.safe_load(manifest_data)
+            raw = load_unique_yaml(manifest_data)
             manifest_id = raw.get("id") if isinstance(raw, dict) else None
-        except yaml.YAMLError as exc:
+        except (ValueError, yaml.YAMLError) as exc:
             _failure(
                 failures,
                 "task_manifest_parse_error",

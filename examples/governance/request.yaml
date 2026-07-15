@@ -1,4 +1,4 @@
-schema_version: agent-eval.request/v1
+schema_version: agent-eval.request/v2
 request_id: 6bb43b63-4aa2-4b18-b72e-66bb79ad58b2
 idempotency_key: todo-july-2026-trial-set-01
 tenant_id: acme-engineering
@@ -9,8 +9,8 @@ agent: claude-code
 model: claude-sonnet-4-5-20250929
 data_classification: internal
 retention_class: standard
-max_total_tokens: 60000
-max_cost_usd: 2.5
+max_observed_total_tokens: 60000
+max_observed_cost_usd: 2.5
 labels:
   environment: evaluation
   owner: developer-productivity

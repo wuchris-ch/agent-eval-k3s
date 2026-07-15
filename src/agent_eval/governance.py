@@ -24,15 +24,15 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from yaml.constructor import ConstructorError
-from yaml.nodes import MappingNode
 
-REQUEST_SCHEMA_VERSION = "agent-eval.request/v1"
-POLICY_SCHEMA_VERSION = "agent-eval.policy/v1"
-DECISION_SCHEMA_VERSION = "agent-eval.decision/v1"
-EVIDENCE_SCHEMA_VERSION = "agent-eval.governance-evidence/v1"
+from .yaml_utils import DuplicateKeyError as DuplicateKeyError
+from .yaml_utils import load_unique_yaml
+
+REQUEST_SCHEMA_VERSION = "agent-eval.request/v2"
+POLICY_SCHEMA_VERSION = "agent-eval.policy/v2"
+DECISION_SCHEMA_VERSION = "agent-eval.decision/v2"
+EVIDENCE_SCHEMA_VERSION = "agent-eval.governance-evidence/v2"
 
 DataClassification = Literal["public", "internal", "confidential", "restricted"]
 RetentionClass = Literal["ephemeral", "standard", "regulated"]
@@ -114,12 +114,11 @@ def _parse_canonical_uuid(value: object, *, field: str) -> object:
     return parsed
 
 
-class EvaluationRequest(BaseModel):
-    """A bounded, versioned authorization request supplied by a caller."""
+class _EvaluationRequestBase(BaseModel):
+    """Strict shared identity fields for versioned authorization requests."""
 
     model_config = _strict_config()
 
-    schema_version: Literal["agent-eval.request/v1"]
     request_id: UUID
     idempotency_key: str
     tenant_id: str
@@ -130,10 +129,6 @@ class EvaluationRequest(BaseModel):
     model: str
     data_classification: DataClassification
     retention_class: RetentionClass
-    max_total_tokens: int | None = Field(default=None, gt=0, strict=True)
-    max_cost_usd: float | None = Field(
-        default=None, gt=0, allow_inf_nan=False, strict=True
-    )
     labels: dict[str, str] = Field(default_factory=dict, max_length=32)
 
     @field_validator("request_id", mode="before")
@@ -174,6 +169,26 @@ class EvaluationRequest(BaseModel):
         return labels
 
 
+class LegacyEvaluationRequestV1(_EvaluationRequestBase):
+    """Read-only historical request shape with the original limit names."""
+
+    schema_version: Literal["agent-eval.request/v1"]
+    max_total_tokens: int | None = Field(default=None, gt=0, strict=True)
+    max_cost_usd: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False, strict=True
+    )
+
+
+class EvaluationRequest(_EvaluationRequestBase):
+    """A bounded v2 request with explicitly observed usage thresholds."""
+
+    schema_version: Literal["agent-eval.request/v2"]
+    max_observed_total_tokens: int | None = Field(default=None, gt=0, strict=True)
+    max_observed_cost_usd: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False, strict=True
+    )
+
+
 class GovernanceRules(BaseModel):
     """Organization-level limits.  Empty allowlists intentionally match nothing."""
 
@@ -185,6 +200,9 @@ class GovernanceRules(BaseModel):
     allowed_network_modes: list[NetworkMode] = Field(max_length=2)
     allowed_egress_domains: list[str] = Field(default_factory=list, max_length=128)
     allowed_proxy_images: list[str] = Field(default_factory=list, max_length=32)
+    allowed_scanner_identities: list[str] = Field(
+        default_factory=list, max_length=32
+    )
     allowed_data_classifications: list[DataClassification] = Field(max_length=4)
     allowed_retention_classes: list[RetentionClass] = Field(max_length=3)
     require_scans: bool = True
@@ -193,8 +211,10 @@ class GovernanceRules(BaseModel):
     max_trials: int = Field(gt=0, strict=True)
     max_agent_seconds: int = Field(gt=0, strict=True)
     max_eval_seconds: int = Field(gt=0, strict=True)
-    max_total_tokens: int = Field(gt=0, strict=True)
-    max_cost_usd: float = Field(gt=0, allow_inf_nan=False, strict=True)
+    max_observed_total_tokens: int = Field(gt=0, strict=True)
+    max_observed_cost_usd: float = Field(
+        gt=0, allow_inf_nan=False, strict=True
+    )
 
     @field_validator("allowed_tenants", "allowed_projects", "allowed_tasks")
     @classmethod
@@ -233,6 +253,18 @@ class GovernanceRules(BaseModel):
                 )
         return normalized
 
+    @field_validator("allowed_scanner_identities")
+    @classmethod
+    def _valid_scanner_identities(cls, values: list[str]) -> list[str]:
+        normalized = _validate_unique(
+            values, field="allowed_scanner_identities"
+        )
+        if any(_SHA256.fullmatch(value) is None for value in normalized):
+            raise ValueError(
+                "allowed_scanner_identities must contain lowercase SHA-256 values"
+            )
+        return normalized
+
     @field_validator(
         "allowed_network_modes",
         "allowed_data_classifications",
@@ -241,6 +273,181 @@ class GovernanceRules(BaseModel):
     @classmethod
     def _unique_enum_allowlist(cls, values: list[str], info: Any) -> list[str]:
         return _validate_unique(values, field=info.field_name)
+
+    @model_validator(mode="after")
+    def _scanner_allowlist_required(self) -> "GovernanceRules":
+        if self.require_scans and not self.allowed_scanner_identities:
+            raise ValueError(
+                "require_scans requires at least one approved scanner identity"
+            )
+        return self
+
+
+class ApprovedTaskImage(BaseModel):
+    """One policy-approved, single-platform task image and build assertion.
+
+    Governed execution never creates this approval.  An operator promotes an
+    already-built manifest into the task registry after reviewing its builder
+    evidence.  The policy snapshot is therefore the authorization boundary,
+    while the runtime independently verifies the local OCI manifest digest.
+    """
+
+    model_config = _strict_config()
+
+    platform: str
+    reference: str
+    manifest_digest: str
+    builder_id: str
+    build_type: str
+    source_revision: str
+    provenance_sha256: str
+
+    @field_validator("platform")
+    @classmethod
+    def _valid_platform(cls, value: str) -> str:
+        if _PLATFORM.fullmatch(value) is None:
+            raise ValueError("approved image platform must be an exact Linux platform")
+        return value
+
+    @field_validator("reference")
+    @classmethod
+    def _valid_reference(cls, value: str) -> str:
+        if _GOVERNED_IMAGE_REF.fullmatch(value) is None:
+            raise ValueError(
+                "approved image reference must be a content-derived governed ref"
+            )
+        return value
+
+    @field_validator("manifest_digest")
+    @classmethod
+    def _valid_manifest_digest(cls, value: str) -> str:
+        if _IMAGE_DIGEST.fullmatch(value) is None:
+            raise ValueError("approved image manifest_digest must be sha256:<digest>")
+        return value
+
+    @field_validator("builder_id", "build_type")
+    @classmethod
+    def _valid_builder_identity(cls, value: str, info: Any) -> str:
+        if (
+            not 1 <= len(value) <= 512
+            or not value.isprintable()
+            or any(character.isspace() for character in value)
+        ):
+            raise ValueError(
+                f"approved image {info.field_name} must be a bounded exact URI-like value"
+            )
+        return value
+
+    @field_validator("source_revision")
+    @classmethod
+    def _valid_source_revision(cls, value: str) -> str:
+        return _validate_revision(value, field="approved image source_revision")
+
+    @field_validator("provenance_sha256")
+    @classmethod
+    def _valid_provenance_digest(cls, value: str) -> str:
+        if _SHA256.fullmatch(value) is None:
+            raise ValueError(
+                "approved image provenance_sha256 must be a lowercase SHA-256 value"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _content_derived_identity(self) -> "ApprovedTaskImage":
+        digest = self.manifest_digest.removeprefix("sha256:")
+        if not self.reference.endswith(f":governed-{digest}"):
+            raise ValueError(
+                "approved image reference must be derived from manifest_digest"
+            )
+        return self
+
+
+class TaskRegistryEntry(BaseModel):
+    """Exact approved task content and execution recipes.
+
+    Name allowlists are useful for coarse policy, but they are not an integrity
+    boundary.  A governed run must also match one immutable task tree and one
+    explicitly approved execution-specification digest before any build or
+    credential side effect is allowed.
+    """
+
+    model_config = _strict_config()
+
+    task_id: str
+    task_tree_sha256: str
+    execution_spec_digests: list[str] = Field(min_length=1, max_length=32)
+    approved_images: list[ApprovedTaskImage] = Field(min_length=1, max_length=32)
+    status: ModelStatus = "approved"
+
+    @field_validator("task_id")
+    @classmethod
+    def _valid_task_id(cls, value: str) -> str:
+        return _validate_safe(value, field="task_id", maximum=128)
+
+    @field_validator("task_tree_sha256")
+    @classmethod
+    def _valid_tree_digest(cls, value: str) -> str:
+        if _SHA256.fullmatch(value) is None:
+            raise ValueError("task_tree_sha256 must be a lowercase SHA-256 value")
+        return value
+
+    @field_validator("execution_spec_digests")
+    @classmethod
+    def _valid_execution_digests(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("execution_spec_digests must not contain duplicates")
+        if any(_SHA256.fullmatch(value) is None for value in values):
+            raise ValueError(
+                "execution_spec_digests must contain lowercase SHA-256 values"
+            )
+        return values
+
+    @field_validator("approved_images")
+    @classmethod
+    def _unique_approved_platforms(
+        cls, values: list[ApprovedTaskImage]
+    ) -> list[ApprovedTaskImage]:
+        platforms = [value.platform for value in values]
+        if len(platforms) != len(set(platforms)):
+            raise ValueError("approved_images must contain at most one image per platform")
+        return values
+
+    @model_validator(mode="after")
+    def _approved_images_match_task(self) -> "TaskRegistryEntry":
+        expected_prefix = f"agent-eval/{self.task_id}:governed-"
+        if any(
+            not image.reference.startswith(expected_prefix)
+            for image in self.approved_images
+        ):
+            raise ValueError("approved image reference must match task_id")
+        return self
+
+
+class TaskRegistry(BaseModel):
+    """Versioned exact task approvals, separate from model approvals."""
+
+    model_config = _strict_config()
+
+    registry_id: str
+    revision: str
+    tasks: list[TaskRegistryEntry] = Field(min_length=1, max_length=4096)
+
+    @field_validator("registry_id")
+    @classmethod
+    def _valid_registry_id(cls, value: str) -> str:
+        return _validate_safe(value, field="task_registry.registry_id", maximum=128)
+
+    @field_validator("revision")
+    @classmethod
+    def _valid_revision(cls, value: str) -> str:
+        return _validate_revision(value, field="task_registry.revision")
+
+    @model_validator(mode="after")
+    def _unique_tasks(self) -> "TaskRegistry":
+        task_ids = [entry.task_id for entry in self.tasks]
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError("task registry contains a duplicate task_id")
+        return self
 
 
 class _RegistryIdentity(BaseModel):
@@ -277,10 +484,12 @@ class _RegistryIdentity(BaseModel):
 
 
 class ModelRegistryEntry(_RegistryIdentity):
-    """One coding-agent model registration and its hard budget ceilings."""
+    """One model registration and its post-run usage observation thresholds."""
 
-    max_total_tokens: int = Field(gt=0, strict=True)
-    max_cost_usd: float = Field(gt=0, allow_inf_nan=False, strict=True)
+    max_observed_total_tokens: int = Field(gt=0, strict=True)
+    max_observed_cost_usd: float = Field(
+        gt=0, allow_inf_nan=False, strict=True
+    )
 
     @field_validator("adapter")
     @classmethod
@@ -326,10 +535,11 @@ class GovernanceBundle(BaseModel):
 
     model_config = _strict_config()
 
-    schema_version: Literal["agent-eval.policy/v1"]
+    schema_version: Literal["agent-eval.policy/v2"]
     policy_id: str
     revision: str
     rules: GovernanceRules
+    task_registry: TaskRegistry
     model_registry: ModelRegistry
 
     @field_validator("policy_id")
@@ -365,13 +575,17 @@ class PolicyReason(BaseModel):
 
 
 class EffectiveLimits(BaseModel):
+    """Hard execution limits plus post-run usage observation thresholds."""
+
     model_config = _strict_config()
 
     max_trials: int = Field(gt=0, strict=True)
     max_agent_seconds: int = Field(gt=0, strict=True)
     max_eval_seconds: int = Field(gt=0, strict=True)
-    max_total_tokens: int = Field(gt=0, strict=True)
-    max_cost_usd: float = Field(gt=0, allow_inf_nan=False, strict=True)
+    max_observed_total_tokens: int = Field(gt=0, strict=True)
+    max_observed_cost_usd: float = Field(
+        gt=0, allow_inf_nan=False, strict=True
+    )
 
 
 class PolicyDecision(BaseModel):
@@ -379,7 +593,7 @@ class PolicyDecision(BaseModel):
 
     model_config = _strict_config()
 
-    schema_version: Literal["agent-eval.decision/v1"] = DECISION_SCHEMA_VERSION
+    schema_version: Literal["agent-eval.decision/v2"] = DECISION_SCHEMA_VERSION
     decision_stage: Literal["preflight", "execution"]
     preflight_decision_id: UUID | None = None
     preflight_decision_digest: str | None = None
@@ -392,12 +606,16 @@ class PolicyDecision(BaseModel):
     policy_id: str
     policy_revision: str
     policy_digest: str
+    task_registry_id: str
+    task_registry_revision: str
+    task_registry_digest: str
     registry_id: str
     registry_revision: str
     registry_digest: str
     sanitized_input: dict[str, Any]
     reasons: list[PolicyReason]
     effective_limits: EffectiveLimits
+    matched_task: TaskRegistryEntry | None
     matched_model: ModelRegistryEntry | None
     matched_judge: JudgeRegistryEntry | None
 
@@ -424,7 +642,12 @@ class PolicyDecision(BaseModel):
             raise ValueError("decided_at must use UTC")
         return value
 
-    @field_validator("request_digest", "policy_digest", "registry_digest")
+    @field_validator(
+        "request_digest",
+        "policy_digest",
+        "task_registry_digest",
+        "registry_digest",
+    )
     @classmethod
     def _valid_digest(cls, value: str) -> str:
         if not _SHA256.fullmatch(value):
@@ -451,14 +674,36 @@ class PolicyDecision(BaseModel):
         return self
 
 
-class GovernanceEvidence(BaseModel):
-    """Governance subset intended for durable run attestations."""
+class LegacyEffectiveLimitsV1(BaseModel):
+    """Read-only pre-v2 names retained for historical evidence."""
 
     model_config = _strict_config()
 
-    schema_version: Literal["agent-eval.governance-evidence/v1"] = (
-        EVIDENCE_SCHEMA_VERSION
-    )
+    max_trials: int = Field(gt=0, strict=True)
+    max_agent_seconds: int = Field(gt=0, strict=True)
+    max_eval_seconds: int = Field(gt=0, strict=True)
+    max_total_tokens: int = Field(gt=0, strict=True)
+    max_cost_usd: float = Field(gt=0, allow_inf_nan=False, strict=True)
+
+
+class LegacyModelRegistryEntryV1(_RegistryIdentity):
+    """Read-only coding-model entry embedded in historical evidence."""
+
+    max_total_tokens: int = Field(gt=0, strict=True)
+    max_cost_usd: float = Field(gt=0, allow_inf_nan=False, strict=True)
+
+
+class LegacyGovernanceEvidenceV1(BaseModel):
+    """Read-only shape for pre-task-registry governed run history.
+
+    Version 1 evidence remains parseable for reports and migration, but it must
+    never be promoted to current evidence because it did not authorize an exact
+    task registry entry.
+    """
+
+    model_config = _strict_config()
+
+    schema_version: Literal["agent-eval.governance-evidence/v1"]
     decision_stage: Literal["execution"] = "execution"
     preflight_decision_id: UUID
     preflight_decision_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -496,7 +741,65 @@ class GovernanceEvidence(BaseModel):
     judge_backend: Literal["claude", "codex"] | None
     judge_model: str | None
     reason_codes: list[str]
+    effective_limits: LegacyEffectiveLimitsV1
+    matched_model: LegacyModelRegistryEntryV1 | None
+    matched_judge: JudgeRegistryEntry | None
+
+
+class GovernanceEvidence(BaseModel):
+    """Governance subset intended for durable run attestations."""
+
+    model_config = _strict_config()
+
+    schema_version: Literal["agent-eval.governance-evidence/v2"] = (
+        EVIDENCE_SCHEMA_VERSION
+    )
+    decision_stage: Literal["execution"] = "execution"
+    preflight_decision_id: UUID
+    preflight_decision_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    decision_id: UUID
+    trace_id: str
+    decided_at: datetime
+    allowed: bool
+    request_id: UUID
+    idempotency_key: str
+    tenant_id: str
+    project_id: str
+    asserted_actor: str
+    identity_assurance: Literal["asserted-unverified"] = "asserted-unverified"
+    data_classification: DataClassification
+    retention_class: RetentionClass
+    request_digest: str
+    policy_id: str
+    policy_revision: str
+    policy_digest: str
+    task_registry_id: str
+    task_registry_revision: str
+    task_registry_digest: str
+    registry_id: str
+    registry_revision: str
+    registry_digest: str
+    task_tree_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    execution_spec_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    task_image_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    task_image_ref: str = Field(
+        pattern=(
+            r"^agent-eval/[a-z0-9](?:[a-z0-9.-]{0,62}):"
+            r"governed-[0-9a-f]{64}$"
+        )
+    )
+    task_image_platform: str = Field(pattern=r"^linux/[a-z0-9_]+$")
+    run_scans: bool
+    scanner_identity_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    scanner_promotion_ready: bool = False
+    run_judge: bool
+    judge_backend: Literal["claude", "codex"] | None
+    judge_model: str | None
+    reason_codes: list[str]
     effective_limits: EffectiveLimits
+    matched_task: TaskRegistryEntry
     matched_model: ModelRegistryEntry | None
     matched_judge: JudgeRegistryEntry | None
 
@@ -531,6 +834,22 @@ class GovernanceEvidence(BaseModel):
                 "governance evidence requires an exact task image identity"
             )
         run_judge = decision.sanitized_input.get("run_judge")
+        run_scans = decision.sanitized_input.get("run_scans")
+        scanner_identity = decision.sanitized_input.get(
+            "scanner_identity_sha256"
+        )
+        scanner_ready = decision.sanitized_input.get("scanner_promotion_ready")
+        if run_scans is True:
+            if (
+                not isinstance(scanner_identity, str)
+                or _SHA256.fullmatch(scanner_identity) is None
+                or scanner_ready is not True
+            ):
+                raise ValueError(
+                    "governance evidence requires a promotion-ready scanner identity"
+                )
+        elif scanner_identity is not None or scanner_ready is not False:
+            raise ValueError("disabled scans cannot carry a scanner identity")
         judge_backend = decision.sanitized_input.get("judge_backend")
         judge_model = decision.sanitized_input.get("judge_model")
         if run_judge is True:
@@ -551,6 +870,18 @@ class GovernanceEvidence(BaseModel):
             or decision.preflight_decision_digest is None
         ):
             raise ValueError("execution decision is missing its preflight link")
+        if (
+            decision.matched_task is None
+            or decision.matched_task.status != "approved"
+            or decision.matched_task.task_id != request.task_id
+            or decision.matched_task.task_tree_sha256
+            != decision.sanitized_input.get("task_tree_sha256")
+            or decision.sanitized_input.get("execution_spec_digest")
+            not in decision.matched_task.execution_spec_digests
+        ):
+            raise ValueError(
+                "governance evidence requires an approved exact task identity"
+            )
         return cls(
             decision_stage="execution",
             preflight_decision_id=decision.preflight_decision_id,
@@ -570,6 +901,9 @@ class GovernanceEvidence(BaseModel):
             policy_id=decision.policy_id,
             policy_revision=decision.policy_revision,
             policy_digest=decision.policy_digest,
+            task_registry_id=decision.task_registry_id,
+            task_registry_revision=decision.task_registry_revision,
+            task_registry_digest=decision.task_registry_digest,
             registry_id=decision.registry_id,
             registry_revision=decision.registry_revision,
             registry_digest=decision.registry_digest,
@@ -578,12 +912,15 @@ class GovernanceEvidence(BaseModel):
             task_image_digest=task_image_digest,
             task_image_ref=task_image_ref,
             task_image_platform=task_image_platform,
-            run_scans=decision.sanitized_input["run_scans"],
+            run_scans=run_scans,
+            scanner_identity_sha256=scanner_identity,
+            scanner_promotion_ready=scanner_ready,
             run_judge=run_judge,
             judge_backend=judge_backend,
             judge_model=judge_model,
             reason_codes=[reason.code for reason in decision.reasons],
             effective_limits=decision.effective_limits,
+            matched_task=decision.matched_task,
             matched_model=decision.matched_model,
             matched_judge=decision.matched_judge,
         )
@@ -617,47 +954,44 @@ def validate_execution_continuity(
     if any(preflight.sanitized_input.get(key) is not None for key in image_fields):
         raise ValueError("preflight decision contains an image identity")
 
-
-class DuplicateKeyError(ValueError):
-    """Raised when a YAML mapping repeats a key at any nesting level."""
-
-
-class _UniqueKeyLoader(yaml.SafeLoader):
-    pass
-
-
-def _construct_unique_mapping(
-    loader: _UniqueKeyLoader, node: MappingNode, deep: bool = False
-) -> dict[Any, Any]:
-    loader.flatten_mapping(node)
-    mapping: dict[Any, Any] = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
-        try:
-            duplicate = key in mapping
-        except TypeError as exc:
-            raise ConstructorError(
-                "while constructing a mapping",
-                node.start_mark,
-                "found an unhashable mapping key",
-                key_node.start_mark,
-            ) from exc
-        if duplicate:
-            raise DuplicateKeyError(
-                f"duplicate YAML key {key!r} at line {key_node.start_mark.line + 1}"
-            )
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
-
-
-_UniqueKeyLoader.add_constructor(
-    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
-)
+    # Re-evaluating the same sanitized runtime fields under a different policy
+    # or registry is not continuity. Bind the complete authorization snapshot,
+    # selected entries, reasons, and effective limits across both stages so an
+    # execution decision cannot widen a previously admitted preflight.
+    bound_fields = (
+        "schema_version",
+        "request_id",
+        "request_digest",
+        "policy_id",
+        "policy_revision",
+        "policy_digest",
+        "task_registry_id",
+        "task_registry_revision",
+        "task_registry_digest",
+        "registry_id",
+        "registry_revision",
+        "registry_digest",
+        "reasons",
+        "effective_limits",
+        "matched_task",
+        "matched_model",
+        "matched_judge",
+    )
+    changed = [
+        field
+        for field in bound_fields
+        if getattr(preflight, field) != getattr(execution, field)
+    ]
+    if changed:
+        raise ValueError(
+            "execution decision changes its preflight authorization snapshot: "
+            + ", ".join(changed)
+        )
 
 
 def _load_yaml_object(path: Path | str) -> Mapping[str, Any]:
     source = Path(path)
-    raw = yaml.load(source.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
+    raw = load_unique_yaml(source.read_text(encoding="utf-8"))
     if not isinstance(raw, Mapping):
         raise ValueError(f"{source} must contain a YAML object")
     return raw
@@ -666,13 +1000,30 @@ def _load_yaml_object(path: Path | str) -> Mapping[str, Any]:
 def load_evaluation_request(path: Path | str) -> EvaluationRequest:
     """Load and strictly validate a duplicate-key-safe request YAML file."""
 
-    return EvaluationRequest.model_validate(_load_yaml_object(path))
+    document = _load_yaml_object(path)
+    if document.get("schema_version") == "agent-eval.request/v1":
+        legacy = LegacyEvaluationRequestV1.model_validate(document)
+        normalized = legacy.model_dump(mode="python")
+        normalized["schema_version"] = REQUEST_SCHEMA_VERSION
+        normalized["max_observed_total_tokens"] = normalized.pop(
+            "max_total_tokens"
+        )
+        normalized["max_observed_cost_usd"] = normalized.pop("max_cost_usd")
+        return EvaluationRequest.model_validate(normalized)
+    return EvaluationRequest.model_validate(document)
 
 
 def load_governance_bundle(path: Path | str) -> GovernanceBundle:
     """Load and strictly validate a duplicate-key-safe policy YAML file."""
 
-    return GovernanceBundle.model_validate(_load_yaml_object(path))
+    document = _load_yaml_object(path)
+    if document.get("schema_version") == "agent-eval.policy/v1":
+        raise ValueError(
+            "agent-eval.policy/v1 cannot be normalized safely; migrate to "
+            "policy/v2 with a task registry, approved per-platform images, "
+            "observed usage limits, and scanner identity allowlisting"
+        )
+    return GovernanceBundle.model_validate(document)
 
 
 def _matches(value: str, patterns: Sequence[str]) -> bool:
@@ -702,6 +1053,8 @@ def evaluate_admission(
     broker_configured: bool,
     run_scans: bool,
     run_judge: bool,
+    scanner_identity_sha256: str | None = None,
+    scanner_promotion_ready: bool = False,
     task_tree_sha256: str,
     execution_spec_digest: str,
     judge_backend: str | None = None,
@@ -717,9 +1070,10 @@ def evaluate_admission(
 ) -> PolicyDecision:
     """Evaluate admission without side effects, accumulating ordered denials.
 
-    The returned effective limits are the strictest applicable limits.  Callers
-    must enforce them during execution; an ``allowed`` decision is not itself a
-    resource limiter.
+    The returned trial and timeout limits are hard execution controls.  Token
+    and cost values are explicitly post-run observation thresholds because the
+    bundled provider CLIs cannot guarantee generation-time interruption.  An
+    ``allowed`` decision is not itself a resource limiter.
     """
 
     reasons: list[PolicyReason] = []
@@ -792,12 +1146,57 @@ def evaluate_admission(
             "Task tree and execution specification digests are required",
         )
 
+    matched_task = next(
+        (
+            entry
+            for entry in bundle.task_registry.tasks
+            if entry.task_id == actual_task_id
+        ),
+        None,
+    )
+    if matched_task is None:
+        deny(
+            "task_not_registered",
+            "Runtime task has no exact entry in the approved task registry",
+        )
+    else:
+        if matched_task.status != "approved":
+            deny(
+                f"task_{matched_task.status}",
+                f"Registered task status is {matched_task.status}",
+            )
+        if task_tree_sha256 != matched_task.task_tree_sha256:
+            deny(
+                "task_tree_not_approved",
+                "Runtime task tree digest does not match the approved task registry",
+            )
+        if execution_spec_digest not in matched_task.execution_spec_digests:
+            deny(
+                "execution_spec_not_approved",
+                "Runtime execution specification is not approved for this task",
+            )
+        if decision_stage == "execution" and not any(
+            image.platform == task_image_platform
+            and image.reference == task_image_ref
+            and image.manifest_digest == task_image_digest
+            for image in matched_task.approved_images
+        ):
+            deny(
+                "task_image_not_approved",
+                "Runtime task image and platform are not preapproved in the task registry",
+            )
+
     if actual_task_id != request.task_id:
         deny("task_mismatch", "Runtime task does not match the authorized request")
     if actual_agent != request.agent:
         deny("agent_mismatch", "Runtime agent does not match the authorized request")
     if actual_model != request.model:
         deny("model_mismatch", "Runtime model does not match the authorized request")
+    if actual_agent == "codex":
+        deny(
+            "coding_model_observation_unsupported",
+            "Governed Codex coding cannot yet prove the runtime model identity",
+        )
 
     if not _matches(request.tenant_id, rules.allowed_tenants):
         deny("tenant_not_allowed", "Tenant is not allowed by policy")
@@ -853,6 +1252,30 @@ def evaluate_admission(
         deny("invalid_scan_configuration", "Scanner configuration must be boolean")
     elif rules.require_scans and not run_scans:
         deny("scans_required", "Policy requires the scanner phase")
+    if run_scans is True:
+        if (
+            not isinstance(scanner_identity_sha256, str)
+            or _SHA256.fullmatch(scanner_identity_sha256) is None
+        ):
+            deny(
+                "scanner_identity_required",
+                "Scanner execution requires an exact assurance identity",
+            )
+        elif scanner_identity_sha256 not in rules.allowed_scanner_identities:
+            deny(
+                "scanner_identity_not_allowed",
+                "Scanner assurance identity is not approved by policy",
+            )
+        if scanner_promotion_ready is not True:
+            deny(
+                "scanner_identity_incomplete",
+                "Scanner assurance inputs are incomplete for governed promotion",
+            )
+    elif scanner_identity_sha256 is not None or scanner_promotion_ready is not False:
+        deny(
+            "scanner_identity_unexpected",
+            "Disabled scanner execution cannot claim an assurance identity",
+        )
     if not isinstance(run_judge, bool):
         deny("invalid_judge_configuration", "Judge configuration must be boolean")
     elif rules.require_judge and not run_judge:
@@ -969,22 +1392,22 @@ def evaluate_admission(
                 "Registered model is not approved for the data classification",
             )
 
-    token_limits = [rules.max_total_tokens]
-    cost_limits = [rules.max_cost_usd]
-    if request.max_total_tokens is not None:
-        token_limits.append(request.max_total_tokens)
-    if request.max_cost_usd is not None:
-        cost_limits.append(request.max_cost_usd)
+    token_limits = [rules.max_observed_total_tokens]
+    cost_limits = [rules.max_observed_cost_usd]
+    if request.max_observed_total_tokens is not None:
+        token_limits.append(request.max_observed_total_tokens)
+    if request.max_observed_cost_usd is not None:
+        cost_limits.append(request.max_observed_cost_usd)
     if matched_model is not None:
-        token_limits.append(matched_model.max_total_tokens)
-        cost_limits.append(matched_model.max_cost_usd)
+        token_limits.append(matched_model.max_observed_total_tokens)
+        cost_limits.append(matched_model.max_observed_cost_usd)
 
     effective_limits = EffectiveLimits(
         max_trials=rules.max_trials,
         max_agent_seconds=rules.max_agent_seconds,
         max_eval_seconds=rules.max_eval_seconds,
-        max_total_tokens=min(token_limits),
-        max_cost_usd=min(cost_limits),
+        max_observed_total_tokens=min(token_limits),
+        max_observed_cost_usd=min(cost_limits),
     )
     if not reasons:
         reasons.append(
@@ -1005,6 +1428,8 @@ def evaluate_admission(
         "trials": trials,
         "network_mode": network_mode,
         "run_scans": run_scans,
+        "scanner_identity_sha256": scanner_identity_sha256,
+        "scanner_promotion_ready": scanner_promotion_ready,
         "run_judge": run_judge,
         "judge_backend": judge_backend,
         "judge_model": judge_model,
@@ -1029,12 +1454,16 @@ def evaluate_admission(
         policy_id=bundle.policy_id,
         policy_revision=bundle.revision,
         policy_digest=sha256_json(_policy_document(bundle)),
+        task_registry_id=bundle.task_registry.registry_id,
+        task_registry_revision=bundle.task_registry.revision,
+        task_registry_digest=sha256_json(bundle.task_registry),
         registry_id=bundle.model_registry.registry_id,
         registry_revision=bundle.model_registry.revision,
         registry_digest=sha256_json(bundle.model_registry),
         sanitized_input=sanitized_input,
         reasons=reasons,
         effective_limits=effective_limits,
+        matched_task=matched_task,
         matched_model=matched_model,
         matched_judge=matched_judge,
     )

@@ -33,6 +33,8 @@ def _task(root: Path) -> Path:
     task = root / "task"
     (task / "environment" / "workspace").mkdir(parents=True)
     (task / "task.yaml").write_text(
+        "schema_version: agent-eval.task/v1\n"
+        "version: 1.0.0\n"
         "id: demo\nprompt: test\ntest_command: pytest\n",
         encoding="utf-8",
     )

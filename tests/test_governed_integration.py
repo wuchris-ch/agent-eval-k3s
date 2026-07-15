@@ -18,9 +18,11 @@ from agent_eval.audit import (
     canonical_audit_json_bytes,
     verify_audit_chain,
 )
+from agent_eval.assessments import derive_assessments
 from agent_eval.evaluators import scanners
 from agent_eval.evaluators.tests import TestResults as EvalTestResults
 from agent_eval.governance import (
+    EffectiveLimits,
     EvaluationRequest,
     GovernanceBundle,
     GovernanceEvidence,
@@ -28,16 +30,23 @@ from agent_eval.governance import (
     sha256_json,
     write_canonical_json,
 )
-from agent_eval.metrics import AgentMetrics, DiffStats, RunRecord, ScanResults
+from agent_eval.metrics import (
+    AgentMetrics,
+    DiffStats,
+    RunRecord,
+    ScanResults,
+    TrivyDatabaseIdentity,
+)
 from agent_eval.kube import KubeError
 from agent_eval.outcome import RunOutcome
-from agent_eval.task import load_task
+from agent_eval.task import EvaluationConfig, load_task
 
 
 IMAGE_DIGEST = "sha256:" + "a" * 64
 IMAGE_REF = "agent-eval/example-todo-api:governed-" + "a" * 64
 IMAGE_PLATFORM = "linux/amd64"
 REQUEST_ID = "12345678-1234-4234-8234-123456789abc"
+AGENT = "claude-code"
 MODEL = "frontier-code-2026-07"
 PROXY_IMAGE = (
     "ubuntu/squid@sha256:"
@@ -45,16 +54,75 @@ PROXY_IMAGE = (
 )
 
 
+def _approved_scan_results() -> ScanResults:
+    results = ScanResults(
+        lint_errors=0,
+        sec_findings_high=0,
+        sec_findings_medium=0,
+        sec_findings_low=0,
+        secrets_found=0,
+        vulns=0,
+        scanner_runtime_lock_sha256=scanners.scanner_runtime_lock_digest(),
+        scanner_runtime_environment_sha256="3" * 64,
+        scanner_status={
+            "ruff": "ok",
+            "semgrep": "ok",
+            "gitleaks": "ok",
+            "trivy": "ok",
+        },
+        scanner_versions={
+            "ruff": "0.15.20",
+            "semgrep": "1.169.0",
+            "gitleaks": "8.30.1",
+            "trivy": "0.72.0",
+        },
+        scanner_executable_sha256={
+            "uv": "c" * 64,
+            "python": "d" * 64,
+            "ruff": "1" * 64,
+            "semgrep": "2" * 64,
+            "gitleaks": "e" * 64,
+            "trivy": "f" * 64,
+        },
+        trivy_db=TrivyDatabaseIdentity(
+            version=2,
+            updated_at="2026-07-14T00:00:00Z",
+            next_update="2026-07-15T00:00:00Z",
+            downloaded_at="2026-07-14T01:00:00Z",
+            content_sha256="b" * 64,
+        ),
+    )
+    results.scanner_assurance = scanners.scanner_assurance_identity(results)
+    return ScanResults.model_validate(results.model_dump(mode="python"))
+
+
+SCANNER_RESULTS = _approved_scan_results()
+SCANNER_ASSURANCE = SCANNER_RESULTS.scanner_assurance
+assert SCANNER_ASSURANCE is not None
+SCANNER_IDENTITY = SCANNER_ASSURANCE.identity_sha256
+
+
+@pytest.fixture(autouse=True)
+def _stable_governance_scanner_evidence(monkeypatch):
+    monkeypatch.setattr(
+        runner,
+        "_governance_scanner_evidence",
+        lambda *, run_scans: (
+            (SCANNER_IDENTITY, True) if run_scans else (None, False)
+        ),
+    )
+
+
 def _request_data(
     task_id: str,
     *,
-    agent: str = "codex",
+    agent: str = AGENT,
     model: str = MODEL,
     max_total_tokens: int = 40,
     max_cost_usd: float = 0.3,
 ) -> dict:
     return {
-        "schema_version": "agent-eval.request/v1",
+        "schema_version": "agent-eval.request/v2",
         "request_id": REQUEST_ID,
         "idempotency_key": "ci-run-42",
         "tenant_id": "tenant-a",
@@ -65,15 +133,16 @@ def _request_data(
         "model": model,
         "data_classification": "internal",
         "retention_class": "standard",
-        "max_total_tokens": max_total_tokens,
-        "max_cost_usd": max_cost_usd,
+        "max_observed_total_tokens": max_total_tokens,
+        "max_observed_cost_usd": max_cost_usd,
         "labels": {"environment": "test"},
     }
 
 
 def _policy_data(
     *,
-    agent: str = "codex",
+    registered_task=None,
+    agent: str = AGENT,
     model: str = MODEL,
     tenants: list[str] | None = None,
     network_modes: list[str] | None = None,
@@ -83,8 +152,21 @@ def _policy_data(
     model_max_total_tokens: int = 25,
     model_max_cost_usd: float = 0.2,
 ) -> dict:
+    registered_task = registered_task or load_task("example-todo-api")
+    task_tree_sha256 = None
+    execution_spec_digests: set[str] = set()
+    for run_scans in (False, True):
+        for run_judge in (False, True):
+            tree_digest, execution_digest = runner._governance_task_evidence(
+                registered_task,
+                run_scans=run_scans,
+                run_judge=run_judge,
+            )
+            task_tree_sha256 = tree_digest
+            execution_spec_digests.add(execution_digest)
+    assert task_tree_sha256 is not None
     return {
-        "schema_version": "agent-eval.policy/v1",
+        "schema_version": "agent-eval.policy/v2",
         "policy_id": "enterprise-evals",
         "revision": "2026-07-14.1",
         "rules": {
@@ -98,6 +180,7 @@ def _policy_data(
                 else [".anthropic.com", ".claude.ai"]
             ),
             "allowed_proxy_images": [PROXY_IMAGE],
+            "allowed_scanner_identities": [SCANNER_IDENTITY],
             "allowed_data_classifications": ["internal"],
             "allowed_retention_classes": ["standard"],
             "require_scans": True,
@@ -106,8 +189,31 @@ def _policy_data(
             "max_trials": max_trials,
             "max_agent_seconds": 900,
             "max_eval_seconds": 300,
-            "max_total_tokens": max_total_tokens,
-            "max_cost_usd": max_cost_usd,
+            "max_observed_total_tokens": max_total_tokens,
+            "max_observed_cost_usd": max_cost_usd,
+        },
+        "task_registry": {
+            "registry_id": "approved-tasks",
+            "revision": "2026-07-14.1",
+            "tasks": [
+                {
+                    "task_id": registered_task.id,
+                    "task_tree_sha256": task_tree_sha256,
+                    "execution_spec_digests": sorted(execution_spec_digests),
+                    "approved_images": [
+                        {
+                            "platform": IMAGE_PLATFORM,
+                            "reference": IMAGE_REF,
+                            "manifest_digest": IMAGE_DIGEST,
+                            "builder_id": "https://ci.example/builders/task-images",
+                            "build_type": "https://slsa.dev/container/v1",
+                            "source_revision": "commit-123",
+                            "provenance_sha256": "b" * 64,
+                        }
+                    ],
+                    "status": "approved",
+                }
+            ],
         },
         "model_registry": {
             "registry_id": "approved-models",
@@ -119,8 +225,8 @@ def _policy_data(
                     "provider": "openai",
                     "status": "approved",
                     "allowed_data_classifications": ["internal"],
-                    "max_total_tokens": model_max_total_tokens,
-                    "max_cost_usd": model_max_cost_usd,
+                    "max_observed_total_tokens": model_max_total_tokens,
+                    "max_observed_cost_usd": model_max_cost_usd,
                 },
                 {
                     "adapter": "judge:claude",
@@ -147,6 +253,8 @@ def _task_evidence_args(
     )
     return {
         "run_scans": run_scans,
+        "scanner_identity_sha256": SCANNER_IDENTITY if run_scans else None,
+        "scanner_promotion_ready": run_scans,
         "run_judge": run_judge,
         "judge_backend": task.judge.backend if run_judge else None,
         "judge_model": task.judge.model if run_judge else None,
@@ -175,6 +283,8 @@ def _execution_from_preflight(
         eval_timeout_seconds=admitted["eval_timeout_seconds"],
         broker_configured=admitted["broker_configured"],
         run_scans=admitted["run_scans"],
+        scanner_identity_sha256=admitted["scanner_identity_sha256"],
+        scanner_promotion_ready=admitted["scanner_promotion_ready"],
         run_judge=admitted["run_judge"],
         judge_backend=admitted["judge_backend"],
         judge_model=admitted["judge_model"],
@@ -222,9 +332,75 @@ def _patch_cli_dependencies(monkeypatch, task, adapter) -> dict[str, int]:
     return calls
 
 
+@pytest.mark.parametrize(
+    ("metrics_value", "expected"),
+    [
+        (AgentMetrics(cost_usd=0.1), "token usage evidence is unavailable"),
+        (
+            AgentMetrics(tokens_in=20, tokens_out=6, cost_usd=0.1),
+            "observed token usage 26 exceeds 25",
+        ),
+        (
+            AgentMetrics(tokens_in=1, tokens_out=1),
+            "cost evidence is unavailable",
+        ),
+        (
+            AgentMetrics(tokens_in=1, tokens_out=1, cost_usd=0.3),
+            "observed cost 0.3 exceeds 0.2",
+        ),
+        (AgentMetrics(tokens_in=1, tokens_out=1, cost_usd=0.1), None),
+    ],
+)
+def test_governed_cli_stops_before_another_call_on_usage_evidence_failure(
+    metrics_value,
+    expected,
+):
+    record = RunRecord(
+        run_id="usage-stop",
+        task_id="example-todo-api",
+        agent=AGENT,
+        efficiency=metrics_value,
+    )
+    limits = EffectiveLimits(
+        max_trials=3,
+        max_agent_seconds=900,
+        max_eval_seconds=300,
+        max_observed_total_tokens=25,
+        max_observed_cost_usd=0.2,
+    )
+
+    assert cli._governed_usage_stop_reason(record, limits) == expected
+
+
+def test_tasks_fingerprint_prints_exact_content_and_recipe_identity():
+    task = load_task("example-todo-api")
+    tree_digest, execution_digest = runner._governance_task_evidence(
+        task, run_scans=True, run_judge=True
+    )
+
+    result = CliRunner().invoke(cli.app, ["tasks", "fingerprint", task.id])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {
+        "task_id": task.id,
+        "task_tree_sha256": tree_digest,
+        "execution_spec_digests": [execution_digest],
+    }
+
+
+def test_tasks_fingerprint_can_include_all_execution_recipes():
+    result = CliRunner().invoke(
+        cli.app,
+        ["tasks", "fingerprint", "example-todo-api", "--all-recipes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(json.loads(result.output)["execution_spec_digests"]) == 3
+
+
 def test_cli_requires_request_policy_pair_before_cluster(monkeypatch, tmp_path):
     task = load_task("example-todo-api")
-    adapter = type("Adapter", (), {"name": "codex"})()
+    adapter = type("Adapter", (), {"name": AGENT})()
     request_path = _write_yaml(tmp_path / "request.yaml", _request_data(task.id))
     calls = _patch_cli_dependencies(monkeypatch, task, adapter)
 
@@ -248,7 +424,7 @@ def test_cli_requires_request_policy_pair_before_cluster(monkeypatch, tmp_path):
 
 def test_malformed_governance_yaml_exits_two_before_cluster(monkeypatch, tmp_path):
     task = load_task("example-todo-api")
-    adapter = type("Adapter", (), {"name": "codex"})()
+    adapter = type("Adapter", (), {"name": AGENT})()
     request_path = tmp_path / "request.yaml"
     request_path.write_text("schema_version: [\n", encoding="utf-8")
     policy_path = _write_yaml(tmp_path / "policy.yaml", _policy_data())
@@ -276,7 +452,7 @@ def test_malformed_governance_yaml_exits_two_before_cluster(monkeypatch, tmp_pat
 
 def test_denied_policy_persists_evidence_before_any_runtime_work(monkeypatch, tmp_path):
     task = load_task("example-todo-api")
-    adapter = type("Adapter", (), {"name": "codex"})()
+    adapter = type("Adapter", (), {"name": AGENT})()
     request_path = _write_yaml(tmp_path / "request.yaml", _request_data(task.id))
     policy_path = _write_yaml(
         tmp_path / "policy.yaml",
@@ -325,7 +501,7 @@ def test_task_added_egress_domain_is_denied_before_runtime(monkeypatch, tmp_path
             )
         }
     )
-    adapter = type("Adapter", (), {"name": "codex"})()
+    adapter = type("Adapter", (), {"name": AGENT})()
     request_path = _write_yaml(tmp_path / "request.yaml", _request_data(task.id))
     policy_path = _write_yaml(tmp_path / "policy.yaml", _policy_data())
     monkeypatch.setattr(metrics, "RUNS_ROOT", tmp_path / "runs")
@@ -355,7 +531,7 @@ def test_admitted_cli_uses_request_model_and_reuses_decision_for_trials(
     monkeypatch, tmp_path
 ):
     task = load_task("example-todo-api")
-    adapter = type("Adapter", (), {"name": "codex"})()
+    adapter = type("Adapter", (), {"name": AGENT})()
     request_path = _write_yaml(tmp_path / "request.yaml", _request_data(task.id))
     policy_path = _write_yaml(tmp_path / "policy.yaml", _policy_data(max_trials=2))
     monkeypatch.setattr(metrics, "RUNS_ROOT", tmp_path / "runs")
@@ -384,6 +560,11 @@ def test_admitted_cli_uses_request_model_and_reuses_decision_for_trials(
             agent=adapter_arg.name,
             trial=kwargs["trial"],
             correctness=EvalTestResults(total=1, passed=1, command_exit_code=0),
+            efficiency=AgentMetrics(
+                tokens_in=1,
+                tokens_out=1,
+                cost_usd=0.1,
+            ),
         )
 
     monkeypatch.setattr(runner, "run_agent_trial", fake_trial)
@@ -421,22 +602,20 @@ def test_admitted_cli_uses_request_model_and_reuses_decision_for_trials(
     assert requests[0].model == MODEL
     assert decisions[0].allowed is True
     assert decisions[0].matched_model.model == MODEL
-    assert decisions[0].effective_limits.max_total_tokens == 25
-    assert decisions[0].effective_limits.max_cost_usd == 0.2
+    assert decisions[0].effective_limits.max_observed_total_tokens == 25
+    assert decisions[0].effective_limits.max_observed_cost_usd == 0.2
 
 
-def test_governed_prepare_force_builds_private_snapshot_despite_existing_tag(
-    monkeypatch,
-):
+def test_governed_prepare_uses_preapproved_image_without_runtime_build(monkeypatch):
     task = load_task("example-todo-api")
     request = EvaluationRequest.model_validate(_request_data(task.id))
     bundle = GovernanceBundle.model_validate(_policy_data())
-    domains, proxy_image = runner._governance_network_evidence(task, "codex")
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
     preflight = evaluate_admission(
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=2,
         network_mode=task.network.agent_mode,
@@ -447,20 +626,13 @@ def test_governed_prepare_force_builds_private_snapshot_despite_existing_tag(
         proxy_image=proxy_image,
         **_task_evidence_args(task),
     )
-    state = {"built": False}
-    build_roots = []
+    snapshot_roots = []
     lifecycle = []
-
-    def fake_build(snapshot):
-        lifecycle.append("build")
-        build_roots.append(snapshot.path)
-        assert build_roots[-1] != task.path
-        state["built"] = True
-        return runner._BuiltImage(IMAGE_REF, IMAGE_DIGEST, IMAGE_PLATFORM)
 
     def fake_import(snapshot, rebuild=False, *, expected_digest=None, image_ref=None):
         assert rebuild is False
         assert snapshot.path != task.path
+        snapshot_roots.append(snapshot.path)
         assert expected_digest == IMAGE_DIGEST
         assert image_ref == IMAGE_REF
         lifecycle.append("import")
@@ -473,7 +645,14 @@ def test_governed_prepare_force_builds_private_snapshot_despite_existing_tag(
         return original_finalize(*args, **kwargs)
 
     monkeypatch.delenv("AGENT_EVAL_CREDENTIAL_COMMAND", raising=False)
-    monkeypatch.setattr(runner, "_build_governed_image", fake_build)
+    monkeypatch.setattr(runner, "_docker_platform", lambda: IMAGE_PLATFORM)
+    monkeypatch.setattr(
+        runner,
+        "_build_task_image_candidate",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("governed execution must not build an image")
+        ),
+    )
     monkeypatch.setattr(runner, "_finalize_execution_decision", capture_finalize)
     monkeypatch.setattr(
         runner.cluster_mod,
@@ -484,7 +663,7 @@ def test_governed_prepare_force_builds_private_snapshot_despite_existing_tag(
 
     execution = runner.prepare_governed_execution(
         task,
-        agent="codex",
+        agent=AGENT,
         model=MODEL,
         run_scans=True,
         run_judge=True,
@@ -493,9 +672,8 @@ def test_governed_prepare_force_builds_private_snapshot_despite_existing_tag(
         preflight_decision=preflight,
     )
 
-    assert state["built"] is True
-    assert lifecycle == ["build", "final-decision", "cluster", "import"]
-    assert build_roots and all(not root.exists() for root in build_roots)
+    assert lifecycle == ["final-decision", "cluster", "import"]
+    assert snapshot_roots and all(not root.exists() for root in snapshot_roots)
     assert execution.decision_stage == "execution"
     assert execution.preflight_decision_id == preflight.decision_id
     assert execution.sanitized_input["task_image_digest"] == IMAGE_DIGEST
@@ -503,16 +681,165 @@ def test_governed_prepare_force_builds_private_snapshot_despite_existing_tag(
     assert execution.sanitized_input["task_image_platform"] == IMAGE_PLATFORM
 
 
-def test_post_binding_retag_fails_before_credentials_or_runtime(monkeypatch, tmp_path):
+def test_governed_prepare_rejects_final_identity_drift_before_cluster(monkeypatch):
     task = load_task("example-todo-api")
     request = EvaluationRequest.model_validate(_request_data(task.id))
-    bundle = GovernanceBundle.model_validate(_policy_data())
-    domains, proxy_image = runner._governance_network_evidence(task, "codex")
+    other_identity = "7" * 64
+    policy = _policy_data()
+    policy["rules"]["allowed_scanner_identities"].append(other_identity)
+    bundle = GovernanceBundle.model_validate(policy)
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
     preflight = evaluate_admission(
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
+        actual_model=MODEL,
+        trials=1,
+        network_mode=task.network.agent_mode,
+        agent_timeout_seconds=task.timeouts.agent_seconds,
+        eval_timeout_seconds=task.timeouts.eval_seconds,
+        broker_configured=False,
+        effective_egress_domains=domains,
+        proxy_image=proxy_image,
+        **_task_evidence_args(task),
+    )
+    observed_identities = iter(
+        [(SCANNER_IDENTITY, True), (other_identity, True)]
+    )
+    monkeypatch.setattr(
+        runner,
+        "_governance_scanner_evidence",
+        lambda *, run_scans: next(observed_identities),
+    )
+    monkeypatch.setattr(runner, "_docker_platform", lambda: IMAGE_PLATFORM)
+    monkeypatch.setattr(
+        runner.cluster_mod,
+        "ensure_cluster",
+        lambda: pytest.fail("identity drift reached cluster setup"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "ensure_image",
+        lambda *args, **kwargs: pytest.fail("identity drift reached image import"),
+    )
+
+    with pytest.raises(ValueError, match="broadens or changes its preflight"):
+        runner.prepare_governed_execution(
+            task,
+            agent=AGENT,
+            model=MODEL,
+            run_scans=True,
+            run_judge=True,
+            request=request,
+            bundle=bundle,
+            preflight_decision=preflight,
+        )
+
+
+def test_governed_prepare_rejects_cooperative_evaluation_before_side_effects(
+    monkeypatch,
+):
+    task = load_task("example-todo-api").model_copy(
+        update={"evaluation": EvaluationConfig()}
+    )
+    request = EvaluationRequest.model_validate(_request_data(task.id))
+    bundle = GovernanceBundle.model_validate(_policy_data(registered_task=task))
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
+    preflight = evaluate_admission(
+        request,
+        bundle,
+        actual_task_id=task.id,
+        actual_agent=AGENT,
+        actual_model=MODEL,
+        trials=1,
+        network_mode=task.network.agent_mode,
+        agent_timeout_seconds=task.timeouts.agent_seconds,
+        eval_timeout_seconds=task.timeouts.eval_seconds,
+        broker_configured=False,
+        effective_egress_domains=domains,
+        proxy_image=proxy_image,
+        **_task_evidence_args(task),
+    )
+    monkeypatch.setattr(
+        runner.cluster_mod,
+        "ensure_cluster",
+        lambda: pytest.fail("cooperative task reached cluster setup"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "ensure_image",
+        lambda *args, **kwargs: pytest.fail("cooperative task reached image import"),
+    )
+
+    with pytest.raises(ValueError, match="require isolated-black-box"):
+        runner.prepare_governed_execution(
+            task,
+            agent=AGENT,
+            model=MODEL,
+            run_scans=True,
+            run_judge=True,
+            request=request,
+            bundle=bundle,
+            preflight_decision=preflight,
+        )
+
+
+def test_governed_prepare_fails_before_cluster_without_platform_approval(monkeypatch):
+    task = load_task("example-todo-api")
+    request = EvaluationRequest.model_validate(_request_data(task.id))
+    bundle = GovernanceBundle.model_validate(_policy_data())
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
+    preflight = evaluate_admission(
+        request,
+        bundle,
+        actual_task_id=task.id,
+        actual_agent=AGENT,
+        actual_model=MODEL,
+        trials=1,
+        network_mode=task.network.agent_mode,
+        agent_timeout_seconds=task.timeouts.agent_seconds,
+        eval_timeout_seconds=task.timeouts.eval_seconds,
+        broker_configured=False,
+        effective_egress_domains=domains,
+        proxy_image=proxy_image,
+        **_task_evidence_args(task),
+    )
+    monkeypatch.setattr(runner, "_docker_platform", lambda: "linux/arm64")
+    monkeypatch.setattr(
+        runner.cluster_mod,
+        "ensure_cluster",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("cluster must not start without an approved image")
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="no preapproved image for platform linux/arm64",
+    ):
+        runner.prepare_governed_execution(
+            task,
+            agent=AGENT,
+            model=MODEL,
+            run_scans=True,
+            run_judge=True,
+            request=request,
+            bundle=bundle,
+            preflight_decision=preflight,
+        )
+
+
+def test_post_binding_retag_fails_before_credentials_or_runtime(monkeypatch, tmp_path):
+    task = load_task("example-todo-api")
+    request = EvaluationRequest.model_validate(_request_data(task.id))
+    bundle = GovernanceBundle.model_validate(_policy_data())
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
+    preflight = evaluate_admission(
+        request,
+        bundle,
+        actual_task_id=task.id,
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=1,
         network_mode=task.network.agent_mode,
@@ -549,7 +876,7 @@ def test_post_binding_retag_fails_before_credentials_or_runtime(monkeypatch, tmp
     monkeypatch.setattr(runner, "_capture_provenance", lambda *args: None)
     monkeypatch.setattr(runner, "_persist_run", lambda *args: None)
 
-    adapter = type("Adapter", (), {"name": "codex"})()
+    adapter = type("Adapter", (), {"name": AGENT})()
     record = runner.run_agent_trial(
         task,
         adapter,
@@ -575,7 +902,7 @@ def test_execution_decision_without_preflight_triplet_is_rejected():
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=1,
         network_mode=task.network.agent_mode,
@@ -589,7 +916,7 @@ def test_execution_decision_without_preflight_triplet_is_rejected():
     with pytest.raises(ValueError, match="execution decision requires"):
         runner.run_agent_trial(
             task,
-            type("Adapter", (), {"name": "codex"})(),
+            type("Adapter", (), {"name": AGENT})(),
             governance_execution_decision=execution,
         )
 
@@ -598,12 +925,12 @@ def test_execution_decision_cannot_escalate_preflight_trial_scope():
     task = load_task("example-todo-api")
     request = EvaluationRequest.model_validate(_request_data(task.id))
     bundle = GovernanceBundle.model_validate(_policy_data(max_trials=3))
-    domains, proxy_image = runner._governance_network_evidence(task, "codex")
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
     preflight = evaluate_admission(
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=1,
         network_mode=task.network.agent_mode,
@@ -619,7 +946,7 @@ def test_execution_decision_cannot_escalate_preflight_trial_scope():
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=2,
         network_mode=task.network.agent_mode,
@@ -627,6 +954,8 @@ def test_execution_decision_cannot_escalate_preflight_trial_scope():
         eval_timeout_seconds=task.timeouts.eval_seconds,
         broker_configured=False,
         run_scans=admitted["run_scans"],
+        scanner_identity_sha256=admitted["scanner_identity_sha256"],
+        scanner_promotion_ready=admitted["scanner_promotion_ready"],
         run_judge=admitted["run_judge"],
         judge_backend=admitted["judge_backend"],
         judge_model=admitted["judge_model"],
@@ -646,7 +975,7 @@ def test_execution_decision_cannot_escalate_preflight_trial_scope():
     with pytest.raises(ValueError, match="broadens or changes"):
         runner._validate_governance_decision(
             task,
-            agent="codex",
+            agent=AGENT,
             model=MODEL,
             trial=1,
             run_scans=True,
@@ -673,8 +1002,9 @@ class _SuccessfulAgentPod:
     def image_digest(self):
         return IMAGE_DIGEST
 
-    def image_manifest_digest(self, image_ref):
+    def image_manifest_digest(self, image_ref, *, expected_manifest_digest=None):
         assert image_ref == IMAGE_REF
+        assert expected_manifest_digest == IMAGE_DIGEST
         return IMAGE_DIGEST
 
     def copy_dir_to(self, local_dir, remote_dir):
@@ -720,12 +1050,14 @@ def test_governed_run_writes_ordered_privacy_safe_audit_and_applies_budget(
         }
     )
     request = EvaluationRequest.model_validate(_request_data(task.id))
-    bundle = GovernanceBundle.model_validate(_policy_data(network_modes=["open"]))
+    bundle = GovernanceBundle.model_validate(
+        _policy_data(registered_task=task, network_modes=["open"])
+    )
     decision = evaluate_admission(
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=1,
         network_mode="open",
@@ -737,7 +1069,7 @@ def test_governed_run_writes_ordered_privacy_safe_audit_and_applies_budget(
     assert decision.allowed is True
 
     class Adapter:
-        name = "codex"
+        name = AGENT
         env = {}
 
         def build_command(self, model=None):
@@ -784,14 +1116,7 @@ def test_governed_run_writes_ordered_privacy_safe_audit_and_applies_budget(
         return None
 
     monkeypatch.setattr(runner, "load_trial_credentials", fake_credentials)
-    governed_build_roots = []
-
-    def fake_governed_build(governed_task):
-        governed_build_roots.append(governed_task.path)
-        assert governed_task.path != task.path
-        return runner._BuiltImage(IMAGE_REF, IMAGE_DIGEST, IMAGE_PLATFORM)
-
-    monkeypatch.setattr(runner, "_build_governed_image", fake_governed_build)
+    monkeypatch.setattr(runner, "_docker_platform", lambda: IMAGE_PLATFORM)
     monkeypatch.setattr(
         runner,
         "ensure_image",
@@ -829,11 +1154,13 @@ def test_governed_run_writes_ordered_privacy_safe_audit_and_applies_budget(
             governed_task.tests_dir / source_test_relative
         ).read_bytes() == admitted_test_bytes
         return EvalTestResults(
+            evaluation_mode="isolated-black-box",
             total=1,
             passed=1,
             command_exit_code=0,
             coverage_percent=100.0,
             runtime_image_digest=IMAGE_DIGEST,
+            submission_runtime_image_digest=IMAGE_DIGEST,
         )
 
     monkeypatch.setattr(runner, "run_eval_phase", fake_eval)
@@ -847,15 +1174,7 @@ def test_governed_run_writes_ordered_privacy_safe_audit_and_applies_budget(
     monkeypatch.setattr(
         scanners,
         "run_scanners",
-        lambda *args, **kwargs: ScanResults(
-            lint_errors=0,
-            sec_findings_high=0,
-            sec_findings_medium=0,
-            sec_findings_low=0,
-            secrets_found=0,
-            vulns=0,
-            scanner_status={"ruff": "ok", "semgrep": "ok", "gitleaks": "ok"},
-        ),
+        lambda *args, **kwargs: SCANNER_RESULTS.model_copy(deep=True),
     )
 
     try:
@@ -885,8 +1204,6 @@ def test_governed_run_writes_ordered_privacy_safe_audit_and_applies_budget(
     assert pod.deleted is True
     assert record.outcome.status == "accepted"
     assert record.governance is not None
-    assert governed_build_roots
-    assert all(not root.exists() for root in governed_build_roots)
     assert record.governance.preflight_decision_id == decision.decision_id
     assert record.governance.decision_id != decision.decision_id
     assert record.governance.task_image_digest == IMAGE_DIGEST
@@ -968,7 +1285,7 @@ def test_persist_run_binds_governance_and_audit_artifacts(monkeypatch, tmp_path)
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=1,
         network_mode=task.network.agent_mode,
@@ -984,7 +1301,7 @@ def test_persist_run_binds_governance_and_audit_artifacts(monkeypatch, tmp_path)
     record = RunRecord(
         run_id="attested-governed-run",
         task_id=task.id,
-        agent="codex",
+        agent=AGENT,
         governance=evidence,
     )
     record.provenance.image_tag = record.governance.task_image_ref
@@ -1027,7 +1344,7 @@ def test_governed_model_identity_must_be_observed_exactly():
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=1,
         network_mode=task.network.agent_mode,
@@ -1040,7 +1357,7 @@ def test_governed_model_identity_must_be_observed_exactly():
     record = RunRecord(
         run_id="model-evidence",
         task_id=task.id,
-        agent="codex",
+        agent=AGENT,
         governance=GovernanceEvidence.from_decision(request, decision),
         efficiency=AgentMetrics(wall_time_s=1.0, model="provider-fallback"),
     )
@@ -1058,12 +1375,12 @@ def test_task_changed_after_admission_is_rejected_before_trial(tmp_path):
     task = load_task(source.id, tasks_root)
     request = EvaluationRequest.model_validate(_request_data(task.id))
     bundle = GovernanceBundle.model_validate(_policy_data())
-    domains, proxy_image = runner._governance_network_evidence(task, "codex")
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
     decision = evaluate_admission(
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=1,
         network_mode=task.network.agent_mode,
@@ -1080,7 +1397,7 @@ def test_task_changed_after_admission_is_rejected_before_trial(tmp_path):
     with pytest.raises(ValueError, match="runtime evidence"):
         runner._validate_governance_decision(
             task,
-            agent="codex",
+            agent=AGENT,
             model=MODEL,
             trial=1,
             run_scans=True,
@@ -1112,6 +1429,20 @@ def test_execution_digest_binds_scanner_and_judge_recipe():
     assert len({all_graders, no_judge, no_scans}) == 3
 
 
+def test_execution_digest_binds_cluster_runtime(monkeypatch):
+    task = load_task("example-todo-api")
+    monkeypatch.delenv("AGENT_EVAL_RUNTIME_CLASS", raising=False)
+    _, default_runtime = runner._governance_task_evidence(
+        task, run_scans=True, run_judge=True
+    )
+    monkeypatch.setenv("AGENT_EVAL_RUNTIME_CLASS", "gvisor")
+    _, hardened_runtime = runner._governance_task_evidence(
+        task, run_scans=True, run_judge=True
+    )
+
+    assert default_runtime != hardened_runtime
+
+
 def test_completion_recheck_fails_closed_if_governed_snapshot_changes(
     monkeypatch, tmp_path
 ):
@@ -1121,12 +1452,12 @@ def test_completion_recheck_fails_closed_if_governed_snapshot_changes(
     task = load_task(source.id, tasks_root)
     request = EvaluationRequest.model_validate(_request_data(task.id))
     bundle = GovernanceBundle.model_validate(_policy_data())
-    domains, proxy_image = runner._governance_network_evidence(task, "codex")
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
     decision = evaluate_admission(
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=1,
         network_mode=task.network.agent_mode,
@@ -1141,7 +1472,7 @@ def test_completion_recheck_fails_closed_if_governed_snapshot_changes(
     record = RunRecord(
         run_id="changed-governed-snapshot",
         task_id=task.id,
-        agent="codex",
+        agent=AGENT,
         governance=GovernanceEvidence.from_decision(request, decision),
         correctness=EvalTestResults(total=1, passed=1, command_exit_code=0),
     )
@@ -1159,12 +1490,12 @@ def test_completion_requires_admitted_judge_evidence(monkeypatch):
     task = load_task("example-todo-api")
     request = EvaluationRequest.model_validate(_request_data(task.id))
     bundle = GovernanceBundle.model_validate(_policy_data())
-    domains, proxy_image = runner._governance_network_evidence(task, "codex")
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
     decision = evaluate_admission(
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=1,
         network_mode=task.network.agent_mode,
@@ -1179,7 +1510,7 @@ def test_completion_requires_admitted_judge_evidence(monkeypatch):
     record = RunRecord(
         run_id="missing-governed-judge",
         task_id=task.id,
-        agent="codex",
+        agent=AGENT,
         governance=GovernanceEvidence.from_decision(request, decision),
         correctness=EvalTestResults(total=1, passed=1, command_exit_code=0),
     )
@@ -1191,16 +1522,123 @@ def test_completion_requires_admitted_judge_evidence(monkeypatch):
     assert "governed judge evidence is missing" in completed.efficiency.infra_error
 
 
+def test_completion_rejects_a_scanner_identity_different_from_admission(monkeypatch):
+    task = load_task("example-todo-api")
+    request = EvaluationRequest.model_validate(_request_data(task.id))
+    bundle = GovernanceBundle.model_validate(_policy_data())
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
+    preflight = evaluate_admission(
+        request,
+        bundle,
+        actual_task_id=task.id,
+        actual_agent=AGENT,
+        actual_model=MODEL,
+        trials=1,
+        network_mode=task.network.agent_mode,
+        agent_timeout_seconds=task.timeouts.agent_seconds,
+        eval_timeout_seconds=task.timeouts.eval_seconds,
+        broker_configured=False,
+        effective_egress_domains=domains,
+        proxy_image=proxy_image,
+        **_task_evidence_args(task, run_judge=False),
+    )
+    decision = _execution_from_preflight(request, bundle, preflight)
+    mismatched_scans = SCANNER_RESULTS.model_copy(deep=True)
+    mismatched_scans.scanner_runtime_environment_sha256 = "0" * 64
+    mismatched_scans.scanner_assurance = scanners.scanner_assurance_identity(
+        mismatched_scans
+    )
+    mismatched_scans = ScanResults.model_validate(
+        mismatched_scans.model_dump(mode="python")
+    )
+    record = RunRecord(
+        run_id="mismatched-governed-scanner",
+        task_id=task.id,
+        agent=AGENT,
+        governance=GovernanceEvidence.from_decision(request, decision),
+        correctness=EvalTestResults(
+            evaluation_mode="isolated-black-box",
+            total=1,
+            passed=1,
+            command_exit_code=0,
+        ),
+        scans=mismatched_scans,
+    )
+    monkeypatch.setattr(runner, "_persist_run", lambda *args, **kwargs: None)
+
+    completed = runner._complete_record(task, record, audit=None)
+
+    assert completed.outcome.status == "infra_error"
+    assert "scanner assurance identity does not match" in (
+        completed.efficiency.infra_error
+    )
+
+
+def test_governed_snapshot_is_removed_when_run_setup_raises(monkeypatch):
+    task = load_task("example-todo-api")
+    request = EvaluationRequest.model_validate(_request_data(task.id))
+    bundle = GovernanceBundle.model_validate(_policy_data())
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
+    preflight = evaluate_admission(
+        request,
+        bundle,
+        actual_task_id=task.id,
+        actual_agent=AGENT,
+        actual_model=MODEL,
+        trials=1,
+        network_mode=task.network.agent_mode,
+        agent_timeout_seconds=task.timeouts.agent_seconds,
+        eval_timeout_seconds=task.timeouts.eval_seconds,
+        broker_configured=False,
+        effective_egress_domains=domains,
+        proxy_image=proxy_image,
+        **_task_evidence_args(task, run_judge=False),
+    )
+    execution = _execution_from_preflight(request, bundle, preflight)
+    snapshot_paths = []
+    real_snapshot = runner._snapshot_governed_task
+
+    def capture_snapshot(*args, **kwargs):
+        snapshot = real_snapshot(*args, **kwargs)
+        snapshot_paths.append(snapshot.path)
+        return snapshot
+
+    monkeypatch.setattr(runner, "_snapshot_governed_task", capture_snapshot)
+
+    def fail_prepare(*args, **kwargs):
+        del args, kwargs
+        raise OSError("injected")
+
+    monkeypatch.setattr(runner, "prepare_run_dir", fail_prepare)
+    adapter = type("Adapter", (), {"name": AGENT, "env": {}})()
+
+    with pytest.raises(OSError, match="injected"):
+        runner.run_agent_trial(
+            task,
+            adapter,
+            model=MODEL,
+            run_scans=True,
+            run_judge=False,
+            governance_request=request,
+            governance_bundle=bundle,
+            governance_decision=preflight,
+            governance_execution_decision=execution,
+        )
+
+    assert snapshot_paths
+    assert all(not path.exists() for path in snapshot_paths)
+
+
 def test_audit_lifecycle_rejects_skipped_admitted_judge(tmp_path):
     task = load_task("example-todo-api")
     request = EvaluationRequest.model_validate(_request_data(task.id))
     bundle = GovernanceBundle.model_validate(_policy_data())
-    domains, proxy_image = runner._governance_network_evidence(task, "codex")
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
     decision = evaluate_admission(
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=1,
         network_mode=task.network.agent_mode,
@@ -1215,7 +1653,7 @@ def test_audit_lifecycle_rejects_skipped_admitted_judge(tmp_path):
     record = RunRecord(
         run_id="skipped-governed-judge",
         task_id=task.id,
-        agent="codex",
+        agent=AGENT,
         trial=1,
         governance=GovernanceEvidence.from_decision(request, decision),
         outcome=RunOutcome(status="infra_error", reasons=["missing judge"]),
@@ -1251,12 +1689,15 @@ def test_audit_lifecycle_rejects_skipped_admitted_judge(tmp_path):
                 "policy_id": decision.policy_id,
                 "policy_revision": decision.policy_revision,
                 "policy_digest": decision.policy_digest,
+                "task_registry_id": decision.task_registry_id,
+                "task_registry_revision": decision.task_registry_revision,
+                "task_registry_digest": decision.task_registry_digest,
                 "registry_id": decision.registry_id,
                 "registry_revision": decision.registry_revision,
                 "registry_digest": decision.registry_digest,
             },
         )
-        audit.append("agent.started", {"agent": "codex", "model": MODEL, "trial": 1})
+        audit.append("agent.started", {"agent": AGENT, "model": MODEL, "trial": 1})
         audit.append("agent.completed", {"status": "completed"})
         audit.append("cleanup.completed", {"status": "completed"})
         audit.append("evaluation.started", {"task_id": task.id, "trial": 1})
@@ -1278,12 +1719,12 @@ def test_audit_lifecycle_rejects_completed_judge_without_score(tmp_path):
     task = load_task("example-todo-api")
     request = EvaluationRequest.model_validate(_request_data(task.id))
     bundle = GovernanceBundle.model_validate(_policy_data())
-    domains, proxy_image = runner._governance_network_evidence(task, "codex")
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
     decision = evaluate_admission(
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=1,
         network_mode=task.network.agent_mode,
@@ -1298,7 +1739,7 @@ def test_audit_lifecycle_rejects_completed_judge_without_score(tmp_path):
     record = RunRecord(
         run_id="scoreless-governed-judge",
         task_id=task.id,
-        agent="codex",
+        agent=AGENT,
         trial=1,
         governance=GovernanceEvidence.from_decision(request, decision),
         outcome=RunOutcome(status="infra_error", reasons=["missing judge score"]),
@@ -1335,12 +1776,15 @@ def test_audit_lifecycle_rejects_completed_judge_without_score(tmp_path):
                 "policy_id": decision.policy_id,
                 "policy_revision": decision.policy_revision,
                 "policy_digest": decision.policy_digest,
+                "task_registry_id": decision.task_registry_id,
+                "task_registry_revision": decision.task_registry_revision,
+                "task_registry_digest": decision.task_registry_digest,
                 "registry_id": decision.registry_id,
                 "registry_revision": decision.registry_revision,
                 "registry_digest": decision.registry_digest,
             },
         )
-        audit.append("agent.started", {"agent": "codex", "model": MODEL, "trial": 1})
+        audit.append("agent.started", {"agent": AGENT, "model": MODEL, "trial": 1})
         audit.append("agent.completed", {"status": "completed"})
         audit.append("cleanup.completed", {"status": "completed"})
         audit.append("evaluation.started", {"task_id": task.id, "trial": 1})
@@ -1375,7 +1819,7 @@ def test_missing_governed_attestation_prerequisites_fail_closed(monkeypatch, tmp
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=1,
         network_mode=task.network.agent_mode,
@@ -1389,7 +1833,7 @@ def test_missing_governed_attestation_prerequisites_fail_closed(monkeypatch, tmp
     record = RunRecord(
         run_id="missing-provenance",
         task_id=task.id,
-        agent="codex",
+        agent=AGENT,
         governance=GovernanceEvidence.from_decision(request, decision),
         correctness=EvalTestResults(total=1, passed=1, command_exit_code=0),
     )
@@ -1409,7 +1853,7 @@ def test_audit_cli_accepts_valid_chain_and_rejects_tampering(tmp_path):
     with AuditChain(audit_path, "run-1", trace_id="1" * 32) as chain:
         chain.append(
             "agent.started",
-            {"agent": "codex", "model": MODEL, "trial": 1},
+            {"agent": AGENT, "model": MODEL, "trial": 1},
         )
         chain.append("run.completed", {"status": "accepted"})
         final_hash = chain.final_hash
@@ -1452,12 +1896,12 @@ def test_verify_run_replays_policy_and_governed_lifecycle(monkeypatch, tmp_path)
     task = load_task("example-todo-api")
     request = EvaluationRequest.model_validate(_request_data(task.id))
     bundle = GovernanceBundle.model_validate(_policy_data())
-    domains, proxy_image = runner._governance_network_evidence(task, "codex")
+    domains, proxy_image = runner._governance_network_evidence(task, AGENT)
     decision = evaluate_admission(
         request,
         bundle,
         actual_task_id=task.id,
-        actual_agent="codex",
+        actual_agent=AGENT,
         actual_model=MODEL,
         trials=1,
         network_mode=task.network.agent_mode,
@@ -1474,13 +1918,17 @@ def test_verify_run_replays_policy_and_governed_lifecycle(monkeypatch, tmp_path)
     record = RunRecord(
         run_id="verified-governed-run",
         task_id=task.id,
-        agent="codex",
+        agent=AGENT,
         trial=1,
+        started_at="2026-07-14T19:00:00+00:00",
+        finished_at="2026-07-14T19:01:00+00:00",
         governance=GovernanceEvidence.from_decision(request, decision),
         outcome=RunOutcome(status="infra_error", reasons=["fixture"]),
+        scans=SCANNER_RESULTS.model_copy(deep=True),
     )
     record.efficiency.requested_model = MODEL
     record.efficiency.infra_error = "fixture"
+    record.correctness.evaluation_mode = "isolated-black-box"
     record.run_dir.mkdir(parents=True)
     write_canonical_json(record.run_dir / "governance-request.json", request)
     write_canonical_json(record.run_dir / "policy-bundle.json", bundle)
@@ -1518,12 +1966,15 @@ def test_verify_run_replays_policy_and_governed_lifecycle(monkeypatch, tmp_path)
                 "policy_id": decision.policy_id,
                 "policy_revision": decision.policy_revision,
                 "policy_digest": decision.policy_digest,
+                "task_registry_id": decision.task_registry_id,
+                "task_registry_revision": decision.task_registry_revision,
+                "task_registry_digest": decision.task_registry_digest,
                 "registry_id": decision.registry_id,
                 "registry_revision": decision.registry_revision,
                 "registry_digest": decision.registry_digest,
             },
         )
-        audit.append("agent.started", {"agent": "codex", "model": MODEL, "trial": 1})
+        audit.append("agent.started", {"agent": AGENT, "model": MODEL, "trial": 1})
         audit.append("agent.completed", {"status": "infrastructure_error"})
         audit.append("cleanup.completed", {"status": "completed"})
         audit.append("outcome.decided", {"status": "infra_error"})
@@ -1539,12 +1990,108 @@ def test_verify_run_replays_policy_and_governed_lifecycle(monkeypatch, tmp_path)
     record.provenance.harness_commit = git.sha
     record.provenance.harness_dirty = git.dirty
     record.provenance.harness_worktree_sha256 = git.worktree_sha256
+    effective_task = runner._governed_task(task, decision)
+    record.assessments = derive_assessments(record, effective_task)
 
     assert runner._persist_run(task, record) is None
     result = CliRunner().invoke(cli.app, ["verify-run", "--run", record.run_id])
 
     assert result.exit_code == 0, result.output
     assert "verified" in result.output
+
+    with metrics._connect() as connection:
+        connection.execute(
+            "UPDATE assessments SET status = 'failed' "
+            "WHERE assessment_id = ("
+            "SELECT assessment_id FROM assessments WHERE run_id = ? LIMIT 1"
+            ")",
+            (record.run_id,),
+        )
+    assessment_tamper = CliRunner().invoke(
+        cli.app,
+        ["verify-run", "--run", record.run_id],
+    )
+    assert assessment_tamper.exit_code == 2
+    assert "normalized assessments differ" in assessment_tamper.output
+    assert runner._persist_run(task, record) is None
+
+    with metrics._connect() as connection:
+        connection.execute(
+            "UPDATE runs SET tests_passed = 999, tests_total = 999, cost_usd = 0 "
+            "WHERE run_id = ?",
+            (record.run_id,),
+        )
+    run_projection_tamper = CliRunner().invoke(
+        cli.app,
+        ["verify-run", "--run", record.run_id],
+    )
+    assert run_projection_tamper.exit_code == 2
+    assert "run projection differs" in run_projection_tamper.output
+    assert runner._persist_run(task, record) is None
+
+    resolved_assessment = next(
+        assessment
+        for assessment in record.assessments
+        if assessment.name == "tests.resolved"
+    )
+    assert resolved_assessment.value is not None
+    record.assessments = [
+        (
+            assessment.model_copy(
+                update={
+                    "value": assessment.value.model_copy(update={"boolean": True})
+                }
+            )
+            if assessment.name == "tests.resolved" and assessment.value is not None
+            else assessment
+        )
+        for assessment in record.assessments
+    ]
+    assert runner._persist_run(task, record) is None
+    stale_envelope = CliRunner().invoke(
+        cli.app,
+        ["verify-run", "--run", record.run_id],
+    )
+    assert stale_envelope.exit_code == 2
+    assert "assessment envelope does not recompute" in stale_envelope.output
+    record.assessments = derive_assessments(record, effective_task)
+    assert runner._persist_run(task, record) is None
+
+    mismatched_scans = SCANNER_RESULTS.model_copy(deep=True)
+    mismatched_scans.scanner_runtime_environment_sha256 = "0" * 64
+    mismatched_scans.scanner_assurance = scanners.scanner_assurance_identity(
+        mismatched_scans
+    )
+    record.scans = ScanResults.model_validate(
+        mismatched_scans.model_dump(mode="python")
+    )
+    assert runner._persist_run(task, record) is None
+    scanner_mismatch = CliRunner().invoke(
+        cli.app, ["verify-run", "--run", record.run_id]
+    )
+    assert scanner_mismatch.exit_code == 2
+    assert "scanner assurance identity does not match" in scanner_mismatch.output
+    record.scans = SCANNER_RESULTS.model_copy(deep=True)
+    assert runner._persist_run(task, record) is None
+
+    stored = json.loads(record.model_dump_json())
+    stored["scans"]["scanner_assurance"][
+        "runtime_environment_sha256"
+    ] = "9" * 64
+    with metrics._connect() as connection:
+        connection.execute(
+            "UPDATE runs SET results_json = ? WHERE run_id = ?",
+            (json.dumps(stored), record.run_id),
+        )
+    scanner_material_tamper = CliRunner().invoke(
+        cli.app, ["verify-run", "--run", record.run_id]
+    )
+    assert scanner_material_tamper.exit_code == 2
+    assert "persisted run schema is invalid" in scanner_material_tamper.output
+    assert "identity_sha256 does not match its material" in (
+        scanner_material_tamper.output
+    )
+    assert runner._persist_run(task, record) is None
 
     audit_path = record.run_dir / "audit.jsonl"
     original_audit = audit_path.read_bytes()
@@ -1658,7 +2205,7 @@ def test_verify_run_rejects_unknown_persisted_result_fields(monkeypatch, tmp_pat
     record = RunRecord(
         run_id="unknown-result-field",
         task_id="example-todo-api",
-        agent="codex",
+        agent=AGENT,
     )
     metrics.save_run(record)
     stored = json.loads(record.model_dump_json())
@@ -1682,7 +2229,7 @@ def test_legacy_run_record_parses_without_governance_or_audit_fields():
             {
                 "run_id": "legacy-run",
                 "task_id": "example-todo-api",
-                "agent": "codex",
+                "agent": AGENT,
                 "trial": 1,
                 "provenance": {
                     "image_tag": "agent-eval/example:legacy",

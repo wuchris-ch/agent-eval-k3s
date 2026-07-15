@@ -20,8 +20,11 @@ def main() -> int:
     for entry_point in importlib.metadata.entry_points(group="pytest11"):
         plugins.append(entry_point.load())
 
-    os.chdir("/workspace")
-    sys.path.insert(0, "/workspace")
+    if os.environ.get("AGENT_EVAL_EVALUATION_MODE") == "isolated-black-box":
+        os.chdir("/tests")
+    else:
+        os.chdir("/workspace")
+        sys.path.insert(0, "/workspace")
     return pytest.main(sys.argv[1:], plugins=plugins)
 
 

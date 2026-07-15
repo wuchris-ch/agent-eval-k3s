@@ -10,25 +10,31 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from agent_eval import runner
 from agent_eval.governance import (
     DuplicateKeyError,
     EvaluationRequest,
     GovernanceBundle,
     GovernanceEvidence,
+    LegacyGovernanceEvidenceV1,
     canonical_json_bytes,
     evaluate_admission,
     load_evaluation_request,
     load_governance_bundle,
     sha256_json,
+    validate_execution_continuity,
     write_canonical_json,
 )
+from agent_eval.task import load_task
 
 PROXY_IMAGE = "ubuntu/squid@sha256:" + "a" * 64
+SCANNER_IDENTITY = "9" * 64
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def request_data(**overrides: object) -> dict[str, object]:
     data: dict[str, object] = {
-        "schema_version": "agent-eval.request/v1",
+        "schema_version": "agent-eval.request/v2",
         "request_id": "12345678-1234-5678-9234-567812345678",
         "idempotency_key": "nightly:payment-api:42",
         "tenant_id": "frontier-labs",
@@ -39,8 +45,8 @@ def request_data(**overrides: object) -> dict[str, object]:
         "model": "claude-sonnet-4-5-20250929",
         "data_classification": "confidential",
         "retention_class": "regulated",
-        "max_total_tokens": 1_000,
-        "max_cost_usd": 0.5,
+        "max_observed_total_tokens": 1_000,
+        "max_observed_cost_usd": 0.5,
         "labels": {"team": "payments", "purpose": "release gate"},
     }
     data.update(overrides)
@@ -55,6 +61,7 @@ def bundle_data(**rule_overrides: object) -> dict[str, object]:
         "allowed_network_modes": ["proxy"],
         "allowed_egress_domains": [".anthropic.com", ".claude.ai"],
         "allowed_proxy_images": [PROXY_IMAGE],
+        "allowed_scanner_identities": [SCANNER_IDENTITY],
         "allowed_data_classifications": ["internal", "confidential"],
         "allowed_retention_classes": ["ephemeral", "regulated"],
         "require_scans": True,
@@ -63,15 +70,41 @@ def bundle_data(**rule_overrides: object) -> dict[str, object]:
         "max_trials": 5,
         "max_agent_seconds": 600,
         "max_eval_seconds": 300,
-        "max_total_tokens": 2_000,
-        "max_cost_usd": 2.0,
+        "max_observed_total_tokens": 2_000,
+        "max_observed_cost_usd": 2.0,
     }
     rules.update(rule_overrides)
     return {
-        "schema_version": "agent-eval.policy/v1",
+        "schema_version": "agent-eval.policy/v2",
         "policy_id": "prod-evaluation",
         "revision": "2026-07-14.1",
         "rules": rules,
+        "task_registry": {
+            "registry_id": "frontier-tasks",
+            "revision": "2026-07-14",
+            "tasks": [
+                {
+                    "task_id": "repair-refund-race",
+                    "task_tree_sha256": "b" * 64,
+                    "execution_spec_digests": ["c" * 64],
+                    "approved_images": [
+                        {
+                            "platform": "linux/amd64",
+                            "reference": (
+                                "agent-eval/repair-refund-race:governed-"
+                                + "d" * 64
+                            ),
+                            "manifest_digest": "sha256:" + "d" * 64,
+                            "builder_id": "https://ci.example/builders/task-images",
+                            "build_type": "https://slsa.dev/container/v1",
+                            "source_revision": "commit-123",
+                            "provenance_sha256": "e" * 64,
+                        }
+                    ],
+                    "status": "approved",
+                }
+            ],
+        },
         "model_registry": {
             "registry_id": "frontier-models",
             "revision": "2026-07-14",
@@ -86,8 +119,8 @@ def bundle_data(**rule_overrides: object) -> dict[str, object]:
                         "internal",
                         "confidential",
                     ],
-                    "max_total_tokens": 1_500,
-                    "max_cost_usd": 1.0,
+                    "max_observed_total_tokens": 1_500,
+                    "max_observed_cost_usd": 1.0,
                 },
                 {
                     "adapter": "judge:claude",
@@ -128,6 +161,8 @@ def admission(
         "eval_timeout_seconds": 200,
         "broker_configured": True,
         "run_scans": True,
+        "scanner_identity_sha256": SCANNER_IDENTITY,
+        "scanner_promotion_ready": True,
         "run_judge": True,
         "judge_backend": "claude",
         "judge_model": "claude-sonnet-4-5-20250929",
@@ -137,6 +172,11 @@ def admission(
         "proxy_image": PROXY_IMAGE,
     }
     arguments.update(overrides)
+    if arguments["run_scans"] is not True:
+        if "scanner_identity_sha256" not in overrides:
+            arguments["scanner_identity_sha256"] = None
+        if "scanner_promotion_ready" not in overrides:
+            arguments["scanner_promotion_ready"] = False
     if arguments["run_judge"] is not True:
         arguments["judge_backend"] = None
         arguments["judge_model"] = None
@@ -177,22 +217,96 @@ def test_admission_allows_exact_runtime_and_uses_effective_minima():
         "max_trials": 5,
         "max_agent_seconds": 600,
         "max_eval_seconds": 300,
-        "max_total_tokens": 1_000,
-        "max_cost_usd": 0.5,
+        "max_observed_total_tokens": 1_000,
+        "max_observed_cost_usd": 0.5,
     }
     assert decision.matched_model is not None
     assert decision.matched_model.provider == "anthropic"
+    assert decision.matched_task is not None
+    assert decision.matched_task.task_tree_sha256 == "b" * 64
     assert isinstance(decision.decision_id, UUID)
     assert len(decision.trace_id) == 32
     assert decision.decided_at.utcoffset().total_seconds() == 0
 
 
+def test_execution_denies_an_image_not_preapproved_by_platform_and_digest():
+    data = bundle_data()
+    image = data["task_registry"]["tasks"][0]["approved_images"][0]  # type: ignore[index]
+    image["reference"] = "agent-eval/repair-refund-race:governed-" + "e" * 64
+    image["manifest_digest"] = "sha256:" + "e" * 64
+    governance_bundle = GovernanceBundle.model_validate(data)
+
+    decision = execution_admission(governance_bundle=governance_bundle)
+
+    assert decision.allowed is False
+    assert [reason.code for reason in decision.reasons] == [
+        "task_image_not_approved"
+    ]
+
+
+def test_execution_continuity_binds_entire_authorization_snapshot():
+    evaluation_request = request(
+        max_observed_total_tokens=None,
+        max_observed_cost_usd=None,
+    )
+    preflight_bundle = bundle()
+    preflight = admission(evaluation_request, preflight_bundle)
+
+    widened_data = bundle_data(
+        max_observed_total_tokens=40_000,
+        max_observed_cost_usd=40.0,
+    )
+    widened_data["revision"] = "2026-07-14.2"
+    widened_model = widened_data["model_registry"]["models"][0]  # type: ignore[index]
+    widened_model["max_observed_total_tokens"] = 40_000
+    widened_model["max_observed_cost_usd"] = 40.0
+    widened_bundle = GovernanceBundle.model_validate(widened_data)
+    execution = admission(
+        evaluation_request,
+        widened_bundle,
+        decision_stage="execution",
+        task_image_digest="sha256:" + "d" * 64,
+        task_image_ref="agent-eval/repair-refund-race:governed-" + "d" * 64,
+        task_image_platform="linux/amd64",
+        preflight_decision_id=preflight.decision_id,
+        preflight_decision_digest=sha256_json(preflight),
+    )
+
+    assert preflight.allowed and execution.allowed
+    assert (
+        execution.effective_limits.max_observed_total_tokens
+        > preflight.effective_limits.max_observed_total_tokens
+    )
+    with pytest.raises(ValueError, match="authorization snapshot"):
+        validate_execution_continuity(preflight, execution)
+
+
+def test_execution_continuity_accepts_only_image_bound_finalization():
+    evaluation_request = request()
+    governance_bundle = bundle()
+    preflight = admission(evaluation_request, governance_bundle)
+    execution = admission(
+        evaluation_request,
+        governance_bundle,
+        decision_stage="execution",
+        task_image_digest="sha256:" + "d" * 64,
+        task_image_ref="agent-eval/repair-refund-race:governed-" + "d" * 64,
+        task_image_platform="linux/amd64",
+        preflight_decision_id=preflight.decision_id,
+        preflight_decision_digest=sha256_json(preflight),
+    )
+
+    validate_execution_continuity(preflight, execution)
+
+
 def test_request_limits_are_optional_and_harder_limits_still_apply():
-    decision = admission(request(max_total_tokens=None, max_cost_usd=None))
+    decision = admission(
+        request(max_observed_total_tokens=None, max_observed_cost_usd=None)
+    )
 
     assert decision.allowed is True
-    assert decision.effective_limits.max_total_tokens == 1_500
-    assert decision.effective_limits.max_cost_usd == 1.0
+    assert decision.effective_limits.max_observed_total_tokens == 1_500
+    assert decision.effective_limits.max_observed_cost_usd == 1.0
 
 
 def test_governed_judge_requires_observable_registered_runtime_identity():
@@ -202,6 +316,37 @@ def test_governed_judge_requires_observable_registered_runtime_identity():
     assert [reason.code for reason in missing.reasons] == ["judge_identity_required"]
     assert [reason.code for reason in codex.reasons] == [
         "judge_model_observation_unsupported"
+    ]
+
+
+def test_governed_codex_coding_is_denied_before_runtime_side_effects():
+    data = bundle_data()
+    data["model_registry"]["models"].append(  # type: ignore[index]
+        {
+            "adapter": "codex",
+            "model": "gpt-5.4",
+            "provider": "openai",
+            "status": "approved",
+            "allowed_data_classifications": [
+                "public",
+                "internal",
+                "confidential",
+            ],
+            "max_observed_total_tokens": 1_500,
+            "max_observed_cost_usd": 1.0,
+        }
+    )
+    decision = admission(
+        request(agent="codex", model="gpt-5.4"),
+        GovernanceBundle.model_validate(data),
+        actual_agent="codex",
+        actual_model="gpt-5.4",
+        run_judge=False,
+    )
+
+    assert decision.allowed is False
+    assert [reason.code for reason in decision.reasons] == [
+        "coding_model_observation_unsupported"
     ]
 
 
@@ -220,11 +365,13 @@ def test_judge_registry_identity_cannot_be_used_as_a_coding_agent():
 
 
 def test_caller_ceiling_above_policy_is_clamped_not_treated_as_entitlement():
-    decision = admission(request(max_total_tokens=99_999, max_cost_usd=99.0))
+    decision = admission(
+        request(max_observed_total_tokens=99_999, max_observed_cost_usd=99.0)
+    )
 
     assert decision.allowed is True
-    assert decision.effective_limits.max_total_tokens == 1_500
-    assert decision.effective_limits.max_cost_usd == 1.0
+    assert decision.effective_limits.max_observed_total_tokens == 1_500
+    assert decision.effective_limits.max_observed_cost_usd == 1.0
 
 
 def test_admission_accumulates_denials_in_stable_order():
@@ -242,6 +389,7 @@ def test_admission_accumulates_denials_in_stable_order():
 
     assert decision.allowed is False
     assert [reason.code for reason in decision.reasons] == [
+        "task_not_registered",
         "task_mismatch",
         "agent_mismatch",
         "model_mismatch",
@@ -325,6 +473,26 @@ def test_required_grader_phases_fail_closed():
     assert [reason.code for reason in without_judge.reasons] == ["judge_required"]
 
 
+def test_scanner_identity_must_be_approved_and_promotion_ready():
+    unapproved = admission(scanner_identity_sha256="8" * 64)
+    incomplete = admission(scanner_promotion_ready=False)
+
+    assert [reason.code for reason in unapproved.reasons] == [
+        "scanner_identity_not_allowed"
+    ]
+    assert [reason.code for reason in incomplete.reasons] == [
+        "scanner_identity_incomplete"
+    ]
+
+
+def test_required_scans_require_a_nonempty_scanner_allowlist():
+    data = bundle_data()
+    data["rules"]["allowed_scanner_identities"] = []  # type: ignore[index]
+
+    with pytest.raises(ValidationError, match="approved scanner identity"):
+        GovernanceBundle.model_validate(data)
+
+
 def test_governed_judge_requires_secret_screening_even_when_scans_are_optional():
     decision = admission(
         governance_bundle=bundle(require_scans=False),
@@ -405,6 +573,37 @@ def test_decision_digests_bind_request_policy_and_registry_separately():
     assert first.registry_digest != changed_registry.registry_digest
 
 
+def test_admission_requires_exact_approved_task_content_and_execution_spec():
+    wrong_tree = admission(task_tree_sha256="d" * 64)
+    wrong_execution = admission(execution_spec_digest="e" * 64)
+    missing = admission(actual_task_id="unregistered-task")
+
+    assert [reason.code for reason in wrong_tree.reasons] == [
+        "task_tree_not_approved"
+    ]
+    assert [reason.code for reason in wrong_execution.reasons] == [
+        "execution_spec_not_approved"
+    ]
+    assert "task_not_registered" in [reason.code for reason in missing.reasons]
+
+
+def test_task_registry_digest_is_independent_and_task_status_fails_closed():
+    first = admission()
+    data = bundle_data()
+    data["task_registry"]["revision"] = "2026-07-15"  # type: ignore[index]
+    changed = admission(governance_bundle=GovernanceBundle.model_validate(data))
+    blocked_data = bundle_data()
+    blocked_data["task_registry"]["tasks"][0]["status"] = "blocked"  # type: ignore[index]
+    blocked = admission(
+        governance_bundle=GovernanceBundle.model_validate(blocked_data)
+    )
+
+    assert first.task_registry_digest != changed.task_registry_digest
+    assert first.policy_digest == changed.policy_digest
+    assert first.registry_digest == changed.registry_digest
+    assert [reason.code for reason in blocked.reasons] == ["task_blocked"]
+
+
 def test_sanitized_input_omits_identity_idempotency_and_labels():
     decision = admission()
 
@@ -427,10 +626,46 @@ def test_evidence_marks_asserted_identity_unverified_and_carries_limits():
     assert evidence.data_classification == "confidential"
     assert evidence.reason_codes == ["admitted"]
     assert evidence.policy_digest == decision.policy_digest
+    assert evidence.task_registry_digest == decision.task_registry_digest
     assert evidence.registry_digest == decision.registry_digest
     assert evidence.task_image_digest == "sha256:" + "d" * 64
     assert evidence.preflight_decision_id == decision.preflight_decision_id
     assert evidence.effective_limits == decision.effective_limits
+
+
+def test_legacy_evidence_remains_readable_without_inventing_task_approval():
+    evaluation_request = request()
+    current = GovernanceEvidence.from_decision(
+        evaluation_request, execution_admission(evaluation_request)
+    ).model_dump(mode="json")
+    current["schema_version"] = "agent-eval.governance-evidence/v1"
+    for field in (
+        "task_registry_id",
+        "task_registry_revision",
+        "task_registry_digest",
+        "matched_task",
+        "scanner_identity_sha256",
+        "scanner_promotion_ready",
+    ):
+        current.pop(field)
+    current["effective_limits"]["max_total_tokens"] = current["effective_limits"].pop(
+        "max_observed_total_tokens"
+    )
+    current["effective_limits"]["max_cost_usd"] = current["effective_limits"].pop(
+        "max_observed_cost_usd"
+    )
+    current["matched_model"]["max_total_tokens"] = current["matched_model"].pop(
+        "max_observed_total_tokens"
+    )
+    current["matched_model"]["max_cost_usd"] = current["matched_model"].pop(
+        "max_observed_cost_usd"
+    )
+
+    legacy = LegacyGovernanceEvidenceV1.model_validate_json(json.dumps(current))
+
+    assert legacy.schema_version == "agent-eval.governance-evidence/v1"
+    assert legacy.task_tree_sha256 == "b" * 64
+    assert "task_registry_id" not in legacy.model_dump()
 
 
 def test_preflight_cannot_be_materialized_as_execution_evidence():
@@ -457,8 +692,8 @@ def test_evidence_rejects_decision_for_another_request():
         ({"request_id": "not-a-uuid"}, "request_id"),
         ({"tenant_id": "has whitespace"}, "tenant_id"),
         ({"model": "gpt-*"}, "model"),
-        ({"max_total_tokens": "1000"}, "max_total_tokens"),
-        ({"max_cost_usd": math.inf}, "max_cost_usd"),
+        ({"max_observed_total_tokens": "1000"}, "max_observed_total_tokens"),
+        ({"max_observed_cost_usd": math.inf}, "max_observed_cost_usd"),
         ({"labels": {"bad key": "value"}}, "labels"),
         ({"unexpected": True}, "unexpected"),
     ],
@@ -485,26 +720,26 @@ def test_registry_requires_unique_exact_adapter_model_entries():
 def test_judge_registry_rejects_unenforceable_local_spend_limits():
     data = bundle_data()
     judge = data["model_registry"]["models"][1]  # type: ignore[index]
-    judge["max_total_tokens"] = 8_000
+    judge["max_observed_total_tokens"] = 8_000
 
-    with pytest.raises(ValidationError, match="max_total_tokens"):
+    with pytest.raises(ValidationError, match="max_observed_total_tokens"):
         GovernanceBundle.model_validate(data)
 
 
 def test_coding_model_registry_requires_hard_budget_ceilings():
     data = bundle_data()
     model = data["model_registry"]["models"][0]  # type: ignore[index]
-    del model["max_cost_usd"]
+    del model["max_observed_cost_usd"]
 
-    with pytest.raises(ValidationError, match="max_cost_usd"):
+    with pytest.raises(ValidationError, match="max_observed_cost_usd"):
         GovernanceBundle.model_validate(data)
 
 
 def test_policy_rejects_duplicate_enum_allowlist_and_nonfinite_budget():
     with pytest.raises(ValidationError, match="must not contain duplicates"):
         bundle(allowed_network_modes=["proxy", "proxy"])
-    with pytest.raises(ValidationError, match="max_cost_usd"):
-        bundle(max_cost_usd=float("nan"))
+    with pytest.raises(ValidationError, match="max_observed_cost_usd"):
+        bundle(max_observed_cost_usd=float("nan"))
 
 
 @pytest.mark.parametrize("pattern", ["tenant[", "tenant]", "tenant[]", "tenant[!]"])
@@ -530,6 +765,53 @@ def test_loaders_accept_valid_yaml(tmp_path: Path):
 
     assert loaded_request.request_id == UUID(request_data()["request_id"])
     assert loaded_bundle.policy_id == "prod-evaluation"
+
+
+def test_checked_in_governance_examples_load_and_bind_current_task_recipe():
+    governance_bundle = load_governance_bundle(
+        REPO_ROOT / "examples" / "governance" / "policy.yaml"
+    )
+    evaluation_request = load_evaluation_request(
+        REPO_ROOT / "examples" / "governance" / "request.yaml"
+    )
+    task = load_task("example-todo-api")
+    tree_digest, execution_digest = runner._governance_task_evidence(
+        task,
+        run_scans=True,
+        run_judge=True,
+    )
+    entry = governance_bundle.task_registry.tasks[0]
+
+    assert evaluation_request.task_id == task.id == entry.task_id
+    assert entry.task_tree_sha256 == tree_digest
+    assert entry.execution_spec_digests == [execution_digest]
+
+
+def test_loader_normalizes_strict_legacy_v1_request_limits(tmp_path: Path):
+    legacy = request_data()
+    legacy["schema_version"] = "agent-eval.request/v1"
+    legacy["max_total_tokens"] = legacy.pop("max_observed_total_tokens")
+    legacy["max_cost_usd"] = legacy.pop("max_observed_cost_usd")
+    request_path = tmp_path / "legacy-request.yaml"
+    request_path.write_text(yaml.safe_dump(legacy), encoding="utf-8")
+
+    loaded = load_evaluation_request(request_path)
+
+    assert loaded.schema_version == "agent-eval.request/v2"
+    assert loaded.max_observed_total_tokens == 1_000
+    assert loaded.max_observed_cost_usd == 0.5
+    with pytest.raises(ValidationError, match="schema_version"):
+        EvaluationRequest.model_validate(legacy)
+
+
+def test_policy_v1_requires_explicit_security_migration(tmp_path: Path):
+    legacy = bundle_data()
+    legacy["schema_version"] = "agent-eval.policy/v1"
+    policy_path = tmp_path / "legacy-policy.yaml"
+    policy_path.write_text(yaml.safe_dump(legacy), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cannot be normalized safely"):
+        load_governance_bundle(policy_path)
 
 
 @pytest.mark.parametrize("loader", [load_evaluation_request, load_governance_bundle])
