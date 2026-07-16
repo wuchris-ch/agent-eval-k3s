@@ -1,107 +1,89 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 500" role="img" aria-labelledby="title description">
-  <title id="title">agent-eval-k3s assurance paths</title>
-  <desc id="description">Two restrained workflow lanes show pull-request review and coding-agent evaluation. Both collect independent evidence before producing an explicit result.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 410" role="img" aria-labelledby="title description">
+  <title id="title">How agent-eval works</title>
+  <desc id="description">A code review turns a change into a risk report. An agent evaluation turns a task into a scorecard. Metrics come from agent events, the evaluator, and the harness.</desc>
   <defs>
     <style>
       :root {
-        --canvas: #ffffff;
+        --background: #ffffff;
         --surface: #f8fafc;
-        --surface-strong: #f1f5f9;
-        --ink: #0f172a;
+        --text: #111827;
         --muted: #64748b;
-        --line: #cbd5e1;
-        --line-strong: #94a3b8;
-        --emphasis: #0f172a;
-        --emphasis-ink: #ffffff;
+        --border: #cbd5e1;
+        --arrow: #94a3b8;
       }
       @media (prefers-color-scheme: dark) {
         :root {
-          --canvas: #0b0f14;
-          --surface: #111820;
-          --surface-strong: #17202a;
-          --ink: #e5e7eb;
+          --background: #0b0f14;
+          --surface: #121820;
+          --text: #e5e7eb;
           --muted: #9ca3af;
-          --line: #334155;
-          --line-strong: #64748b;
-          --emphasis: #253140;
-          --emphasis-ink: #f8fafc;
+          --border: #334155;
+          --arrow: #64748b;
         }
       }
-      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: var(--ink); }
-      .canvas { fill: var(--canvas); }
-      .panel { fill: var(--surface); stroke: var(--line); stroke-width: 1; }
-      .panel-strong { fill: var(--surface-strong); }
-      .divider { stroke: var(--line); stroke-width: 1; }
-      .flow { stroke: var(--line-strong); stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
-      .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: .12em; fill: var(--muted); }
-      .title { font-size: 24px; font-weight: 650; letter-spacing: -.02em; }
-      .subtitle { font-size: 14px; fill: var(--muted); }
-      .lane-number { font-size: 28px; font-weight: 650; fill: var(--line-strong); }
-      .lane-name { font-size: 14px; font-weight: 700; letter-spacing: .08em; }
-      .lane-command { font-size: 13px; fill: var(--muted); }
-      .step-title { font-size: 16px; font-weight: 650; }
-      .step-detail { font-size: 13px; fill: var(--muted); }
-      .evidence { font-size: 12px; fill: var(--muted); }
-      .result { fill: var(--emphasis); }
-      .result-text, .step-detail.result-text { fill: var(--emphasis-ink); }
-      .principle { font-size: 13px; font-weight: 600; }
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: var(--text); }
+      .background { fill: var(--background); }
+      .box { fill: var(--surface); stroke: var(--border); stroke-width: 1; }
+      .line { fill: none; stroke: var(--arrow); stroke-width: 1.5; marker-end: url(#arrowhead); }
+      .rule { stroke: var(--border); stroke-width: 1; }
+      .title { font-size: 22px; font-weight: 650; }
+      .lane { font-size: 12px; font-weight: 700; letter-spacing: .1em; fill: var(--muted); }
+      .box-title { font-size: 15px; font-weight: 650; }
+      .detail { font-size: 12px; fill: var(--muted); }
+      .source-title { font-size: 13px; font-weight: 650; }
+      .source-detail { font-size: 11px; fill: var(--muted); }
+      .principle { font-size: 12px; font-weight: 600; fill: var(--muted); }
     </style>
-    <marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+    <marker id="arrowhead" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
       <path d="M0 0 7 3.5 0 7Z" fill="#94a3b8"/>
     </marker>
   </defs>
 
-  <rect class="canvas" width="1200" height="500"/>
+  <rect class="background" width="1200" height="410"/>
+  <text class="title" x="40" y="42">How it works</text>
 
-  <text class="eyebrow" x="40" y="34">SYSTEM OVERVIEW</text>
-  <text class="title" x="40" y="64">Two paths, one evidence rule</text>
-  <text class="subtitle" x="420" y="63">Machine-checkable evidence is collected before a decision is recorded.</text>
+  <text class="lane" x="40" y="94">REVIEW</text>
+  <rect class="box" x="150" y="66" width="210" height="58" rx="4"/>
+  <text class="box-title" x="170" y="91">Code change</text>
+  <text class="detail" x="170" y="111">base + head</text>
+  <path class="line" d="M360 95 H419"/>
+  <rect class="box" x="420" y="66" width="260" height="58" rx="4"/>
+  <text class="box-title" x="440" y="91">Collect evidence</text>
+  <text class="detail" x="440" y="111">policy, tests, scanners, review</text>
+  <path class="line" d="M680 95 H739"/>
+  <rect class="box" x="740" y="66" width="210" height="58" rx="4"/>
+  <text class="box-title" x="760" y="91">Risk report</text>
+  <text class="detail" x="760" y="111">low, medium, or high</text>
 
-  <rect class="panel" x="40" y="90" width="1120" height="140" rx="8"/>
-  <rect class="panel-strong" x="40" y="90" width="170" height="140" rx="8"/>
-  <line class="divider" x1="210" y1="90" x2="210" y2="230"/>
-  <text class="lane-number" x="62" y="129">01</text>
-  <text class="lane-name" x="62" y="158">PULL REQUEST</text>
-  <text class="lane-command" x="62" y="183">agent-eval review</text>
+  <text class="lane" x="40" y="184">AGENT RUN</text>
+  <rect class="box" x="150" y="156" width="170" height="58" rx="4"/>
+  <text class="box-title" x="170" y="181">Task</text>
+  <text class="detail" x="170" y="201">prompt + starter code</text>
+  <path class="line" d="M320 185 H369"/>
+  <rect class="box" x="370" y="156" width="210" height="58" rx="4"/>
+  <text class="box-title" x="390" y="181">Agent edits code</text>
+  <text class="detail" x="390" y="201">Claude Code or Codex</text>
+  <path class="line" d="M580 185 H629"/>
+  <rect class="box" x="630" y="156" width="210" height="58" rx="4"/>
+  <text class="box-title" x="650" y="181">Independent grade</text>
+  <text class="detail" x="650" y="201">hidden tests + checks</text>
+  <path class="line" d="M840 185 H889"/>
+  <rect class="box" x="890" y="156" width="210" height="58" rx="4"/>
+  <text class="box-title" x="910" y="181">Scorecard</text>
+  <text class="detail" x="910" y="201">outcome + metrics</text>
 
-  <text class="step-title" x="242" y="137">Git change</text>
-  <text class="step-detail" x="242" y="161">resolved base + head</text>
-  <path class="flow" d="M377 151 H431"/>
-  <text class="step-title" x="452" y="137">Collect evidence</text>
-  <text class="step-detail" x="452" y="161">policy, tests, scanners, AI</text>
-  <path class="flow" d="M640 151 H694"/>
-  <text class="step-title" x="715" y="137">Verify claims</text>
-  <text class="step-detail" x="715" y="161">match findings to diff lines</text>
-  <path class="flow" d="M895 151 H949"/>
-  <rect class="result" x="970" y="113" width="158" height="74" rx="6"/>
-  <text class="step-title result-text" x="990" y="141">Risk report</text>
-  <text class="step-detail result-text" x="990" y="164">low / medium / high</text>
+  <line class="rule" x1="40" y1="252" x2="1160" y2="252"/>
+  <text class="lane" x="40" y="286">METRICS COME FROM</text>
 
-  <rect class="panel" x="40" y="250" width="1120" height="170" rx="8"/>
-  <rect class="panel-strong" x="40" y="250" width="170" height="170" rx="8"/>
-  <line class="divider" x1="210" y1="250" x2="210" y2="420"/>
-  <text class="lane-number" x="62" y="289">02</text>
-  <text class="lane-name" x="62" y="318">CODING AGENT</text>
-  <text class="lane-command" x="62" y="343">agent-eval run</text>
+  <text class="source-title" x="260" y="286">Agent events</text>
+  <text class="source-detail" x="260" y="307">tokens, turns, tools, model, cost when available</text>
 
-  <text class="step-title" x="242" y="293">Versioned task</text>
-  <text class="step-detail" x="242" y="317">prompt + starter code</text>
-  <path class="flow" d="M377 307 H431"/>
-  <text class="step-title" x="452" y="293">Agent pod</text>
-  <text class="step-detail" x="452" y="317">Claude or Codex edits code</text>
-  <path class="flow" d="M640 307 H694"/>
-  <text class="step-title" x="715" y="293">Independent grade</text>
-  <text class="step-detail" x="715" y="317">submission and evaluator isolated</text>
-  <path class="flow" d="M895 307 H949"/>
-  <rect class="result" x="970" y="269" width="158" height="82" rx="6"/>
-  <text class="step-title result-text" x="990" y="301">Outcome</text>
-  <text class="step-detail result-text" x="990" y="322">accepted / rejected</text>
-  <text class="step-detail result-text" x="990" y="340">infra_error</text>
+  <text class="source-title" x="620" y="286">Evaluator</text>
+  <text class="source-detail" x="620" y="307">tests and coverage</text>
 
-  <line class="divider" x1="242" y1="355" x2="1128" y2="355"/>
-  <text class="eyebrow" x="242" y="383">EVIDENCE INPUTS</text>
-  <text class="evidence" x="390" y="383">provider JSONL  •  JUnit + coverage  •  diff + scanners + judge  •  wall time + exit</text>
+  <text class="source-title" x="850" y="286">Harness</text>
+  <text class="source-detail" x="850" y="307">time, exit, diff, scanners, judge</text>
 
-  <rect class="panel-strong" x="40" y="440" width="1120" height="40" rx="6"/>
-  <text class="principle" x="600" y="465" text-anchor="middle">Missing evidence stays missing. Required missing evidence fails closed.</text>
+  <rect class="box" x="40" y="345" width="1120" height="40" rx="4"/>
+  <text class="principle" x="600" y="370" text-anchor="middle">Missing values stay missing. Required missing evidence fails the check.</text>
 </svg>
