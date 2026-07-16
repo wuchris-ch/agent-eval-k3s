@@ -79,7 +79,7 @@ console = Console()
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _PROVIDER_DOMAINS = {
     "claude-code": [".anthropic.com", ".claude.ai"],
-    "codex": [".openai.com", ".chatgpt.com"],
+    "codex": [".openai.com", ".chatgpt.com", ".oaiusercontent.com"],
 }
 _TRUSTED_PYTEST_RUNNER = Path(__file__).parent / "evaluators" / "trusted_pytest.py"
 _EVALUATOR_CONTROL_FILES = {

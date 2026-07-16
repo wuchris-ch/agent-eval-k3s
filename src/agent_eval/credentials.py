@@ -35,7 +35,10 @@ MAX_REDACTION_PATTERN_BYTES = 3 * 1024 * 1024
 MAX_REDACTION_PATTERN_BYTES_TOTAL = 8 * 1024 * 1024
 MAX_JSON_CREDENTIAL_DEPTH = 32
 REDACTION_READ_CHUNK_BYTES = 64 * 1024
-MAX_JSON_ESCAPE_DECODE_ROUNDS = 1
+# Provider event streams can contain JSON strings nested inside JSONL events.
+# Inspect enough layers for those legitimate transcripts while retaining a
+# finite fail-closed boundary for deliberately over-nested output.
+MAX_JSON_ESCAPE_DECODE_ROUNDS = 8
 _SENSITIVE_JSON_KEY = re.compile(
     r"(?:^|[_-])(?:"
     r"api[_-]?key|auth|authorization|bearer|cookie|credential|id[_-]?token|"
@@ -267,6 +270,135 @@ def _json_unescape_bytes_once(value: bytes) -> tuple[bytes, bool]:
     return bytes(output), changed
 
 
+class _StreamingJSONUnescaper:
+    """Incrementally apply one JSON-string unescape pass.
+
+    At most one incomplete simple escape, Unicode escape, or surrogate pair is
+    retained between chunks. Complete output is byte-for-byte equivalent to
+    ``_json_unescape_bytes_once`` over the concatenated input.
+    """
+
+    def __init__(self) -> None:
+        self._pending = bytearray()
+        self.changed = False
+
+    def feed(self, value: bytes, *, final: bool = False) -> bytes:
+        self._pending.extend(value)
+        candidate = self._pending
+        output = bytearray()
+        cursor = 0
+
+        while cursor < len(candidate):
+            if candidate[cursor] != ord("\\"):
+                output.append(candidate[cursor])
+                cursor += 1
+                continue
+
+            remaining = len(candidate) - cursor
+            if remaining < 2:
+                if final:
+                    output.append(candidate[cursor])
+                    cursor += 1
+                break
+
+            marker = candidate[cursor + 1]
+            simple = _JSON_SIMPLE_ESCAPES.get(marker)
+            if simple is not None:
+                output.extend(simple)
+                cursor += 2
+                self.changed = True
+                continue
+
+            if marker != ord("u"):
+                output.append(candidate[cursor])
+                cursor += 1
+                continue
+
+            if remaining < 6:
+                if final:
+                    output.append(candidate[cursor])
+                    cursor += 1
+                    continue
+                break
+            if any(
+                byte not in _ASCII_HEX
+                for byte in candidate[cursor + 2 : cursor + 6]
+            ):
+                output.append(candidate[cursor])
+                cursor += 1
+                continue
+
+            codepoint = int(candidate[cursor + 2 : cursor + 6], 16)
+            consumed = 6
+            if 0xD800 <= codepoint <= 0xDBFF:
+                if remaining < 12:
+                    if final:
+                        output.extend(candidate[cursor : cursor + 6])
+                        cursor += 6
+                        continue
+                    break
+                low_start = cursor + 6
+                if (
+                    candidate[low_start : low_start + 2] != b"\\u"
+                    or any(
+                        byte not in _ASCII_HEX
+                        for byte in candidate[low_start + 2 : low_start + 6]
+                    )
+                ):
+                    output.extend(candidate[cursor : cursor + 6])
+                    cursor += 6
+                    continue
+                low = int(candidate[low_start + 2 : low_start + 6], 16)
+                if not 0xDC00 <= low <= 0xDFFF:
+                    output.extend(candidate[cursor : cursor + 6])
+                    cursor += 6
+                    continue
+                codepoint = (
+                    0x10000
+                    + ((codepoint - 0xD800) << 10)
+                    + (low - 0xDC00)
+                )
+                consumed = 12
+            elif 0xDC00 <= codepoint <= 0xDFFF:
+                output.extend(candidate[cursor : cursor + 6])
+                cursor += 6
+                continue
+
+            output.extend(chr(codepoint).encode("utf-8"))
+            cursor += consumed
+            self.changed = True
+
+        if cursor:
+            del self._pending[:cursor]
+        return bytes(output)
+
+    def finish(self) -> bytes:
+        output = self.feed(b"", final=True)
+        if self._pending:
+            raise CredentialRedactionError(
+                "credential JSON escape inspection did not finish"
+            )
+        return output
+
+
+class _StreamingPatternMatcher:
+    """Match exact patterns while retaining only direct-pattern overlap."""
+
+    def __init__(self, patterns: tuple[bytes, ...], maximum_bytes: int) -> None:
+        self._patterns = patterns
+        self._overlap = max(0, maximum_bytes - 1)
+        self._tail = b""
+
+    def feed(self, value: bytes) -> bool:
+        if not value:
+            return False
+        candidate = self._tail + value
+        if any(pattern in candidate for pattern in self._patterns):
+            return True
+        self._tail = candidate[-self._overlap :] if self._overlap else b""
+        return False
+
+
 @dataclass(frozen=True)
 class CredentialRedactor:
     """Exact, bounded redaction derived from the credential actually projected.
@@ -335,13 +467,6 @@ class CredentialRedactor:
     @property
     def maximum_pattern_bytes(self) -> int:
         return max(map(len, self.patterns), default=0)
-
-    @property
-    def maximum_json_encoded_pattern_bytes(self) -> int:
-        # One Unicode escape can encode one source character in six bytes.
-        # This overlap is intentionally based on one valid JSON serialization;
-        # repeated serialization is handled in-buffer by the bounded decoder.
-        return self.maximum_pattern_bytes * 6
 
     def contains_bytes(self, value: bytes) -> bool:
         candidate = value
@@ -434,29 +559,62 @@ class CredentialRedactor:
         maximum_bytes: int,
         chunk_bytes: int = REDACTION_READ_CHUNK_BYTES,
     ) -> bool:
-        """Search a bounded stream, retaining overlap for cross-chunk tokens."""
+        """Search a bounded stream through every supported JSON escape layer."""
 
         if maximum_bytes < 0 or chunk_bytes <= 0:
             raise ValueError("credential stream limits must be positive")
         if not self.patterns:
             return False
-        overlap = max(0, self.maximum_json_encoded_pattern_bytes - 1)
-        read_bytes = max(chunk_bytes, overlap + 1)
-        tail = b""
+
+        matchers = [
+            _StreamingPatternMatcher(self.patterns, self.maximum_pattern_bytes)
+            for _ in range(MAX_JSON_ESCAPE_DECODE_ROUNDS + 1)
+        ]
+        decoders = [
+            _StreamingJSONUnescaper()
+            for _ in range(MAX_JSON_ESCAPE_DECODE_ROUNDS + 1)
+        ]
+        read_bytes = max(chunk_bytes, self.maximum_pattern_bytes)
+
+        def feed_layers(value: bytes, start: int = 0) -> bool:
+            current = value
+            for layer in range(start, MAX_JSON_ESCAPE_DECODE_ROUNDS):
+                current = decoders[layer].feed(current)
+                if matchers[layer + 1].feed(current):
+                    return True
+            # One extra decoder records whether the supported depth was
+            # exceeded. Its output is deliberately not treated as evidence.
+            decoders[MAX_JSON_ESCAPE_DECODE_ROUNDS].feed(current)
+            return False
+
         consumed = 0
         while True:
             chunk = stream.read(read_bytes)
             if not chunk:
-                return self.contains_bytes(tail)
+                break
             consumed += len(chunk)
             if consumed > maximum_bytes:
                 raise CredentialRedactionError(
                     "credential inspection exceeded its byte limit"
                 )
-            candidate = tail + chunk
-            if self.contains_bytes(candidate):
+            if matchers[0].feed(chunk) or feed_layers(chunk):
                 return True
-            tail = candidate[-overlap:] if overlap else b""
+
+        # Flush incomplete escapes from each layer, then pass that output only
+        # through downstream layers that have not yet been finalized.
+        for layer in range(MAX_JSON_ESCAPE_DECODE_ROUNDS):
+            current = decoders[layer].finish()
+            if matchers[layer + 1].feed(current):
+                return True
+            if feed_layers(current, start=layer + 1):
+                return True
+
+        decoders[MAX_JSON_ESCAPE_DECODE_ROUNDS].finish()
+        if decoders[MAX_JSON_ESCAPE_DECODE_ROUNDS].changed:
+            raise CredentialRedactionError(
+                "credential output exceeds the JSON escape inspection limit"
+            )
+        return False
 
 
 @dataclass(frozen=True)

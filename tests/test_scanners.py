@@ -269,11 +269,13 @@ def test_python_target_inventory_covers_excluded_and_unknown_sources(tmp_path):
     workspace = tmp_path / "workspace"
     excluded = workspace / ".venv" / "hidden.py"
     unknown = workspace / "service.txt"
+    canary = workspace / "canary.txt"
     dependency = workspace / "node_modules" / "package-lock.json"
     excluded.parent.mkdir(parents=True)
     dependency.parent.mkdir(parents=True)
     excluded.write_text("import os\n", encoding="utf-8")
     unknown.write_text("eval('hidden')\n", encoding="utf-8")
+    canary.write_text("AGENT_EVAL_NON_SECRET_CANARY\n", encoding="utf-8")
     dependency.write_text('{"lockfileVersion": 2}\n', encoding="utf-8")
 
     targets = scanners._python_scan_targets(workspace)

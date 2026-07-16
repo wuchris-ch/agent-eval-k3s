@@ -175,7 +175,7 @@ def _policy_data(
             "allowed_tasks": ["example-*"],
             "allowed_network_modes": network_modes or ["proxy"],
             "allowed_egress_domains": (
-                [".openai.com", ".chatgpt.com"]
+                [".openai.com", ".chatgpt.com", ".oaiusercontent.com"]
                 if agent == "codex"
                 else [".anthropic.com", ".claude.ai"]
             ),
