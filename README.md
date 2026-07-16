@@ -152,21 +152,7 @@ uv run agent-eval evaluate --task example-todo-api \
 
 ### `agent-eval run`: agent work and grading stay separate
 
-```mermaid
-flowchart LR
-    T["Versioned task<br/>prompt + starter code"] --> A["Agent pod<br/>Claude Code or Codex"]
-    A -->|"stdout JSONL"| U["Usage parser<br/>tokens, cost, turns, tools"]
-    A -->|"quiesce, then copy"| W["Produced workspace"]
-    W --> S["Submission pod<br/>runs produced code"]
-    H["Evaluator pod<br/>hidden tests + results"] -->|"one allowed TCP port"| S
-    H --> C["JUnit + coverage<br/>correctness evidence"]
-    W --> Q["Host evidence<br/>diff + scanners + judge"]
-    U --> P["Acceptance policy"]
-    C --> P
-    Q --> P
-    P --> O["accepted / rejected / infra_error"]
-    O --> R["results.json + metrics.db"]
-```
+![Coding-agent execution, independent grading, and metric collection](docs/coding-agent-evaluation.svg)
 
 The agent sees the prompt, starter workspace, and its provider credential. It
 does not see hidden tests. After the CLI exits or times out, the harness stops
@@ -214,16 +200,7 @@ shared local worker kernel unless a hardened RuntimeClass is configured.
 
 ### Pull-request path
 
-```mermaid
-flowchart LR
-    G["Resolved base + head"] --> B["Policy from trusted base"]
-    B --> D["Deterministic evidence<br/>scope, commands, tests, scanners"]
-    B --> M["Secret-screened model review"]
-    M --> V["Verify quoted diff lines<br/>recheck serious findings"]
-    D --> R["One risk result"]
-    V --> R
-    R --> F["review.md + JSON + SARIF"]
-```
+![Pull-request evidence collection and risk decision](docs/pull-request-review.svg)
 
 Static collection uses resolved Git objects without checking out `--head` or
 running hooks, external diff drivers, text conversion, or content filters.
@@ -420,17 +397,7 @@ Python-focused; equivalent profiles for other languages are not yet bundled.
 Governance is optional. It adds a fail-closed gate before cluster setup, image
 work, credential loading, or any model call.
 
-```mermaid
-flowchart LR
-    R["Request<br/>actor, task, model, limits"] --> P["Policy + registries"]
-    P --> A{"Preflight admitted?"}
-    A -->|"no"| D["Stop before side effects"]
-    A -->|"yes"| S["Private task snapshot"]
-    S --> E{"Execution identity still matches?"}
-    E -->|"no"| D
-    E -->|"yes"| X["Run exact image + recipe"]
-    X --> O["Check observed evidence + outcome"]
-```
+![Governance admission and execution identity checks](docs/governed-run.svg)
 
 The checked-in request and policy files are templates, not production
 approvals. Replace all placeholder task, execution, image, scanner, builder,
@@ -553,14 +520,7 @@ operator code; run an untrusted broker in a separately supervised service.
 
 ## Metrics and comparison
 
-```mermaid
-flowchart LR
-    E["Raw evidence"] --> J["results.json<br/>complete run record"]
-    J --> S["metrics.db<br/>query projection + assessments"]
-    J --> V["verify-run<br/>recompute and cross-check"]
-    S --> C["compare / report"]
-    J -. "optional, lossy" .-> O["OpenTelemetry"]
-```
+![Canonical run record, metric projection, verification, and export](docs/metrics-flow.svg)
 
 | Category | Examples |
 |---|---|
