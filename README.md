@@ -32,9 +32,15 @@ times per case on an Apple M1 Max:
 | Todo API | 3/3 | 33/33 | n/a | 41.1 s | 67,923 |
 | Agentic safety controls | 3/3 | 15/15 | 30/30 | 39.2 s | 76,885 |
 
-All six agent runs were scanner-clean. These are small smoke checks, not model
-rankings. The second task tests enterprise-style controls on a small codebase,
-not enterprise scale. See the [method, per-trial data, and
+| Eval-only harness control | Expected | Observed |
+|---|---|---|
+| Unmodified Todo starter | `rejected` | `rejected`, 2/11 hidden tests passed |
+
+The control ran without an agent or model. It is excluded from the acceptance
+rates and token and timing medians. All six Codex performance runs were
+scanner-clean. These are small smoke checks, not model rankings. The second
+task tests enterprise-style controls on a small codebase, not enterprise scale.
+See the [method, per-trial data, control evidence, and
 limits](benchmarks/measured/2026-07-15/README.md).
 
 ## Quick start

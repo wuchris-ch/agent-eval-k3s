@@ -8,11 +8,13 @@
       "codex"
     ],
     "trials_per_case": 3,
+    "outcome_control_trials": 1,
     "model_requested": "gpt-5.6-sol",
     "model_observed": null,
     "judge_enabled_for_run": false
   },
   "environment": {
+    "scope": "review and codex performance",
     "host": "Apple M1 Max",
     "architecture": "arm64",
     "macos_version": "26.5",
@@ -248,11 +250,54 @@
       "cohort_command_wall_time_s": 307.52
     }
   ],
+  "outcome_controls": [
+    {
+      "control_id": "todo-starter-rejection",
+      "kind": "eval-only negative control",
+      "task_id": "example-todo-api",
+      "source_workspace": "tasks/example-todo-api/environment/workspace",
+      "agent": "external",
+      "run_id": "example-todo-api--external--20260715-225622-206a23db0fa7",
+      "expected_outcome": "rejected",
+      "observed_outcome": "rejected",
+      "hidden_tests_passed": 2,
+      "hidden_tests_failed": 9,
+      "hidden_tests_total": 11,
+      "test_command_exit_code": 1,
+      "cli_gate_exit_code": 2,
+      "correctness_infra_error": null,
+      "efficiency_infra_error": null,
+      "scanner_findings": 0,
+      "scanner_status": {
+        "ruff": "ok",
+        "semgrep": "ok",
+        "gitleaks": "ok",
+        "trivy": "ok"
+      },
+      "files_changed": 0,
+      "agent_metrics_present": false,
+      "command_wall_time_s": 31.07,
+      "command_wall_time_source": "todo-starter-rejection.time.txt (/usr/bin/time -p)",
+      "evaluation_spec_digest": "67c4971608a818a08d739d7d0ed7cad0a9f69c708ca5a8d67da3fa9ec4d8abfd",
+      "task_tree_sha256": "029b9fcb68e389256aa4ace3ae5bc6ffef4f081e168d1e07dddfdd03b6033e3d",
+      "harness_version": "0.3.0",
+      "harness_commit": "987e4441918e1fee86d16a5bbf6bb5cb13705ea5",
+      "harness_dirty": false,
+      "verify_run": "passed",
+      "verified_artifacts": 9,
+      "included_in_performance_aggregates": false
+    }
+  ],
   "verification": {
     "verify_run_passed": 6,
     "verify_run_total": 6,
+    "verify_run_scope": "codex performance records",
+    "outcome_control_verify_run_passed": 1,
+    "outcome_control_verify_run_total": 1,
     "repository_tests_passed": 828,
     "repository_tests_skipped": 1,
+    "infra_error_targeted_tests_passed": 4,
+    "infra_error_targeted_tests_total": 4,
     "todo_oracle": "11/11",
     "safety_oracle": "5/5",
     "review_corpus_reproducers_passed": 2,
