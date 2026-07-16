@@ -79,6 +79,7 @@ Check which features the machine is ready to use:
 
 ```sh
 uv run agent-eval doctor
+uv run agent-eval scanners prepare
 ```
 
 `uv sync` installs `agent-eval` and its locked Python dependencies into the
@@ -550,6 +551,10 @@ harness, Git commit, and worktree identities. Pairing additionally requires the
 same experiment, task, and trial number. Third-party adapters need distribution,
 version, and installed-artifact identity. Unbound runs stay separate, and
 missing metrics never become zeros or zero deltas.
+
+See the [July 15, 2026 measured smoke check](benchmarks/measured/2026-07-15/README.md)
+for commands, per-trial values, bound identities, and limitations from real
+`review` and `run` executions.
 
 ## Security boundary summary
 

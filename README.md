@@ -17,6 +17,26 @@ is missing, the command fails instead of pretending the result is clean.
 This makes the result easier to explain and reproduce than a model opinion or
 a single benchmark score.
 
+## Measured end-to-end check
+
+On July 15, 2026, Codex with requested model `gpt-5.6-sol` was run three
+times per case on an Apple M1 Max:
+
+| `review` case | Result | Blocked | Median command time |
+|---|---:|---:|---:|
+| Clean refactor | 3/3 low risk | 0/3 | 25.05 s |
+| Authorization bypass | 3/3 high risk | 3/3 | 24.79 s |
+
+| `run` task | Accepted | Hidden tests | Challenge checks | Median agent time | Median total tokens |
+|---|---:|---:|---:|---:|---:|
+| Todo API | 3/3 | 33/33 | n/a | 41.1 s | 67,923 |
+| Agentic safety controls | 3/3 | 15/15 | 30/30 | 39.2 s | 76,885 |
+
+All six agent runs were scanner-clean. These are small smoke checks, not model
+rankings. The second task tests enterprise-style controls on a small codebase,
+not enterprise scale. See the [method, per-trial data, and
+limits](benchmarks/measured/2026-07-15/README.md).
+
 ## Quick start
 
 Install the project and its command-line tools on macOS:
@@ -28,6 +48,7 @@ cd agent-eval-k3s
 brew install uv kubectl k3d gitleaks trivy
 uv sync
 uv run agent-eval doctor
+uv run agent-eval scanners prepare
 ```
 
 You also need Docker. To run an agent, provide one of these:
