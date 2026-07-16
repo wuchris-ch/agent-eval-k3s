@@ -1,4 +1,5 @@
 import io
+import json
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -196,7 +197,29 @@ def test_stream_search_detects_unicode_escaped_token_across_boundaries():
     )
 
 
-def test_nested_json_escape_layers_fail_closed_even_without_an_exact_hit():
+def _nest_json_escape(value: bytes, rounds: int) -> bytes:
+    nested = value.decode()
+    for _ in range(rounds):
+        nested = json.dumps(nested)[1:-1]
+    return nested.encode()
+
+
+def test_nested_json_escape_layers_are_inspected_within_limit():
+    secret = b"credential-value"
+    encoded_secret = b"".join(f"\\u{byte:04x}".encode() for byte in secret)
+    redactor = CredentialRedactor.from_material(
+        CredentialMaterial(values={"TOKEN": secret.decode()}, env_keys=("TOKEN",))
+    )
+
+    assert redactor.contains_bytes(
+        _nest_json_escape(
+            encoded_secret,
+            credentials_module.MAX_JSON_ESCAPE_DECODE_ROUNDS - 1,
+        )
+    )
+
+
+def test_nested_json_escape_layers_fail_closed_beyond_limit():
     redactor = CredentialRedactor.from_material(
         CredentialMaterial(values={"TOKEN": "different-secret"}, env_keys=("TOKEN",))
     )
@@ -205,7 +228,12 @@ def test_nested_json_escape_layers_fail_closed_even_without_an_exact_hit():
         credentials_module.CredentialRedactionError,
         match="JSON escape inspection limit",
     ):
-        redactor.contains_bytes(b"nested=\\\\u0061")
+        redactor.contains_bytes(
+            _nest_json_escape(
+                b"\\u0061",
+                credentials_module.MAX_JSON_ESCAPE_DECODE_ROUNDS,
+            )
+        )
 
 
 @pytest.mark.parametrize("auth", ["{}", '{"mode":"chatgpt"}'])

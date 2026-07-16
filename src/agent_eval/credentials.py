@@ -35,7 +35,10 @@ MAX_REDACTION_PATTERN_BYTES = 3 * 1024 * 1024
 MAX_REDACTION_PATTERN_BYTES_TOTAL = 8 * 1024 * 1024
 MAX_JSON_CREDENTIAL_DEPTH = 32
 REDACTION_READ_CHUNK_BYTES = 64 * 1024
-MAX_JSON_ESCAPE_DECODE_ROUNDS = 1
+# Provider event streams can contain JSON strings nested inside JSONL events.
+# Inspect enough layers for those legitimate transcripts while retaining a
+# finite fail-closed boundary for deliberately over-nested output.
+MAX_JSON_ESCAPE_DECODE_ROUNDS = 8
 _SENSITIVE_JSON_KEY = re.compile(
     r"(?:^|[_-])(?:"
     r"api[_-]?key|auth|authorization|bearer|cookie|credential|id[_-]?token|"
