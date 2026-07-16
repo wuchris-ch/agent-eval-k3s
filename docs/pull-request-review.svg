@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 330" role="img" aria-labelledby="title description">
+  <title id="title">Pull-request review flow</title>
+  <desc id="description">Resolved Git objects and policy from the trusted base feed deterministic checks and a secret-screened model review. Model findings are verified against diff lines before one risk result and its review artifacts are produced.</desc>
+  <defs>
+    <style>
+      :root { --canvas:#fff; --surface:#f8fafc; --surface2:#f1f5f9; --ink:#0f172a; --muted:#64748b; --line:#cbd5e1; --strong:#94a3b8; --emphasis:#0f172a; --emphasis-ink:#fff; }
+      @media (prefers-color-scheme: dark) { :root { --canvas:#0b0f14; --surface:#111820; --surface2:#17202a; --ink:#e5e7eb; --muted:#9ca3af; --line:#334155; --strong:#64748b; --emphasis:#253140; --emphasis-ink:#f8fafc; } }
+      text { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; fill:var(--ink); }
+      .canvas { fill:var(--canvas); }
+      .card { fill:var(--surface); stroke:var(--line); stroke-width:1; }
+      .card2 { fill:var(--surface2); stroke:var(--line); stroke-width:1; }
+      .result { fill:var(--emphasis); }
+      .result-text, .detail.result-text { fill:var(--emphasis-ink); }
+      .flow { fill:none; stroke:var(--strong); stroke-width:1.5; marker-end:url(#arrow); }
+      .join { fill:none; stroke:var(--strong); stroke-width:1.5; }
+      .eyebrow { font-size:11px; font-weight:700; letter-spacing:.12em; fill:var(--muted); }
+      .title { font-size:22px; font-weight:650; letter-spacing:-.02em; }
+      .node-title { font-size:15px; font-weight:650; }
+      .detail { font-size:12px; fill:var(--muted); }
+      .lane { font-size:11px; font-weight:700; letter-spacing:.08em; fill:var(--muted); }
+    </style>
+    <marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0 0 7 3.5 0 7Z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" width="1200" height="330"/>
+  <text class="eyebrow" x="40" y="31">AGENT-EVAL REVIEW</text>
+  <text class="title" x="40" y="60">One risk result from two evidence lanes</text>
+
+  <rect class="card" x="40" y="121" width="160" height="82" rx="6"/>
+  <text class="node-title" x="58" y="151">Resolved Git objects</text>
+  <text class="detail" x="58" y="173">base + head, no checkout</text>
+  <text class="detail" x="58" y="191">no hooks or filters</text>
+  <path class="flow" d="M200 162 H239"/>
+
+  <rect class="card2" x="240" y="121" width="160" height="82" rx="6"/>
+  <text class="node-title" x="258" y="151">Trusted policy</text>
+  <text class="detail" x="258" y="173">loaded from base</text>
+  <text class="detail" x="258" y="191">defines allowed checks</text>
+
+  <text class="lane" x="450" y="95">DETERMINISTIC</text>
+  <rect class="card" x="440" y="108" width="292" height="72" rx="6"/>
+  <text class="node-title" x="458" y="137">Scope, commands, tests, scanners</text>
+  <text class="detail" x="458" y="159">machine-checkable blockers and findings</text>
+
+  <text class="lane" x="450" y="215">MODEL-ASSISTED</text>
+  <rect class="card" x="440" y="228" width="138" height="72" rx="6"/>
+  <text class="node-title" x="458" y="257">Model review</text>
+  <text class="detail" x="458" y="279">secret-screened diff</text>
+  <path class="flow" d="M578 264 H599"/>
+  <rect class="card" x="600" y="228" width="132" height="72" rx="6"/>
+  <text class="node-title" x="618" y="257">Verify claims</text>
+  <text class="detail" x="618" y="279">lines + serious issues</text>
+
+  <path class="flow" d="M400 150 H440"/>
+  <path class="flow" d="M400 174 H420 V264 H440"/>
+  <path class="join" d="M732 144 H770 V264 H732"/>
+  <path class="flow" d="M770 204 H808"/>
+
+  <rect class="result" x="809" y="158" width="160" height="92" rx="6"/>
+  <text class="node-title result-text" x="829" y="189">Risk decision</text>
+  <text class="detail result-text" x="829" y="212">low / medium / high</text>
+  <text class="detail result-text" x="829" y="231">verified evidence only</text>
+  <path class="flow" d="M969 204 H1008"/>
+
+  <rect class="card2" x="1009" y="158" width="151" height="92" rx="6"/>
+  <text class="node-title" x="1028" y="189">Review artifacts</text>
+  <text class="detail" x="1028" y="212">review.md + JSON</text>
+  <text class="detail" x="1028" y="231">SARIF</text>
+</svg>

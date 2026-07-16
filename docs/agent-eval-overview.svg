@@ -1,125 +1,107 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 600" role="img" aria-labelledby="title description">
-  <title id="title">agent-eval-k3s workflows</title>
-  <desc id="description">Pull request review checks a Git diff and produces a risk report. Coding agent evaluation gives an isolated agent a task, grades the resulting workspace with hidden tests, combines usage and independent evidence, and produces an explicit outcome.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 500" role="img" aria-labelledby="title description">
+  <title id="title">agent-eval-k3s assurance paths</title>
+  <desc id="description">Two restrained workflow lanes show pull-request review and coding-agent evaluation. Both collect independent evidence before producing an explicit result.</desc>
   <defs>
     <style>
       :root {
-        color-scheme: light dark;
         --canvas: #ffffff;
-        --text: #172033;
-        --muted: #667085;
-        --line: #d8dee9;
-        --review-fill: #eef6ff;
-        --review-stroke: #4d8fd8;
-        --agent-fill: #f3efff;
-        --agent-stroke: #8066cc;
-        --grade-fill: #fff8e8;
-        --grade-stroke: #c88a18;
-        --shared-fill: #edf9f3;
-        --shared-stroke: #3f9a70;
-        --arrow: #98a2b3;
+        --surface: #f8fafc;
+        --surface-strong: #f1f5f9;
+        --ink: #0f172a;
+        --muted: #64748b;
+        --line: #cbd5e1;
+        --line-strong: #94a3b8;
+        --emphasis: #0f172a;
+        --emphasis-ink: #ffffff;
       }
       @media (prefers-color-scheme: dark) {
         :root {
-          --canvas: #0d1117;
-          --text: #e6edf3;
-          --muted: #9da7b3;
-          --line: #30363d;
-          --review-fill: #10263d;
-          --review-stroke: #58a6ff;
-          --agent-fill: #211b38;
-          --agent-stroke: #a78bfa;
-          --grade-fill: #302510;
-          --grade-stroke: #d9a441;
-          --shared-fill: #102b22;
-          --shared-stroke: #56d39b;
-          --arrow: #6e7681;
+          --canvas: #0b0f14;
+          --surface: #111820;
+          --surface-strong: #17202a;
+          --ink: #e5e7eb;
+          --muted: #9ca3af;
+          --line: #334155;
+          --line-strong: #64748b;
+          --emphasis: #253140;
+          --emphasis-ink: #f8fafc;
         }
       }
-      text {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        fill: var(--text);
-      }
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: var(--ink); }
       .canvas { fill: var(--canvas); }
-      .lane-label { font-size: 16px; font-weight: 700; letter-spacing: .06em; }
-      .node-title { font-size: 18px; font-weight: 650; }
-      .node-detail { font-size: 14px; fill: var(--muted); }
-      .small-detail { font-size: 12px; fill: var(--muted); }
-      .review-node { fill: var(--review-fill); stroke: var(--review-stroke); }
-      .agent-node { fill: var(--agent-fill); stroke: var(--agent-stroke); }
-      .grade-node { fill: var(--grade-fill); stroke: var(--grade-stroke); }
-      .shared-node { fill: var(--shared-fill); stroke: var(--shared-stroke); }
-      .node { stroke-width: 1.5; rx: 14; }
-      .arrow { stroke: var(--arrow); stroke-width: 2; fill: none; marker-end: url(#arrowhead); }
-      .branch { stroke: var(--arrow); stroke-width: 1.5; fill: none; marker-end: url(#arrowhead); }
+      .panel { fill: var(--surface); stroke: var(--line); stroke-width: 1; }
+      .panel-strong { fill: var(--surface-strong); }
       .divider { stroke: var(--line); stroke-width: 1; }
+      .flow { stroke: var(--line-strong); stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+      .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: .12em; fill: var(--muted); }
+      .title { font-size: 24px; font-weight: 650; letter-spacing: -.02em; }
+      .subtitle { font-size: 14px; fill: var(--muted); }
+      .lane-number { font-size: 28px; font-weight: 650; fill: var(--line-strong); }
+      .lane-name { font-size: 14px; font-weight: 700; letter-spacing: .08em; }
+      .lane-command { font-size: 13px; fill: var(--muted); }
+      .step-title { font-size: 16px; font-weight: 650; }
+      .step-detail { font-size: 13px; fill: var(--muted); }
+      .evidence { font-size: 12px; fill: var(--muted); }
+      .result { fill: var(--emphasis); }
+      .result-text, .step-detail.result-text { fill: var(--emphasis-ink); }
+      .principle { font-size: 13px; font-weight: 600; }
     </style>
-    <marker id="arrowhead" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-      <path d="M0,0 L8,4 L0,8 Z" fill="#98a2b3"/>
+    <marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0 0 7 3.5 0 7Z" fill="#94a3b8"/>
     </marker>
   </defs>
 
-  <rect class="canvas" width="1200" height="600" rx="20"/>
+  <rect class="canvas" width="1200" height="500"/>
 
-  <text class="lane-label" x="48" y="48">PULL REQUEST REVIEW</text>
-  <rect class="node review-node" x="48" y="70" width="218" height="88"/>
-  <text class="node-title" x="70" y="106">Git change</text>
-  <text class="node-detail" x="70" y="132">Trusted policy + diff</text>
+  <text class="eyebrow" x="40" y="34">SYSTEM OVERVIEW</text>
+  <text class="title" x="40" y="64">Two paths, one evidence rule</text>
+  <text class="subtitle" x="420" y="63">Machine-checkable evidence is collected before a decision is recorded.</text>
 
-  <path class="arrow" d="M266 114 H310"/>
-  <rect class="node review-node" x="311" y="70" width="240" height="88"/>
-  <text class="node-title" x="333" y="106">Collect evidence</text>
-  <text class="node-detail" x="333" y="132">Rules + tests + scanners</text>
+  <rect class="panel" x="40" y="90" width="1120" height="140" rx="8"/>
+  <rect class="panel-strong" x="40" y="90" width="170" height="140" rx="8"/>
+  <line class="divider" x1="210" y1="90" x2="210" y2="230"/>
+  <text class="lane-number" x="62" y="129">01</text>
+  <text class="lane-name" x="62" y="158">PULL REQUEST</text>
+  <text class="lane-command" x="62" y="183">agent-eval review</text>
 
-  <path class="arrow" d="M551 114 H595"/>
-  <rect class="node review-node" x="596" y="70" width="255" height="88"/>
-  <text class="node-title" x="618" y="106">Verify AI findings</text>
-  <text class="node-detail" x="618" y="132">Claims must match diff lines</text>
+  <text class="step-title" x="242" y="137">Git change</text>
+  <text class="step-detail" x="242" y="161">resolved base + head</text>
+  <path class="flow" d="M377 151 H431"/>
+  <text class="step-title" x="452" y="137">Collect evidence</text>
+  <text class="step-detail" x="452" y="161">policy, tests, scanners, AI</text>
+  <path class="flow" d="M640 151 H694"/>
+  <text class="step-title" x="715" y="137">Verify claims</text>
+  <text class="step-detail" x="715" y="161">match findings to diff lines</text>
+  <path class="flow" d="M895 151 H949"/>
+  <rect class="result" x="970" y="113" width="158" height="74" rx="6"/>
+  <text class="step-title result-text" x="990" y="141">Risk report</text>
+  <text class="step-detail result-text" x="990" y="164">low / medium / high</text>
 
-  <path class="arrow" d="M851 114 H895"/>
-  <rect class="node review-node" x="896" y="70" width="256" height="88"/>
-  <text class="node-title" x="918" y="106">Risk report</text>
-  <text class="node-detail" x="918" y="132">Low / medium / high + SARIF</text>
+  <rect class="panel" x="40" y="250" width="1120" height="170" rx="8"/>
+  <rect class="panel-strong" x="40" y="250" width="170" height="170" rx="8"/>
+  <line class="divider" x1="210" y1="250" x2="210" y2="420"/>
+  <text class="lane-number" x="62" y="289">02</text>
+  <text class="lane-name" x="62" y="318">CODING AGENT</text>
+  <text class="lane-command" x="62" y="343">agent-eval run</text>
 
-  <line class="divider" x1="48" y1="195" x2="1152" y2="195"/>
+  <text class="step-title" x="242" y="293">Versioned task</text>
+  <text class="step-detail" x="242" y="317">prompt + starter code</text>
+  <path class="flow" d="M377 307 H431"/>
+  <text class="step-title" x="452" y="293">Agent pod</text>
+  <text class="step-detail" x="452" y="317">Claude or Codex edits code</text>
+  <path class="flow" d="M640 307 H694"/>
+  <text class="step-title" x="715" y="293">Independent grade</text>
+  <text class="step-detail" x="715" y="317">submission and evaluator isolated</text>
+  <path class="flow" d="M895 307 H949"/>
+  <rect class="result" x="970" y="269" width="158" height="82" rx="6"/>
+  <text class="step-title result-text" x="990" y="301">Outcome</text>
+  <text class="step-detail result-text" x="990" y="322">accepted / rejected</text>
+  <text class="step-detail result-text" x="990" y="340">infra_error</text>
 
-  <text class="lane-label" x="48" y="233">CODING AGENT EVALUATION</text>
-  <rect class="node agent-node" x="48" y="255" width="210" height="110"/>
-  <text class="node-title" x="70" y="290">Versioned task</text>
-  <text class="node-detail" x="70" y="316">Prompt + starter code</text>
-  <text class="small-detail" x="70" y="340">Hidden tests stay separate</text>
+  <line class="divider" x1="242" y1="355" x2="1128" y2="355"/>
+  <text class="eyebrow" x="242" y="383">EVIDENCE INPUTS</text>
+  <text class="evidence" x="390" y="383">provider JSONL  •  JUnit + coverage  •  diff + scanners + judge  •  wall time + exit</text>
 
-  <path class="arrow" d="M258 310 H302"/>
-  <rect class="node agent-node" x="303" y="255" width="230" height="110"/>
-  <text class="node-title" x="325" y="290">Agent pod</text>
-  <text class="node-detail" x="325" y="316">Claude or Codex edits code</text>
-  <text class="small-detail" x="325" y="340">Produces workspace + JSONL</text>
-
-  <path class="arrow" d="M533 310 H577"/>
-  <rect class="node grade-node" x="578" y="225" width="278" height="170"/>
-  <text class="node-title" x="600" y="258">Independent grading</text>
-  <rect class="node grade-node" x="600" y="275" width="109" height="88"/>
-  <text class="node-detail" x="654" y="306" text-anchor="middle">Submission</text>
-  <text class="small-detail" x="654" y="329" text-anchor="middle">produced code</text>
-  <text class="small-detail" x="654" y="346" text-anchor="middle">one TCP port</text>
-  <rect class="node grade-node" x="725" y="275" width="109" height="88"/>
-  <text class="node-detail" x="779" y="306" text-anchor="middle">Evaluator</text>
-  <text class="small-detail" x="779" y="329" text-anchor="middle">hidden tests</text>
-  <text class="small-detail" x="779" y="346" text-anchor="middle">owns results</text>
-  <path class="branch" d="M725 319 H713"/>
-
-  <path class="arrow" d="M856 310 H900"/>
-  <rect class="node shared-node" x="901" y="255" width="251" height="110"/>
-  <text class="node-title" x="923" y="290">Explicit outcome</text>
-  <text class="node-detail" x="923" y="316">accepted / rejected</text>
-  <text class="node-detail" x="923" y="340">/ infrastructure error</text>
-
-  <path class="branch" d="M418 365 V425 H590"/>
-  <rect class="node agent-node" x="590" y="413" width="260" height="76"/>
-  <text class="node-title" x="612" y="443">Usage evidence</text>
-  <text class="node-detail" x="612" y="468">Time, tokens, cost, turns, tools</text>
-  <path class="branch" d="M850 451 H1025 V365"/>
-
-  <rect class="node shared-node" x="48" y="525" width="1104" height="48"/>
-  <text class="node-title" x="600" y="555" text-anchor="middle">Shared rule: missing evidence stays missing, and required missing evidence fails closed</text>
+  <rect class="panel-strong" x="40" y="440" width="1120" height="40" rx="6"/>
+  <text class="principle" x="600" y="465" text-anchor="middle">Missing evidence stays missing. Required missing evidence fails closed.</text>
 </svg>
