@@ -52,7 +52,7 @@ from ..scanner_runtime import (
 
 console = Console()
 SCAN_TIMEOUT = 600
-_VERSION_TIMEOUT = 20
+_VERSION_TIMEOUT = 60
 _PREPARE_TIMEOUT = 900
 _TERMINATION_GRACE_SECONDS = 2.0
 _STREAM_JOIN_SECONDS = 2.0
@@ -969,8 +969,16 @@ def _looks_like_python_source(path: Path) -> bool:
     )
     if any(isinstance(node, strong_python_nodes) for node in ast.walk(parsed)):
         return True
+    meaningful_statements = (
+        statement
+        for statement in parsed.body
+        if not (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, (ast.Constant, ast.Name))
+        )
+    )
     return (
-        bool(parsed.body)
+        any(meaningful_statements)
         and not path.name.startswith(".")
         and ".git" not in path.parts
     )

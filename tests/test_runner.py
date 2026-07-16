@@ -23,6 +23,19 @@ def _cooperative_task():
     )
 
 
+def test_codex_provider_network_includes_required_openai_asset_hosts():
+    task = load_task("example-todo-api")
+
+    domains, proxy_image = runner._governance_network_evidence(task, "codex")
+
+    assert domains == [
+        ".chatgpt.com",
+        ".oaiusercontent.com",
+        ".openai.com",
+    ]
+    assert proxy_image == task.network.proxy_image
+
+
 class _EvalOOMPod:
     def __init__(self):
         self.deleted = False
