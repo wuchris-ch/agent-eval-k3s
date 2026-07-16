@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 480" role="img" aria-labelledby="title description">
-  <title id="title">agent-eval-k3s overview</title>
-  <desc id="description">Two workflows share one evidence model. Pull request review turns a Git diff into an evidence-checked merge report. Coding agent evaluation runs an agent in an isolated pod, grades it in a fresh evaluator pod, and produces an explicit outcome.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 600" role="img" aria-labelledby="title description">
+  <title id="title">agent-eval-k3s workflows</title>
+  <desc id="description">Pull request review checks a Git diff and produces a risk report. Coding agent evaluation gives an isolated agent a task, grades the resulting workspace with hidden tests, combines usage and independent evidence, and produces an explicit outcome.</desc>
   <defs>
     <style>
       :root {
@@ -13,6 +13,8 @@
         --review-stroke: #4d8fd8;
         --agent-fill: #f3efff;
         --agent-stroke: #8066cc;
+        --grade-fill: #fff8e8;
+        --grade-stroke: #c88a18;
         --shared-fill: #edf9f3;
         --shared-stroke: #3f9a70;
         --arrow: #98a2b3;
@@ -27,6 +29,8 @@
           --review-stroke: #58a6ff;
           --agent-fill: #211b38;
           --agent-stroke: #a78bfa;
+          --grade-fill: #302510;
+          --grade-stroke: #d9a441;
           --shared-fill: #102b22;
           --shared-stroke: #56d39b;
           --arrow: #6e7681;
@@ -37,65 +41,85 @@
         fill: var(--text);
       }
       .canvas { fill: var(--canvas); }
-      .lane-label { font-size: 17px; font-weight: 600; letter-spacing: .02em; }
-      .node-title { font-size: 18px; font-weight: 600; }
+      .lane-label { font-size: 16px; font-weight: 700; letter-spacing: .06em; }
+      .node-title { font-size: 18px; font-weight: 650; }
       .node-detail { font-size: 14px; fill: var(--muted); }
+      .small-detail { font-size: 12px; fill: var(--muted); }
       .review-node { fill: var(--review-fill); stroke: var(--review-stroke); }
       .agent-node { fill: var(--agent-fill); stroke: var(--agent-stroke); }
+      .grade-node { fill: var(--grade-fill); stroke: var(--grade-stroke); }
       .shared-node { fill: var(--shared-fill); stroke: var(--shared-stroke); }
       .node { stroke-width: 1.5; rx: 14; }
       .arrow { stroke: var(--arrow); stroke-width: 2; fill: none; marker-end: url(#arrowhead); }
+      .branch { stroke: var(--arrow); stroke-width: 1.5; fill: none; marker-end: url(#arrowhead); }
       .divider { stroke: var(--line); stroke-width: 1; }
     </style>
     <marker id="arrowhead" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-      <path d="M0,0 L8,4 L0,8 Z" fill="var(--arrow)"/>
+      <path d="M0,0 L8,4 L0,8 Z" fill="#98a2b3"/>
     </marker>
   </defs>
 
-  <rect class="canvas" width="1200" height="480" rx="20"/>
+  <rect class="canvas" width="1200" height="600" rx="20"/>
 
-  <text class="lane-label" x="48" y="53">PR REVIEW</text>
-  <rect class="node review-node" x="48" y="75" width="225" height="92"/>
-  <text class="node-title" x="72" y="112">Git diff</text>
-  <text class="node-detail" x="72" y="138">The proposed change</text>
+  <text class="lane-label" x="48" y="48">PULL REQUEST REVIEW</text>
+  <rect class="node review-node" x="48" y="70" width="218" height="88"/>
+  <text class="node-title" x="70" y="106">Git change</text>
+  <text class="node-detail" x="70" y="132">Trusted policy + diff</text>
 
-  <path class="arrow" d="M273 121 H321"/>
-  <rect class="node review-node" x="322" y="75" width="235" height="92"/>
-  <text class="node-title" x="346" y="112">Run checks</text>
-  <text class="node-detail" x="346" y="138">Tests, policy, scanners</text>
+  <path class="arrow" d="M266 114 H310"/>
+  <rect class="node review-node" x="311" y="70" width="240" height="88"/>
+  <text class="node-title" x="333" y="106">Collect evidence</text>
+  <text class="node-detail" x="333" y="132">Rules + tests + scanners</text>
 
-  <path class="arrow" d="M557 121 H605"/>
-  <rect class="node review-node" x="606" y="75" width="250" height="92"/>
-  <text class="node-title" x="630" y="112">Verify findings</text>
-  <text class="node-detail" x="630" y="138">AI claims need diff evidence</text>
+  <path class="arrow" d="M551 114 H595"/>
+  <rect class="node review-node" x="596" y="70" width="255" height="88"/>
+  <text class="node-title" x="618" y="106">Verify AI findings</text>
+  <text class="node-detail" x="618" y="132">Claims must match diff lines</text>
 
-  <path class="arrow" d="M856 121 H904"/>
-  <rect class="node review-node" x="905" y="75" width="247" height="92"/>
-  <text class="node-title" x="929" y="112">Merge report</text>
-  <text class="node-detail" x="929" y="138">Risk, reasons, JSON, SARIF</text>
+  <path class="arrow" d="M851 114 H895"/>
+  <rect class="node review-node" x="896" y="70" width="256" height="88"/>
+  <text class="node-title" x="918" y="106">Risk report</text>
+  <text class="node-detail" x="918" y="132">Low / medium / high + SARIF</text>
 
-  <line class="divider" x1="48" y1="210" x2="1152" y2="210"/>
+  <line class="divider" x1="48" y1="195" x2="1152" y2="195"/>
 
-  <text class="lane-label" x="48" y="253">AGENT EVALUATION</text>
-  <rect class="node agent-node" x="48" y="275" width="225" height="92"/>
-  <text class="node-title" x="72" y="312">Task + model</text>
-  <text class="node-detail" x="72" y="338">A repeatable coding job</text>
+  <text class="lane-label" x="48" y="233">CODING AGENT EVALUATION</text>
+  <rect class="node agent-node" x="48" y="255" width="210" height="110"/>
+  <text class="node-title" x="70" y="290">Versioned task</text>
+  <text class="node-detail" x="70" y="316">Prompt + starter code</text>
+  <text class="small-detail" x="70" y="340">Hidden tests stay separate</text>
 
-  <path class="arrow" d="M273 321 H321"/>
-  <rect class="node agent-node" x="322" y="275" width="235" height="92"/>
-  <text class="node-title" x="346" y="312">Agent pod</text>
-  <text class="node-detail" x="346" y="338">The agent edits code</text>
+  <path class="arrow" d="M258 310 H302"/>
+  <rect class="node agent-node" x="303" y="255" width="230" height="110"/>
+  <text class="node-title" x="325" y="290">Agent pod</text>
+  <text class="node-detail" x="325" y="316">Claude or Codex edits code</text>
+  <text class="small-detail" x="325" y="340">Produces workspace + JSONL</text>
 
-  <path class="arrow" d="M557 321 H605"/>
-  <rect class="node agent-node" x="606" y="275" width="250" height="92"/>
-  <text class="node-title" x="630" y="312">Fresh evaluator</text>
-  <text class="node-detail" x="630" y="338">Hidden tests in a clean pod</text>
+  <path class="arrow" d="M533 310 H577"/>
+  <rect class="node grade-node" x="578" y="225" width="278" height="170"/>
+  <text class="node-title" x="600" y="258">Independent grading</text>
+  <rect class="node grade-node" x="600" y="275" width="109" height="88"/>
+  <text class="node-detail" x="654" y="306" text-anchor="middle">Submission</text>
+  <text class="small-detail" x="654" y="329" text-anchor="middle">produced code</text>
+  <text class="small-detail" x="654" y="346" text-anchor="middle">one TCP port</text>
+  <rect class="node grade-node" x="725" y="275" width="109" height="88"/>
+  <text class="node-detail" x="779" y="306" text-anchor="middle">Evaluator</text>
+  <text class="small-detail" x="779" y="329" text-anchor="middle">hidden tests</text>
+  <text class="small-detail" x="779" y="346" text-anchor="middle">owns results</text>
+  <path class="branch" d="M725 319 H713"/>
 
-  <path class="arrow" d="M856 321 H904"/>
-  <rect class="node agent-node" x="905" y="275" width="247" height="92"/>
-  <text class="node-title" x="929" y="312">Scorecard</text>
-  <text class="node-detail" x="929" y="338">Scanners, judge, outcome</text>
+  <path class="arrow" d="M856 310 H900"/>
+  <rect class="node shared-node" x="901" y="255" width="251" height="110"/>
+  <text class="node-title" x="923" y="290">Explicit outcome</text>
+  <text class="node-detail" x="923" y="316">accepted / rejected</text>
+  <text class="node-detail" x="923" y="340">/ infrastructure error</text>
 
-  <rect class="node shared-node" x="48" y="405" width="1104" height="48"/>
-  <text class="node-title" x="600" y="435" text-anchor="middle">Shared assurance: policies | budgets | audit trail | provenance | explicit evidence</text>
+  <path class="branch" d="M418 365 V425 H590"/>
+  <rect class="node agent-node" x="590" y="413" width="260" height="76"/>
+  <text class="node-title" x="612" y="443">Usage evidence</text>
+  <text class="node-detail" x="612" y="468">Time, tokens, cost, turns, tools</text>
+  <path class="branch" d="M850 451 H1025 V365"/>
+
+  <rect class="node shared-node" x="48" y="525" width="1104" height="48"/>
+  <text class="node-title" x="600" y="555" text-anchor="middle">Shared rule: missing evidence stays missing, and required missing evidence fails closed</text>
 </svg>
