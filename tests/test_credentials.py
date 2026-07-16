@@ -197,11 +197,91 @@ def test_stream_search_detects_unicode_escaped_token_across_boundaries():
     )
 
 
+def test_stream_read_window_covers_largest_direct_pattern():
+    class RecordingStream(io.BytesIO):
+        requested_sizes: list[int]
+
+        def __init__(self, value: bytes):
+            super().__init__(value)
+            self.requested_sizes = []
+
+        def read(self, size=-1):
+            self.requested_sizes.append(size)
+            return super().read(size)
+
+    secret = "s" * (credentials_module.REDACTION_READ_CHUNK_BYTES + 1)
+    redactor = CredentialRedactor.from_material(
+        CredentialMaterial(values={"TOKEN": secret}, env_keys=("TOKEN",))
+    )
+    stream = RecordingStream(b"x")
+
+    assert not redactor.contains_stream(stream, maximum_bytes=1)
+    assert stream.requested_sizes[0] >= redactor.maximum_pattern_bytes
+
+
+def test_streaming_json_unescaper_matches_whole_buffer_decoder():
+    samples = [
+        b"plain text",
+        b"trailing\\",
+        b"simple=\\n slash=\\/ quote=\\\"",
+        b"unicode=\\u0061 invalid=\\u00zz",
+        b"incomplete=\\u0\\n shorter=\\u\\t",
+        b"pair=\\ud83d\\ude00 lone=\\ud83d!",
+    ]
+
+    for sample in samples:
+        expected, expected_changed = credentials_module._json_unescape_bytes_once(
+            sample
+        )
+        for split in range(len(sample) + 1):
+            decoder = credentials_module._StreamingJSONUnescaper()
+            output = decoder.feed(sample[:split])
+            output += decoder.feed(sample[split:])
+            output += decoder.finish()
+
+            assert output == expected
+            assert decoder.changed is expected_changed
+        for chunk_bytes in range(1, 14):
+            decoder = credentials_module._StreamingJSONUnescaper()
+            output = b"".join(
+                decoder.feed(sample[offset : offset + chunk_bytes])
+                for offset in range(0, len(sample), chunk_bytes)
+            )
+            output += decoder.finish()
+
+            assert output == expected
+            assert decoder.changed is expected_changed
+
+
 def _nest_json_escape(value: bytes, rounds: int) -> bytes:
     nested = value.decode()
     for _ in range(rounds):
         nested = json.dumps(nested)[1:-1]
     return nested.encode()
+
+
+@pytest.mark.parametrize(
+    "decode_layers",
+    range(credentials_module.MAX_JSON_ESCAPE_DECODE_ROUNDS + 1),
+)
+def test_stream_search_detects_credentials_at_every_json_layer(decode_layers):
+    secret = "credential-at-every-layer"
+    if decode_layers == 0:
+        nested = secret.encode()
+    else:
+        encoded_secret = b"".join(
+            f"\\u{byte:04x}".encode() for byte in secret.encode()
+        )
+        nested = _nest_json_escape(encoded_secret, decode_layers - 1)
+    redactor = CredentialRedactor.from_material(
+        CredentialMaterial(values={"TOKEN": secret}, env_keys=("TOKEN",))
+    )
+
+    assert redactor.contains_stream(
+        io.BytesIO(b"prefix=" + nested + b";suffix"),
+        maximum_bytes=len(nested) + 14,
+        chunk_bytes=7,
+    )
 
 
 def test_nested_json_escape_layers_are_inspected_within_limit():
@@ -219,21 +299,69 @@ def test_nested_json_escape_layers_are_inspected_within_limit():
     )
 
 
+def test_nested_json_escape_layers_are_inspected_across_stream_chunks():
+    secret = "a" * 512
+    encoded_secret = b"\\u0061" * len(secret)
+    nested = _nest_json_escape(
+        encoded_secret,
+        credentials_module.MAX_JSON_ESCAPE_DECODE_ROUNDS - 1,
+    )
+    redactor = CredentialRedactor.from_material(
+        CredentialMaterial(values={"TOKEN": secret}, env_keys=("TOKEN",))
+    )
+
+    assert len(nested) > credentials_module.REDACTION_READ_CHUNK_BYTES
+    assert redactor.contains_stream(
+        io.BytesIO(b"prefix=" + nested + b";suffix"),
+        maximum_bytes=len(nested) + 14,
+    )
+
+
 def test_nested_json_escape_layers_fail_closed_beyond_limit():
     redactor = CredentialRedactor.from_material(
         CredentialMaterial(values={"TOKEN": "different-secret"}, env_keys=("TOKEN",))
+    )
+
+    too_deep = _nest_json_escape(
+        b"\\u0061",
+        credentials_module.MAX_JSON_ESCAPE_DECODE_ROUNDS,
     )
 
     with pytest.raises(
         credentials_module.CredentialRedactionError,
         match="JSON escape inspection limit",
     ):
-        redactor.contains_bytes(
-            _nest_json_escape(
-                b"\\u0061",
-                credentials_module.MAX_JSON_ESCAPE_DECODE_ROUNDS,
-            )
+        redactor.contains_bytes(too_deep)
+    with pytest.raises(
+        credentials_module.CredentialRedactionError,
+        match="JSON escape inspection limit",
+    ):
+        redactor.contains_stream(
+            io.BytesIO(too_deep),
+            maximum_bytes=len(too_deep),
+            chunk_bytes=7,
         )
+
+
+@pytest.mark.parametrize("inner", [b"\\u00", b"\\u00zz", b"\\ud83d"])
+def test_invalid_or_incomplete_escape_after_limit_does_not_false_positive(inner):
+    redactor = CredentialRedactor.from_material(
+        CredentialMaterial(
+            values={"TOKEN": "different-secret"},
+            env_keys=("TOKEN",),
+        )
+    )
+    nested = _nest_json_escape(
+        inner,
+        credentials_module.MAX_JSON_ESCAPE_DECODE_ROUNDS,
+    )
+
+    assert not redactor.contains_bytes(nested)
+    assert not redactor.contains_stream(
+        io.BytesIO(nested),
+        maximum_bytes=len(nested),
+        chunk_bytes=1,
+    )
 
 
 @pytest.mark.parametrize("auth", ["{}", '{"mode":"chatgpt"}'])
