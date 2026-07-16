@@ -57,37 +57,50 @@ infrastructure error, not an agent-quality failure.
 
 ### Requirements
 
-On macOS:
+Clone the project, then install its external tools and Python environment:
 
 ```sh
-brew install uv k3d gitleaks trivy
+git clone https://github.com/wuchris-ch/agent-eval-k3s.git
+cd agent-eval-k3s
+
+brew install uv kubectl k3d gitleaks trivy
+uv sync
 ```
 
-You also need Docker, `kubectl`, and at least one authenticated agent backend:
+You also need Docker and at least one authenticated agent backend:
 
 - `ANTHROPIC_API_KEY` for Claude Code and the Claude judge.
 - A logged-in Codex CLI for Codex: `codex login`.
 
-Install the project and check the machine:
+Check which features the machine is ready to use:
 
 ```sh
-uv sync
 uv run agent-eval doctor
 ```
 
+`uv sync` installs `agent-eval` and its locked Python dependencies into the
+project's local `.venv`. Run the commands below from the `agent-eval-k3s`
+checkout so `uv run` uses that environment.
+
 ### Review a pull request
 
-No cluster is required:
+No cluster is required. Pass the Git repository you want to review with
+`--repo`:
 
 ```sh
-uv run agent-eval review
-uv run agent-eval review --base main --head my-branch
+uv run agent-eval review --repo /path/to/repository
+uv run agent-eval review --repo /path/to/repository \
+  --base main --head my-branch
 ```
+
+If `--repo` is omitted, `agent-eval` reviews the current directory. If `--head`
+is omitted, it reviews the target repository's current working-tree changes.
 
 Run trusted project checks as part of the review:
 
 ```sh
 uv run agent-eval review \
+  --repo /path/to/repository \
   --test-cmd "pytest -q" \
   --check "ruff check ." \
   --context @ticket.md \
