@@ -7,13 +7,15 @@ evidence.
 
 ## What it does
 
-| Command | Question it answers | Kubernetes? |
-|---|---|---:|
-| `agent-eval review` | Is this code change safe to merge? | No |
-| `agent-eval run` | How well did Claude Code or Codex complete this task? | Yes |
+| Command | What it does | Main advantage |
+|---|---|---|
+| `agent-eval review` | Reviews a code change without Kubernetes | Tests and scanners back up model findings |
+| `agent-eval run` | Grades Claude Code or Codex in Kubernetes | Hidden tests grade the result independently |
 
 Both commands collect evidence before making a decision. If required evidence
 is missing, the command fails instead of pretending the result is clean.
+This makes the result easier to explain and reproduce than a model opinion or
+a single benchmark score.
 
 ## Quick start
 
@@ -55,6 +57,9 @@ The review reads the base and head Git objects, loads policy from the trusted
 base, and collects test, scanner, and model-review evidence. Model findings are
 checked against the changed lines before they can affect the risk level.
 
+Unlike a model-only review, a confident but unsupported AI claim cannot raise
+the risk level. Deterministic blockers do not depend on model agreement.
+
 ### Test a coding agent
 
 `run` starts a local k3d cluster when needed:
@@ -77,6 +82,11 @@ uv run agent-eval compare --task example-todo-api --out comparison.json
 uv run agent-eval report --task example-todo-api
 ```
 
+Unlike a one-number benchmark, repeated trials keep the evidence behind the
+score and separate agent failures from harness failures.
+This also complements public leaderboards by testing your own versioned tasks
+and acceptance rules.
+
 ## How an agent run works
 
 1. The harness loads a versioned task with a prompt and starter code.
@@ -92,6 +102,9 @@ uv run agent-eval report --task example-todo-api
 The submission and evaluator are separate in protected runs. The evaluator
 owns the hidden tests and results. It can contact the submission only through
 the task's declared TCP port.
+
+This is safer than grading inside the agent's workspace: the agent cannot edit
+the hidden tests or write its own passing result.
 
 ## Where the metrics come from
 
@@ -111,6 +124,9 @@ provide a trustworthy per-run cost, so Codex cost is stored as `null`.
 The harness does not invent missing values. For example, if one Codex turn has
 no valid token count, the total token fields stay `null` instead of reporting a
 partial total.
+
+That is more honest than filling gaps with estimates. It also keeps model
+quality separate from missing provider telemetry.
 
 Each run is saved in two main forms:
 
@@ -133,6 +149,9 @@ uv run agent-eval verify-run --run <run-id>
 
 Passing the hidden tests is not always enough. A run can still be rejected for
 a detected secret, a scanner failure, or an exceeded budget.
+
+Keeping `rejected` separate from `infra_error` also prevents a broken cluster
+from being counted as a bad agent result.
 
 ## Need the full reference?
 
