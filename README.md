@@ -237,6 +237,11 @@ can synchronize them without printing them:
 EVAL_K3S_SYNC=1 review-eval
 ```
 
+The repository watch list follows the same local-only path. Set
+`GITHUB_REPOSITORIES` to a comma-separated list before synchronizing, or put
+that list on one line in `.review-repositories`. The file is ignored by Git so
+private repository names do not become part of the public project.
+
 The simpler Compose stack remains available for one-off evaluation:
 
 ```sh

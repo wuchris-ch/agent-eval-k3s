@@ -223,8 +223,6 @@ spec:
             - secretRef:
                 name: review-runtime
           env:
-            - name: GITHUB_REPOSITORIES
-              value: wuchris-ch/agent-eval-k3s,wuchris-ch/pr-review-agent
             - name: REVIEW_POLL_INTERVAL_SECONDS
               value: "60"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
