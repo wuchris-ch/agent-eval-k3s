@@ -1,313 +1,211 @@
-# agent-eval-k3s
+# Agent Eval on k3s
 
-An evaluation-only harness for AI agents. It runs repeatable golden cases,
-records evidence, assigns `accepted`, `rejected`, or `infra_error`, and can
-export content-minimized OpenTelemetry spans.
+[![Assurance](https://github.com/wuchris-ch/agent-eval-k3s/actions/workflows/ci.yml/badge.svg)](https://github.com/wuchris-ch/agent-eval-k3s/actions/workflows/ci.yml)
+[![Python 3.12–3.14](https://img.shields.io/badge/python-3.12%E2%80%933.14-3776AB)](pyproject.toml)
+[![Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-2f855a)](LICENSE)
 
-![Local k3s review and evaluation platform](docs/local-review-platform.svg)
+An evidence-first evaluation platform for AI coding and pull-request review
+agents. It runs blinded, versioned tasks, keeps grading outside the agent's
+control, distinguishes bad answers from broken infrastructure, and exports
+privacy-filtered traces through OpenTelemetry and Phoenix.
 
-This repository does not contain a pull-request review agent. It can evaluate
-one that is installed separately, such as
-[`pr-review-agent`](https://github.com/wuchris-ch/pr-review-agent).
+![Agent evaluation and observability architecture](docs/local-review-platform.svg)
 
-## What it evaluates
+This repository contains the evaluation system. The separately deployable
+reviewer lives in [`pr-review-agent`](https://github.com/wuchris-ch/pr-review-agent).
 
-| Target | Command | Main evidence |
+## Latest validated benchmark
+
+The release-quality benchmark runs every one of the 20 reviewer cases three
+times. This result was recorded on September 3, 2026 with `gemini-3.8-flash`
+against reviewer corpus `v1.1.0`. Raw model responses stay local.
+
+| Metric | Result | Required gate |
+|---|---:|---:|
+| Release gate | **PASS** | `PASS` |
+| Overall grade | **A** | A |
+| Average score | **1.000** | ≥ 0.900 |
+| Accepted evaluations | **60/60** | Informational |
+| Infrastructure errors | **0** | 0 |
+| Security-blocker recall | **100%** (21/21) | 100% |
+| Clean-diff accuracy | **100%** (21/21) | ≥ 95% |
+| Case stability | **100%** (20/20) | 100% |
+| First-pass acceptance | **95%** (57/60) | Informational |
+
+See the [complete versioned result](benchmarks/reviewer-corpus/v1/results/2026-09-03.md)
+for run identities, report digests, and every case and trial.
+
+## What makes the evaluation trustworthy
+
+- **Blind execution.** The target receives the raw diff or task workspace, not
+  the case ID, golden findings, scoring threshold, or expected answer.
+- **Independent evidence.** The harness owns hidden tests, scanners, golden
+  matches, acceptance policy, and the final result.
+- **Explicit failure semantics.** `accepted`, `rejected`, and `infra_error`
+  prevent a broken model request from being counted as a clean result.
+- **Reproducible inputs.** Corpus artifacts, expected findings, task images,
+  commands, and reports are bound to hashes and versioned metadata.
+- **Honest correction metrics.** First attempts and critique-guided corrections
+  are recorded separately, so retries cannot rewrite the baseline.
+- **Privacy-aware observability.** Traces retain scores, latency, attempts, and
+  counts while excluding prompts, diffs, completions, credentials, and private
+  endpoints.
+
+## Evaluation modes
+
+| Mode | Target | Evidence |
 |---|---|---|
-| External review agent | `agent-eval eval-review-agent` | Golden diffs, exact finding matches, block decisions, optional GEval |
-| Coding agent | `agent-eval run` | Hidden tests, scanners, challenge checks, optional judge |
-| Existing workspace | `agent-eval evaluate` | The same evaluator without running an agent |
+| Reviewer benchmark | External review-agent executable | 20 golden diffs, exact finding matches, block decisions, stability, optional GEval |
+| Coding-agent run | Agent working inside k3s | Hidden tests, coverage, Semgrep, Gitleaks, Trivy, Ruff, challenges, optional judge |
+| Existing workspace | Already-produced code | The same evaluator without launching an agent |
 
-The harness keeps evaluator failures separate from bad agent results. A
-nonzero agent exit, invalid JSON, missing evidence, or broken environment is
-`infra_error`, never a clean result.
+### Reviewer benchmark
+
+Each case binds a raw unified diff to expected file, category, severity, and
+changed-line ranges. Deterministic scoring combines finding F1 with the expected
+block decision. A valid rejected result may receive one critique-guided retry,
+but both attempts remain in the report.
+
+The strict cohort gate requires:
+
+- zero infrastructure errors;
+- 100% recall for security-blocker goldens;
+- at least 95% accuracy on clean diffs; and
+- identical verdict signatures across all three trial rounds.
+
+An optional DeepEval GEval judge can make a score stricter, but it cannot
+override failed deterministic evidence.
+
+### Isolated coding-agent evaluation
+
+The strongest task mode is `isolated-black-box`:
+
+1. The agent receives a prompt and starter workspace in its own pod.
+2. Hidden tests remain inside a separate evaluator image.
+3. The produced application is exposed through one declared TCP port.
+4. The evaluator runs hidden tests, coverage, scanners, and policy checks.
+5. The agent cannot edit its evaluator or final result.
 
 ## Quick start
 
-On macOS:
+Requirements on macOS:
 
 ```sh
-git clone https://github.com/wuchris-ch/agent-eval-k3s.git
-cd agent-eval-k3s
-
 brew install uv kubectl k3d gitleaks trivy
 uv sync --frozen
 uv run agent-eval doctor
 ```
 
-Docker is used for the local Phoenix and OpenTelemetry stack and for the
-isolated k3s coding-agent flow.
+### Run the reviewer benchmark locally
 
-## Evaluate an external review agent
-
-After installing the sibling reviewer with `npm link`, the normal command is:
+Install the sibling reviewer once with `npm link`, configure an
+OpenAI-compatible model gateway, then run:
 
 ```sh
 ./evaluate-reviewer
 ```
 
-This one command uses Docker Compose for the smallest local workflow:
+The command starts Phoenix and the OpenTelemetry Collector with Docker Compose,
+runs one trial across all 20 cases, writes `review-agent-eval.json`, and prints
+the dashboard URL. For a release-quality run:
 
-1. starts or verifies the local Phoenix and OpenTelemetry services;
-2. enables privacy-filtered OTLP export;
-3. runs one trial across the 20-case reviewer corpus;
-4. writes `review-agent-eval.json`; and
-5. prints the local Phoenix dashboard URL.
+```sh
+EVAL_TRIALS=3 ./evaluate-reviewer
+```
 
-The observability services use `restart: unless-stopped`, so Docker keeps them
-running between evaluations. Use `EVAL_TRIALS=3 ./evaluate-reviewer` for a
-slower release-quality stability run. Set `EVAL_OBSERVABILITY=0` for a
-result-only run without Docker.
-
-For continuous PR reviews, a nightly three-trial evaluation, persistent
-results, and the same Phoenix dashboard in local k3s, use `review-stack`
-instead. See [Local k3s operation](#local-k3s-operation).
-
-For a fast single-case smoke check:
+For a fast smoke test:
 
 ```sh
 EVAL_CASE=auth-bypass ./evaluate-reviewer
 ```
 
-The full command below documents what the shortcut runs internally.
+### Run the complete local k3s platform
 
-The target is an executable owned and installed outside this repository:
-
-```sh
-uv run --extra observability agent-eval eval-review-agent \
-  --command "pr-review-agent" \
-  --corpus benchmarks/reviewer-corpus/v1/corpus.yaml \
-  --trials 1 \
-  --out review-agent-eval.json
-```
-
-This command runs locally and must be trusted. The harness uses `shell=False`
-and terminates its dedicated process group after each attempt, but it is not a
-host sandbox.
-
-For every case, the harness writes the exact raw unified diff to the target's
-standard input. It does not pass the case name, expected answer, threshold, or
-golden findings to the child process.
-
-Version 1 caps each raw diff at 64 KiB. Larger cases fail closed before the
-target starts. A later contract can add negotiated per-agent capabilities.
-
-The target must write one JSON object to standard output:
-
-```json
-{
-  "schema_version": "1.0",
-  "input_sha256": "<lowercase SHA-256 of the exact raw diff>",
-  "risk": "high",
-  "blocked": true,
-  "findings": [
-    {
-      "severity": "blocker",
-      "category": "security",
-      "file": "src/auth.py",
-      "line": 42,
-      "detail": "Authorization can be bypassed."
-    }
-  ],
-  "rationale": "The change removes an authorization check."
-}
-```
-
-The contract is strict:
-
-- A blocker means `risk: high` and `blocked: true`.
-- A major finding without a blocker means `risk: medium` and `blocked: true`.
-- Minor or info findings only mean `risk: low` and `blocked: false`.
-- Finding severity is `blocker`, `major`, `minor`, or `info`.
-- Finding category is `security`, `correctness`, `style`, or `performance`.
-- Files are repository-relative and lines are positive integers.
-- Unknown fields, duplicate keys, trailing text, non-finite numbers, and an
-  incorrect `input_sha256` are rejected.
-- A nonzero exit or invalid output is `infra_error`.
-
-Standard input is the default and preferred cross-repository contract. Use
-`--diff-file-flag=--diff` when the target accepts a temporary diff path.
-
-The child environment is allowlisted. Generic target configuration includes
-`MODEL_GATEWAY_API_KEY`, `MODEL_GATEWAY_BASE_URL`, and `REVIEW_AGENT_MODEL`.
-Custom certificate stores can use `SSL_CERT_FILE`, `SSL_CERT_DIR`, or
-`NODE_EXTRA_CA_CERTS`. Safe OTLP endpoint, protocol, exporter, and service-name
-settings are forwarded so the target can emit traces. OTLP headers and resource
-attributes are not forwarded because they can contain credentials or private
-metadata.
-
-### Scoring and correction
-
-Deterministic scoring compares file, category, severity, and line against the
-versioned goldens. It combines finding F1 with the expected block decision.
-The default acceptance threshold is `0.6`.
-
-After a valid rejected first attempt, the harness can run one corrected
-attempt. The raw diff remains byte-for-byte unchanged. Prior critique is sent
-only as `AGENT_EVAL_FEEDBACK`. Results keep first-attempt and corrected-attempt
-metrics separately, so the correction never rewrites the baseline.
-
-Disable correction with `--no-self-correct`.
-
-### Optional DeepEval GEval judge
-
-The deterministic score works offline. To add a model judge:
+The k3s stack keeps the PR worker, Phoenix, and OpenTelemetry Collector running
+and schedules the three-trial benchmark for 2:00 AM Vancouver time.
 
 ```sh
-export MODEL_GATEWAY_API_KEY="..."
-export MODEL_GATEWAY_BASE_URL="https://gateway.example/v1"  # optional
-export AGENT_EVAL_JUDGE_MODEL="your-model-id"
-
-EVAL_JUDGE=1 ./evaluate-reviewer
+./review-stack sync-secrets
+./review-stack up
 ```
 
-GEval can tighten a result but cannot override failed golden evidence. The
-gateway settings are generic and work with an OpenAI-compatible endpoint.
-Enabling `--judge` sends the diff, output, and golden expectation to that
-endpoint. Leave it disabled when those materials must stay local.
-
-## Evaluate coding agents in k3s
-
-The existing isolated task flow remains evaluation infrastructure:
+Normal operations are intentionally short:
 
 ```sh
-uv run agent-eval run \
-  --task example-todo-api \
-  --agent codex \
-  --trials 3 \
-  --experiment-id todo-example \
-  --gate
-```
-
-Each run uses a versioned task and starter workspace. The agent edits code in
-an isolated pod, then a separate evaluator runs hidden tests and configured
-scanners. The agent cannot edit the hidden tests or its final result.
-
-Evaluate an already-produced workspace without launching an agent:
-
-```sh
-uv run agent-eval evaluate \
-  --task example-todo-api \
-  --workspace /path/to/workspace \
-  --gate
-```
-
-Compare and verify saved results:
-
-```sh
-uv run agent-eval compare --task example-todo-api --out comparison.json
-uv run agent-eval report --task example-todo-api
-uv run agent-eval verify-run --run <run-id>
-```
-
-## Local k3s operation
-
-The evaluator is intentionally a batch job. It should run against a fixed
-corpus, record a result, and exit. Keeping an evaluation process alive would
-waste model calls and make results harder to compare.
-
-The included local stack keeps the PR worker, Phoenix, and the OpenTelemetry
-Collector running in k3s. It also schedules the complete 20-case corpus for
-three trials every day at 2:00 AM Vancouver time. On a Mac, the services pause while the
-machine or Docker Desktop sleeps and recover when the k3d cluster returns.
-
-After the sibling reviewer is checked out next to this repository and runtime
-credentials have been synchronized, the normal commands are:
-
-```sh
-./review-stack up          # build and start everything
-./review-stack status      # show worker, scheduler, jobs, and pods
+./review-stack status      # deployments, scheduler, jobs, and pods
 ./review-stack dashboard   # open Phoenix
-./review-stack eval        # run the complete three-trial evaluation now
-./review-stack results     # copy the latest k3s report into this checkout
-./review-stack logs        # show recent PR worker activity
-./review-stack pause       # pause reviews and nightly evaluation
+./review-stack eval        # run the complete benchmark now
+./review-stack results     # copy the newest report into this checkout
+./review-stack logs        # recent PR worker activity
+./review-stack pause       # pause reviews and scheduled evaluation
 ./review-stack resume      # resume both
 ```
 
-The worker polls the configured GitHub repositories once per minute. It reviews
-each new PR head SHA once, publishes a review comment, and sets a commit status.
-The head-specific marker prevents duplicate reviews after pod restarts.
+The worker polls configured GitHub repositories once per minute and reviews
+each new PR head SHA once. Credentials and repository names are synchronized
+into a local Kubernetes Secret. A local `.review-repositories` file may hold a
+private comma-separated watch list and is ignored by Git.
 
-Runtime credentials are stored only in a local Kubernetes Secret. They are not
-written to a manifest or container image. The local `review-eval` shell helper
-can synchronize them without printing them:
+On a Mac, the cluster pauses when the machine or Docker Desktop sleeps. The k3d
+containers use `unless-stopped`, and Kubernetes restores the declared workloads
+when Docker returns.
 
-```sh
-EVAL_K3S_SYNC=1 review-eval
-```
+## Outputs and observability
 
-The repository watch list follows the same local-only path. Set
-`GITHUB_REPOSITORIES` to a comma-separated list before synchronizing, or put
-that list on one line in `.review-repositories`. The file is ignored by Git so
-private repository names do not become part of the public project.
-
-The simpler Compose stack remains available for one-off evaluation:
-
-```sh
-docker compose -f observability/compose.yaml up -d --wait
-```
-
-## Outcomes
-
-| Outcome | Meaning |
-|---|---|
-| `accepted` | The target completed and met every configured requirement. |
-| `rejected` | The target completed, but its evidence did not meet the threshold or policy. |
-| `infra_error` | The harness could not collect trustworthy evidence. |
-
-Infrastructure errors count as zero in cohort averages, so broken executions
-cannot inflate a grade. Cohort grades are A at `0.90`, B at `0.75`, C at
-`0.60`, and F below `0.60`.
-
-### Versioned baseline records
-
-The detailed JSON report is local because it contains model-written review
-text. A content-minimized Markdown record can be committed safely after a
-release-quality run:
+The detailed JSON report is the authoritative record. It contains every trial,
+first and corrected attempt, score component, outcome, and timing measurement.
+A content-minimized Markdown record can be published with:
 
 ```sh
 ./record-review-eval gemini-3.8-flash
 ```
 
-The record includes run identity, aggregate gates, first-pass quality,
-per-case trial results, and a digest of the local raw report. It excludes raw
-diffs, model responses, credentials, endpoints, and provider identity.
+OpenTelemetry spans flow through a checked-in Collector configuration before
+reaching Phoenix. The projection includes corpus identity, case, trial,
+outcome, attempt count, scores, latency, finding counts, and a command digest.
+The Collector removes prompt, completion, provider, server-address, and
+authorization attributes.
 
-## OpenTelemetry
+Local result files remain authoritative if telemetry is unavailable.
 
-`./evaluate-reviewer` starts and configures the checked-in local stack
-automatically. For another command that exports to the same stack, use:
+## Outcome model
 
-```sh
-export AGENT_EVAL_OTEL_ENABLED=1
-export OTEL_EXPORTER_OTLP_PROTOCOL="http/protobuf"
-export OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:4318"
+| Outcome | Meaning |
+|---|---|
+| `accepted` | The target completed and met every configured requirement. |
+| `rejected` | The target completed, but its evidence failed a quality gate. |
+| `infra_error` | The harness could not collect trustworthy evidence. |
+
+Infrastructure errors contribute zero to cohort averages, so broken execution
+cannot inflate a grade. Grades are A at `0.90`, B at `0.75`, C at `0.60`, and F
+below `0.60`.
+
+## Repository map
+
+```text
+benchmarks/        versioned reviewer corpora, goldens, and public records
+deploy/            evaluator image and local k3s manifests
+observability/     Docker Compose and privacy-filtering OTel configuration
+src/agent_eval/    runner, evaluators, policy, evidence, and reporting
+tasks/             isolated coding-agent tasks and hidden evaluators
+tests/             unit, integration, adversarial, and assurance tests
 ```
 
-External-agent spans include corpus identity, case ID, trial number, outcome,
-attempt count, scores, latency, finding counts, and a hash of the command argv.
-They do not export raw diffs, agent output, goldens, feedback, or judge reasons.
-The Collector also removes prompt, completion, provider, server-address, and
-authorization attributes before local storage. The JSON evaluation result
-remains the detailed local record.
-
-## Corpus and task checks
-
-Validate corpus hashes and golden locations without executing its reproducer:
+## Development
 
 ```sh
-uv run agent-eval corpus validate \
-  benchmarks/reviewer-corpus/v1/corpus.yaml
+uv run ruff check .
+uv run pytest
+uv build --no-sources
 ```
 
-Run a reproducer only after reviewing and trusting it:
+The CI matrix tests Python 3.12, 3.13, and 3.14, builds the isolated task
+images, verifies embedded agent binaries, runs pinned secret and vulnerability
+scanners, and proves the packaged wheel works without the source tree.
 
-```sh
-uv run agent-eval corpus validate \
-  benchmarks/reviewer-corpus/v1/corpus.yaml \
-  --allow-local-execution
-```
+See [DETAILS.md](DETAILS.md) for the exact contracts, metrics, governance,
+attestation, isolation model, and security boundaries.
 
-See [DETAILS.md](DETAILS.md) for task isolation, metrics, governance,
-attestations, state paths, and security boundaries.
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
