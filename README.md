@@ -89,69 +89,38 @@ The strongest task mode is `isolated-black-box`:
 4. The evaluator runs hidden tests, coverage, scanners, and policy checks.
 5. The agent cannot edit its evaluator or final result.
 
-## Quick start
+## Platform stack
 
-Requirements on macOS:
+| Layer | Technology | Responsibility |
+|---|---|---|
+| Runtime | Python 3.12+, Pydantic, Typer, uv | Typed evaluation contracts, orchestration, reporting, and reproducible dependency resolution |
+| Local cloud | k3d, k3s, Kubernetes | Long-running reviewer worker, isolated evaluation jobs, nightly scheduling, Secrets, Services, and persistent volumes |
+| Evaluation | Deterministic goldens, hidden pytest suites, coverage, DeepEval GEval | Combines exact evidence with an optional model judge without allowing subjective grading to weaken a failed hard gate |
+| Security evidence | Semgrep, Gitleaks, Trivy, Ruff | Static analysis, secret detection, vulnerability scanning, and code-quality signals with pinned invocation policy |
+| Observability | OpenTelemetry SDK, OTLP, OpenTelemetry Collector, Phoenix | End-to-end traces for runs, attempts, scores, latency, and failures, with sensitive review content removed before export |
+| Evidence store | Versioned JSON, SQLite, SHA-256 digests | Preserves the canonical run record, queryable metrics, provenance, and later verification |
+| Automation | GitHub watcher, Kubernetes Deployment, CronJob | Reviews new pull-request revisions continuously and runs the three-trial release benchmark every night |
+| Delivery | Docker, pinned images, GitHub Actions | Reproducible task isolation, multi-version tests, scanner verification, package builds, and supply-chain checks |
 
-```sh
-brew install uv kubectl k3d gitleaks trivy
-uv sync --frozen
-uv run agent-eval doctor
+### Always-on local control plane
+
+The platform runs as a small local AI operations environment rather than a
+one-shot script. A persistent Kubernetes worker polls configured repositories
+once per minute, reviews each new pull-request head exactly once per policy
+version, publishes the verdict, and reports a GitHub commit status. A nightly
+CronJob then re-evaluates the reviewer against the complete golden corpus.
+
+```text
+GitHub pull request -> k3s reviewer -> model gateway -> validated verdict -> GitHub
+                              |                 |
+                              +-> OTLP Collector +-> Phoenix trace explorer
+
+Versioned corpus -> isolated evaluator -> evidence gates -> JSON + SQLite -> release grade
 ```
 
-### Run the reviewer benchmark locally
-
-Install the sibling reviewer once with `npm link`, configure an
-OpenAI-compatible model gateway, then run:
-
-```sh
-./evaluate-reviewer
-```
-
-The command starts Phoenix and the OpenTelemetry Collector with Docker Compose,
-runs one trial across all 20 cases, writes `review-agent-eval.json`, and prints
-the dashboard URL. For a release-quality run:
-
-```sh
-EVAL_TRIALS=3 ./evaluate-reviewer
-```
-
-For a fast smoke test:
-
-```sh
-EVAL_CASE=auth-bypass ./evaluate-reviewer
-```
-
-### Run the complete local k3s platform
-
-The k3s stack keeps the PR worker, Phoenix, and OpenTelemetry Collector running
-and schedules the three-trial benchmark for 2:00 AM Vancouver time.
-
-```sh
-./review-stack sync-secrets
-./review-stack up
-```
-
-Normal operations are intentionally short:
-
-```sh
-./review-stack status      # deployments, scheduler, jobs, and pods
-./review-stack dashboard   # open Phoenix
-./review-stack eval        # run the complete benchmark now
-./review-stack results     # copy the newest report into this checkout
-./review-stack logs        # recent PR worker activity
-./review-stack pause       # pause reviews and scheduled evaluation
-./review-stack resume      # resume both
-```
-
-The worker polls configured GitHub repositories once per minute and reviews
-each new PR head SHA once. Credentials and repository names are synchronized
-into a local Kubernetes Secret. A local `.review-repositories` file may hold a
-private comma-separated watch list and is ignored by Git.
-
-On a Mac, the cluster pauses when the machine or Docker Desktop sleeps. The k3d
-containers use `unless-stopped`, and Kubernetes restores the declared workloads
-when Docker returns.
+Kubernetes provides declarative recovery for the reviewer, telemetry pipeline,
+trace UI, scheduler, and result persistence. On a laptop, work pauses while the
+machine sleeps and resumes when Docker and the local cluster return.
 
 ## Outputs and observability
 
