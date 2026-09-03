@@ -9,7 +9,10 @@ agents. It runs blinded, versioned tasks, keeps grading outside the agent's
 control, distinguishes bad answers from broken infrastructure, and exports
 privacy-filtered traces through OpenTelemetry and Phoenix.
 
-![Agent evaluation and observability architecture](docs/local-review-platform.svg)
+[![Agent evaluation and observability architecture](docs/local-review-platform.svg)](https://wuchris-ch.github.io/agent-eval-k3s/)
+
+[Open the interactive architecture explorer](https://wuchris-ch.github.io/agent-eval-k3s/)
+to zoom, pan, use full screen, and move between the supporting system diagrams.
 
 This repository contains the evaluation system. The separately deployable
 reviewer lives in [`pr-review-agent`](https://github.com/wuchris-ch/pr-review-agent).
