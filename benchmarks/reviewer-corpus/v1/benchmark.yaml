@@ -1,0 +1,159 @@
+cases:
+  - id: auth-bypass
+    description: Authorization was changed to allow every user to delete records.
+    changed_lines: 1
+    expected:
+      - id: AUTH-001
+        severity: blocker
+        category: security
+        file: auth.py
+        line_start: 2
+        line_end: 2
+  - id: clean-refactor
+    description: A behavior-preserving extraction with no review finding.
+    changed_lines: 3
+    expected: []
+  - id: sql-injection
+    description: Parameterized SQL was replaced with direct user-input interpolation.
+    changed_lines: 1
+    expected:
+      - id: SEC-001
+        severity: blocker
+        category: security
+        file: queries.py
+        line_start: 2
+        line_end: 2
+  - id: shell-injection
+    description: An argv-based subprocess call was replaced with an interpolated shell command.
+    changed_lines: 1
+    expected:
+      - id: SEC-002
+        severity: blocker
+        category: security
+        file: revisions.py
+        line_start: 5
+        line_end: 5
+  - id: path-traversal
+    description: The upload-root containment check was disabled.
+    changed_lines: 1
+    expected:
+      - id: SEC-003
+        severity: blocker
+        category: security
+        file: paths.py
+        line_start: 6
+        line_end: 6
+  - id: secret-exposure
+    description: Audit output now contains an unredacted credential value.
+    changed_lines: 1
+    expected:
+      - id: SEC-004
+        severity: blocker
+        category: security
+        file: audit.py
+        line_start: 2
+        line_end: 2
+  - id: tls-verification-disabled
+    description: Certificate verification was disabled for outbound requests.
+    changed_lines: 1
+    expected:
+      - id: SEC-005
+        severity: blocker
+        category: security
+        file: client.py
+        line_start: 2
+        line_end: 2
+  - id: swallowed-error
+    description: Invalid configuration now silently falls back to a privileged port value.
+    changed_lines: 4
+    expected:
+      - id: COR-001
+        severity: major
+        category: correctness
+        file: config.py
+        line_start: 5
+        line_end: 5
+  - id: pagination-last-page
+    description: The final page was removed from the requested page range.
+    changed_lines: 1
+    expected:
+      - id: COR-002
+        severity: major
+        category: correctness
+        file: pages.py
+        line_start: 2
+        line_end: 2
+  - id: tenant-cache-collision
+    description: Tenant identity was removed from a shared cache key.
+    changed_lines: 1
+    expected:
+      - id: SEC-006
+        severity: blocker
+        category: security
+        file: cache.py
+        line_start: 2
+        line_end: 2
+  - id: transfer-balance-loss
+    description: A transfer now subtracts funds from both accounts.
+    changed_lines: 1
+    expected:
+      - id: COR-003
+        severity: blocker
+        category: correctness
+        file: ledger.py
+        line_start: 3
+        line_end: 3
+  - id: retry-extra-attempt
+    description: Retry scheduling now exceeds the configured maximum attempt count.
+    changed_lines: 1
+    expected:
+      - id: COR-004
+        severity: major
+        category: correctness
+        file: retry.py
+        line_start: 2
+        line_end: 2
+  - id: validation-boundary
+    description: Valid boundary values are now rejected.
+    changed_lines: 1
+    expected:
+      - id: COR-005
+        severity: major
+        category: correctness
+        file: validation.py
+        line_start: 2
+        line_end: 2
+  - id: signature-timing-compare
+    description: Constant-time signature comparison was replaced with ordinary equality.
+    changed_lines: 1
+    expected:
+      - id: SEC-007
+        severity: major
+        category: security
+        file: signatures.py
+        line_start: 2
+        line_end: 2
+  - id: clean-fstring
+    description: String formatting was modernized without changing behavior.
+    changed_lines: 1
+    expected: []
+  - id: clean-constant
+    description: A literal timeout was extracted into a named constant.
+    changed_lines: 2
+    expected: []
+  - id: clean-comprehension
+    description: A loop was replaced with an equivalent list comprehension.
+    changed_lines: 1
+    expected: []
+  - id: clean-guard-clause
+    description: Conditional branches were simplified into a guard clause.
+    changed_lines: 2
+    expected: []
+  - id: clean-enumerate
+    description: Index-based iteration was replaced with enumerate.
+    changed_lines: 1
+    expected: []
+  - id: clean-dict-get
+    description: A dictionary membership branch was replaced with dict.get.
+    changed_lines: 1
+    expected: []

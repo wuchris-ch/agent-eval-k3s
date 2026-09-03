@@ -1,0 +1,6 @@
+{
+  "findings": [
+    {"severity": "major", "category": "security", "file": "auth.py", "line": 2}
+  ],
+  "metrics": {"latency_s": 1.8, "tokens": 920, "cost_usd": 0.023}
+}

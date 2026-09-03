@@ -1,0 +1,182 @@
+#!/bin/sh
+set -eu
+
+repository_root=$(CDPATH= cd "$(dirname "$0")" && pwd)
+reviewer_root=${PR_REVIEW_AGENT_REPO:-"$(dirname "$repository_root")/pr-review-agent"}
+namespace=agent-eval
+
+usage() {
+  printf '%s\n' \
+    'usage: ./review-stack up|sync-secrets|status|dashboard|eval|results|logs|pause|resume'
+}
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'Required command is missing: %s\n' "$1" >&2
+    exit 1
+  fi
+}
+
+ensure_namespace() {
+  kubectl apply -f "$repository_root/deploy/k3s/namespace.yaml" >/dev/null
+}
+
+sync_secrets() {
+  for variable in MODEL_GATEWAY_API_KEY MODEL_GATEWAY_BASE_URL REVIEW_AGENT_MODEL; do
+    eval "value=\${$variable:-}"
+    if [ -z "$value" ]; then
+      printf '%s is required.\n' "$variable" >&2
+      exit 1
+    fi
+    case "$value" in
+      *"
+"* | *""*)
+        printf '%s contains an unsupported newline.\n' "$variable" >&2
+        exit 1
+        ;;
+    esac
+  done
+  require_command gh
+  github_token=$(gh auth token)
+  secret_file=$(mktemp "${TMPDIR:-/tmp}/review-runtime.XXXXXX")
+  trap 'rm -f "$secret_file"' EXIT HUP INT TERM
+  chmod 600 "$secret_file"
+  {
+    printf 'MODEL_GATEWAY_API_KEY=%s\n' "$MODEL_GATEWAY_API_KEY"
+    printf 'MODEL_GATEWAY_BASE_URL=%s\n' "$MODEL_GATEWAY_BASE_URL"
+    printf 'REVIEW_AGENT_MODEL=%s\n' "$REVIEW_AGENT_MODEL"
+    printf 'GITHUB_TOKEN=%s\n' "$github_token"
+  } >"$secret_file"
+  ensure_namespace
+  kubectl create secret generic review-runtime \
+    --namespace "$namespace" \
+    --from-env-file="$secret_file" \
+    --dry-run=client \
+    -o yaml | kubectl apply -f - >/dev/null
+  rm -f "$secret_file"
+  trap - EXIT HUP INT TERM
+  if kubectl get deployment pr-review-worker -n "$namespace" >/dev/null 2>&1; then
+    kubectl rollout restart deployment/pr-review-worker -n "$namespace" >/dev/null
+  fi
+  printf '%s\n' 'Local k3s runtime credentials synchronized.'
+}
+
+stack_up() {
+  require_command docker
+  require_command k3d
+  require_command kubectl
+  if ! docker info >/dev/null 2>&1; then
+    printf '%s\n' 'Docker Desktop is not running.' >&2
+    exit 1
+  fi
+  if [ ! -f "$reviewer_root/package.json" ]; then
+    printf 'Reviewer repository was not found at %s\n' "$reviewer_root" >&2
+    exit 1
+  fi
+  if ! k3d cluster list --no-headers 2>/dev/null | awk '{print $1}' | grep -qx agent-eval; then
+    k3d cluster create --config "$repository_root/deploy/k3d.yaml"
+  fi
+  kubectl config use-context k3d-agent-eval >/dev/null
+  ensure_namespace
+  if ! kubectl get secret review-runtime -n "$namespace" >/dev/null 2>&1; then
+    printf '%s\n' \
+      'Runtime credentials are missing. Run EVAL_K3S_SYNC=1 review-eval once.' >&2
+    exit 1
+  fi
+
+  docker build --tag pr-review-agent:local "$reviewer_root"
+  docker build \
+    --build-context "reviewer=$reviewer_root" \
+    --file "$repository_root/deploy/evaluator.Dockerfile" \
+    --tag agent-eval:local \
+    "$repository_root"
+  k3d image import --cluster agent-eval pr-review-agent:local agent-eval:local
+  kubectl create configmap otel-collector \
+    --namespace "$namespace" \
+    --from-file="config.yaml=$repository_root/observability/otel-collector.yaml" \
+    --dry-run=client \
+    -o yaml | kubectl apply -f - >/dev/null
+  kubectl apply -f "$repository_root/deploy/k3s/stack.yaml"
+  kubectl rollout restart deployment/otel-collector deployment/pr-review-worker \
+    -n "$namespace" >/dev/null
+  kubectl rollout status deployment/phoenix -n "$namespace" --timeout=10m
+  kubectl rollout status deployment/otel-collector -n "$namespace" --timeout=5m
+  kubectl rollout status deployment/pr-review-worker -n "$namespace" --timeout=5m
+  kubectl rollout status deployment/results-keeper -n "$namespace" --timeout=5m
+  printf '%s\n' \
+    'Review stack is running.' \
+    'Dashboard: http://127.0.0.1:6006' \
+    'Use ./review-stack status at any time.'
+}
+
+run_evaluation() {
+  job="reviewer-evaluation-manual-$(date -u +%Y%m%d%H%M%S)"
+  kubectl create job --from=cronjob/reviewer-evaluation "$job" -n "$namespace"
+  printf 'Evaluation job: %s\n' "$job"
+  deadline=$(($(date +%s) + 3600))
+  while :; do
+    complete=$(kubectl get "job/$job" -n "$namespace" \
+      -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}')
+    failed=$(kubectl get "job/$job" -n "$namespace" \
+      -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}')
+    if [ "$complete" = True ]; then
+      break
+    fi
+    if [ "$failed" = True ] || [ "$(date +%s)" -ge "$deadline" ]; then
+      kubectl logs "job/$job" -n "$namespace" --tail=100 || true
+      exit 1
+    fi
+    sleep 5
+  done
+  kubectl logs "job/$job" -n "$namespace" --tail=100
+  copy_results
+}
+
+copy_results() {
+  pod=$(kubectl get pod -n "$namespace" \
+    -l app=results-keeper \
+    -o jsonpath='{.items[0].metadata.name}')
+  kubectl cp "$namespace/$pod:/results/latest.json" \
+    "$repository_root/review-agent-eval.json" \
+    -c results
+  printf 'Latest report: %s/review-agent-eval.json\n' "$repository_root"
+}
+
+command=${1:-}
+case "$command" in
+  up)
+    stack_up
+    ;;
+  sync-secrets)
+    sync_secrets
+    ;;
+  status)
+    kubectl get deployments,cronjobs,jobs,pods -n "$namespace"
+    ;;
+  dashboard)
+    open http://127.0.0.1:6006
+    ;;
+  eval)
+    run_evaluation
+    ;;
+  results)
+    copy_results
+    ;;
+  logs)
+    kubectl logs deployment/pr-review-worker -n "$namespace" --tail=100
+    ;;
+  pause)
+    kubectl scale deployment/pr-review-worker -n "$namespace" --replicas=0
+    kubectl patch cronjob/reviewer-evaluation -n "$namespace" \
+      --type=merge -p '{"spec":{"suspend":true}}'
+    ;;
+  resume)
+    kubectl scale deployment/pr-review-worker -n "$namespace" --replicas=1
+    kubectl patch cronjob/reviewer-evaluation -n "$namespace" \
+      --type=merge -p '{"spec":{"suspend":false}}'
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

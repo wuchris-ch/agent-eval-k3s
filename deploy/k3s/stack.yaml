@@ -1,0 +1,364 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: phoenix-data
+  namespace: agent-eval
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: evaluation-results
+  namespace: agent-eval
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phoenix
+  namespace: agent-eval
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: phoenix
+  template:
+    metadata:
+      labels:
+        app: phoenix
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: phoenix
+          image: arizephoenix/phoenix:version-20.3.0@sha256:22358dc39de9aa02d47afdd6ce659747f511bc887ebf927d74d695e34ec52c75
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PHOENIX_AGENTS_DISABLE_BASH
+              value: "true"
+            - name: PHOENIX_AGENTS_DISABLE_WEB_ACCESS
+              value: "true"
+            - name: PHOENIX_ALLOW_EXTERNAL_RESOURCES
+              value: "false"
+            - name: PHOENIX_ALLOWED_PROVIDERS
+              value: NONE
+            - name: PHOENIX_PORT
+              value: "6006"
+            - name: PHOENIX_TELEMETRY_ENABLED
+              value: "false"
+            - name: PHOENIX_WORKING_DIR
+              value: /mnt/data
+          ports:
+            - name: http
+              containerPort: 6006
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 20
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: data
+              mountPath: /mnt/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: phoenix-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: phoenix
+  namespace: agent-eval
+spec:
+  type: NodePort
+  selector:
+    app: phoenix
+  ports:
+    - name: http
+      port: 6006
+      targetPort: http
+      nodePort: 30606
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: agent-eval
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: collector
+          image: otel/opentelemetry-collector-contrib:0.158.0@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5
+          args: ["--config=/etc/otelcol-contrib/config.yaml"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: health
+              containerPort: 13133
+            - name: metrics
+              containerPort: 8889
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol-contrib
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: agent-eval
+spec:
+  type: NodePort
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+      nodePort: 30318
+    - name: health
+      port: 13133
+      targetPort: health
+    - name: metrics
+      port: 8889
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pr-review-worker
+  namespace: agent-eval
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pr-review-worker
+  template:
+    metadata:
+      labels:
+        app: pr-review-worker
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: worker
+          image: pr-review-agent:local
+          imagePullPolicy: Never
+          envFrom:
+            - secretRef:
+                name: review-runtime
+          env:
+            - name: GITHUB_REPOSITORIES
+              value: wuchris-ch/agent-eval-k3s,wuchris-ch/pr-review-agent
+            - name: REVIEW_POLL_INTERVAL_SECONDS
+              value: "60"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector:4318
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: http/protobuf
+            - name: OTEL_SERVICE_NAME
+              value: pr-review-agent
+          resources:
+            requests:
+              cpu: 25m
+              memory: 128Mi
+            limits:
+              memory: 768Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: reviewer-evaluation
+  namespace: agent-eval
+spec:
+  schedule: "0 2 * * *"
+  timeZone: America/Vancouver
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            app: reviewer-evaluation
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          containers:
+            - name: evaluator
+              image: agent-eval:local
+              imagePullPolicy: Never
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set +e
+                  report="/results/reviewer-$(date -u +%Y%m%dT%H%M%SZ).json"
+                  agent-eval eval-review-agent \
+                    --command "/usr/local/bin/node /opt/reviewer/dist/cli.js" \
+                    --corpus /app/benchmarks/reviewer-corpus/v1/corpus.yaml \
+                    --trials 3 \
+                    --out "$report"
+                  status=$?
+                  if [ -f "$report" ]; then
+                    cp "$report" /results/latest.json
+                  fi
+                  exit "$status"
+              envFrom:
+                - secretRef:
+                    name: review-runtime
+              env:
+                - name: AGENT_EVAL_OTEL_ENABLED
+                  value: "1"
+                - name: OTEL_EXPORTER_OTLP_ENDPOINT
+                  value: http://otel-collector:4318
+                - name: OTEL_EXPORTER_OTLP_PROTOCOL
+                  value: http/protobuf
+                - name: OTEL_SERVICE_NAME
+                  value: reviewer-evaluation
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  memory: 1Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: [ALL]
+                readOnlyRootFilesystem: true
+              volumeMounts:
+                - name: results
+                  mountPath: /results
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: results
+              persistentVolumeClaim:
+                claimName: evaluation-results
+            - name: tmp
+              emptyDir:
+                sizeLimit: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: results-keeper
+  namespace: agent-eval
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: results-keeper
+  template:
+    metadata:
+      labels:
+        app: results-keeper
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: results
+          image: busybox:1.37.0@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
+          command: ["sleep", "2147483647"]
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: results
+              mountPath: /results
+              readOnly: true
+      volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: evaluation-results

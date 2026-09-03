@@ -1,0 +1,61 @@
+name: agent-eval-observability
+
+services:
+  phoenix:
+    image: arizephoenix/phoenix:version-20.3.0@sha256:22358dc39de9aa02d47afdd6ce659747f511bc887ebf927d74d695e34ec52c75
+    restart: unless-stopped
+    environment:
+      PHOENIX_ALLOW_EXTERNAL_RESOURCES: "false"
+      PHOENIX_ALLOWED_PROVIDERS: "NONE"
+      PHOENIX_AGENTS_DISABLE_BASH: "true"
+      PHOENIX_AGENTS_DISABLE_WEB_ACCESS: "true"
+      PHOENIX_TELEMETRY_ENABLED: "false"
+      PHOENIX_WORKING_DIR: /mnt/data
+    ports:
+      - "127.0.0.1:${AGENT_EVAL_PHOENIX_PORT:-6006}:6006"
+    volumes:
+      - phoenix-data:/mnt/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:6006/').read(1)
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - telemetry
+
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.158.0@sha256:c5918f78992ee73b0d6f0e599423ac5ec52dd5d9726733114d6eca53d5a32ed5
+    restart: unless-stopped
+    command:
+      - --config=/etc/otelcol-contrib/config.yaml
+    depends_on:
+      phoenix:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${AGENT_EVAL_OTLP_GRPC_PORT:-4317}:4317"
+      - "127.0.0.1:${AGENT_EVAL_OTLP_HTTP_PORT:-4318}:4318"
+      - "127.0.0.1:${AGENT_EVAL_OTEL_HEALTH_PORT:-13133}:13133"
+      - "127.0.0.1:${AGENT_EVAL_OTEL_METRICS_PORT:-8889}:8889"
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - telemetry
+
+volumes:
+  phoenix-data:
+
+networks:
+  telemetry:

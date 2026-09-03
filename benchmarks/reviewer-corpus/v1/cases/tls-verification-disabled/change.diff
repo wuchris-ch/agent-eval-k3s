@@ -1,0 +1,10 @@
+diff --git a/client.py b/client.py
+--- a/client.py
++++ b/client.py
+@@ -1,5 +1,5 @@
+ def request_options() -> dict[str, object]:
+-    return {"timeout": 10, "verify": True}
++    return {"timeout": 10, "verify": False}
+ 
+ 
+ def _self_test() -> None:

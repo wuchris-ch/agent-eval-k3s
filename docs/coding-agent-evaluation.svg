@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 480" role="img" aria-labelledby="title description">
+  <title id="title">Coding-agent evaluation flow</title>
+  <desc id="description">A versioned task runs in an agent pod. Provider JSONL, isolated hidden-test grading, and host inspection produce independent evidence for the acceptance policy. The policy records an explicit outcome in results.json and metrics.db.</desc>
+  <defs>
+    <style>
+      :root { --canvas:#fff; --surface:#f8fafc; --surface2:#f1f5f9; --ink:#0f172a; --muted:#64748b; --line:#cbd5e1; --strong:#94a3b8; --emphasis:#0f172a; --emphasis-ink:#fff; }
+      @media (prefers-color-scheme: dark) { :root { --canvas:#0b0f14; --surface:#111820; --surface2:#17202a; --ink:#e5e7eb; --muted:#9ca3af; --line:#334155; --strong:#64748b; --emphasis:#253140; --emphasis-ink:#f8fafc; } }
+      text { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; fill:var(--ink); }
+      .canvas { fill:var(--canvas); }
+      .group { fill:none; stroke:var(--line); stroke-width:1; }
+      .card { fill:var(--surface); stroke:var(--line); stroke-width:1; }
+      .card2 { fill:var(--surface2); stroke:var(--line); stroke-width:1; }
+      .decision { fill:var(--emphasis); }
+      .decision-text, .detail.decision-text { fill:var(--emphasis-ink); }
+      .flow { fill:none; stroke:var(--strong); stroke-width:1.5; marker-end:url(#arrow); }
+      .bus { fill:none; stroke:var(--strong); stroke-width:1.5; }
+      .boundary { fill:none; stroke:var(--strong); stroke-width:1; stroke-dasharray:5 5; }
+      .eyebrow { font-size:11px; font-weight:700; letter-spacing:.12em; fill:var(--muted); }
+      .title { font-size:22px; font-weight:650; letter-spacing:-.02em; }
+      .section { font-size:12px; font-weight:700; letter-spacing:.1em; fill:var(--muted); }
+      .node-title { font-size:15px; font-weight:650; }
+      .detail { font-size:12px; fill:var(--muted); }
+      .label { font-size:11px; fill:var(--muted); }
+      .tiny { font-size:10px; fill:var(--muted); }
+    </style>
+    <marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0 0 7 3.5 0 7Z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" width="1200" height="480"/>
+  <text class="eyebrow" x="40" y="31">AGENT-EVAL RUN</text>
+  <text class="title" x="40" y="60">Execution and grading are separate</text>
+
+  <text class="section" x="40" y="98">01  EXECUTE</text>
+  <rect class="group" x="40" y="112" width="408" height="314" rx="8"/>
+  <rect class="card" x="64" y="137" width="152" height="86" rx="6"/>
+  <text class="node-title" x="82" y="168">Versioned task</text>
+  <text class="detail" x="82" y="190">prompt + starter code</text>
+  <text class="detail" x="82" y="208">provider credential</text>
+  <path class="flow" d="M216 180 H254"/>
+  <rect class="card2" x="255" y="137" width="169" height="86" rx="6"/>
+  <text class="node-title" x="274" y="168">Agent pod</text>
+  <text class="detail" x="274" y="190">Claude Code or Codex</text>
+  <text class="detail" x="274" y="208">edits the workspace</text>
+
+  <line class="boundary" x1="64" y1="252" x2="424" y2="252"/>
+  <text class="label" x="64" y="276">After exit or timeout</text>
+  <text class="detail" x="64" y="300">1. Stop remaining agent processes</text>
+  <text class="detail" x="64" y="324">2. Require three clean process scans</text>
+  <text class="detail" x="64" y="348">3. Copy the produced workspace</text>
+  <rect class="card" x="64" y="372" width="360" height="34" rx="5"/>
+  <text class="detail" x="82" y="394">Outputs: workspace copy + provider stdout JSONL</text>
+
+  <text class="section" x="480" y="98">02  COLLECT INDEPENDENT EVIDENCE</text>
+  <rect class="group" x="480" y="112" width="450" height="314" rx="8"/>
+
+  <rect class="card" x="504" y="133" width="398" height="60" rx="6"/>
+  <text class="node-title" x="522" y="158">Usage + process evidence</text>
+  <text class="detail" x="522" y="178">provider JSONL • wall time • exit code • timeout</text>
+
+  <rect class="boundary" x="504" y="211" width="398" height="121" rx="6"/>
+  <text class="label" x="520" y="231">ISOLATED BLACK-BOX GRADING</text>
+  <rect class="card" x="520" y="244" width="150" height="66" rx="5"/>
+  <text class="node-title" x="538" y="269">Submission pod</text>
+  <text class="detail" x="538" y="290">produced code only</text>
+  <rect class="card2" x="736" y="244" width="150" height="66" rx="5"/>
+  <text class="node-title" x="754" y="269">Evaluator pod</text>
+  <text class="detail" x="754" y="290">hidden tests + results</text>
+  <path class="flow" d="M736 277 H681"/>
+  <text class="tiny" x="708" y="266" text-anchor="middle">one TCP port</text>
+
+  <rect class="card" x="504" y="350" width="398" height="55" rx="6"/>
+  <text class="node-title" x="522" y="374">Workspace inspection</text>
+  <text class="detail" x="522" y="394">diff size • Ruff • Semgrep • Gitleaks • Trivy • judge</text>
+
+  <path class="flow" d="M340 223 V243 H463 V163 H504"/>
+  <text class="tiny" x="458" y="153" text-anchor="end">JSONL</text>
+  <path class="flow" d="M424 389 H465 V278 H520"/>
+  <text class="tiny" x="468" y="268" text-anchor="end">workspace</text>
+  <path class="flow" d="M424 389 H504"/>
+
+  <path class="flow" d="M902 163 H948"/>
+  <path class="flow" d="M902 277 H948"/>
+  <path class="flow" d="M902 377 H948"/>
+  <path class="bus" d="M948 163 V377"/>
+  <path class="flow" d="M948 270 H978"/>
+
+  <text class="section" x="962" y="98">03  DECIDE + RECORD</text>
+  <rect class="decision" x="978" y="222" width="182" height="96" rx="6"/>
+  <text class="node-title decision-text" x="999" y="252">Acceptance policy</text>
+  <text class="detail decision-text" x="999" y="275">required evidence joins here</text>
+  <text class="detail decision-text" x="999" y="296">fail closed when missing</text>
+
+  <path class="flow" d="M1069 318 V347"/>
+  <rect class="card2" x="978" y="348" width="182" height="58" rx="6"/>
+  <text class="node-title" x="999" y="373">Explicit outcome</text>
+  <text class="detail" x="999" y="393">accepted / rejected / infra_error</text>
+
+  <text class="label" x="1069" y="436" text-anchor="middle">results.json + metrics.db</text>
+</svg>

@@ -1,0 +1,10 @@
+diff --git a/audit.py b/audit.py
+--- a/audit.py
++++ b/audit.py
+@@ -1,5 +1,5 @@
+ def audit_token(token: str) -> str:
+-    return f"{token[:3]}...{token[-2:]}"
++    return token
+ 
+ 
+ def _self_test() -> None:

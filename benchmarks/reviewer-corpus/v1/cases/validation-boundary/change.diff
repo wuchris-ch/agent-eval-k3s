@@ -1,0 +1,10 @@
+diff --git a/validation.py b/validation.py
+--- a/validation.py
++++ b/validation.py
+@@ -1,5 +1,5 @@
+ def valid_percentage(value: int) -> bool:
+-    return 0 <= value <= 100
++    return 0 < value < 100
+ 
+ 
+ def _self_test() -> None:

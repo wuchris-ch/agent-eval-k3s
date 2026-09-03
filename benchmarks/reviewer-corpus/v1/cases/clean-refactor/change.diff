@@ -1,0 +1,11 @@
+diff --git a/formatting.py b/formatting.py
+--- a/formatting.py
++++ b/formatting.py
+@@ -1,2 +1,6 @@
++def _clean(value: str) -> str:
++    return value.strip()
++
++
+ def display_name(first: str, last: str) -> str:
+-    return f"{first.strip()} {last.strip()}"
++    return f"{_clean(first)} {_clean(last)}"

@@ -1,0 +1,11 @@
+diff --git a/ledger.py b/ledger.py
+--- a/ledger.py
++++ b/ledger.py
+@@ -1,6 +1,6 @@
+ def transfer(balances: dict[str, int], source: str, destination: str, amount: int) -> None:
+     balances[source] -= amount
+-    balances[destination] += amount
++    balances[destination] -= amount
+ 
+ 
+ def _self_test() -> None:

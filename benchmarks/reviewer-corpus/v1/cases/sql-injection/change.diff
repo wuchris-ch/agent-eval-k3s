@@ -1,0 +1,10 @@
+diff --git a/queries.py b/queries.py
+--- a/queries.py
++++ b/queries.py
+@@ -1,5 +1,5 @@
+ def user_query(user_id: str) -> tuple[str, tuple[str, ...]]:
+-    return "SELECT * FROM users WHERE id = %s", (user_id,)
++    return f"SELECT * FROM users WHERE id = {user_id}", ()
+ 
+ 
+ def _self_test() -> None:

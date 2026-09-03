@@ -1,0 +1,14 @@
+diff --git a/features.py b/features.py
+--- a/features.py
++++ b/features.py
+@@ -1,8 +1,7 @@
+ def feature_status(enabled: bool) -> str:
+-    if enabled:
+-        return "enabled"
+-    else:
++    if not enabled:
+         return "disabled"
++    return "enabled"
+ 
+ 
+ def _self_test() -> None:

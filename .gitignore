@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# eval artifacts
+runs/
+graphify-out/
+review-agent-eval.json
+.pytest_cache/
+.ruff_cache/
+
+# Local-only operator instructions. May contain private integration details.
+/AGENTS.md

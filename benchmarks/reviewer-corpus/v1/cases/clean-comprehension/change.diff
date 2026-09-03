@@ -1,0 +1,13 @@
+diff --git a/squares.py b/squares.py
+--- a/squares.py
++++ b/squares.py
+@@ -1,8 +1,5 @@
+ def squares(values: list[int]) -> list[int]:
+-    result = []
+-    for value in values:
+-        result.append(value * value)
+-    return result
++    return [value * value for value in values]
+ 
+ 
+ def _self_test() -> None:

@@ -1,0 +1,10 @@
+diff --git a/pages.py b/pages.py
+--- a/pages.py
++++ b/pages.py
+@@ -1,5 +1,5 @@
+ def requested_pages(page_count: int) -> list[int]:
+-    return list(range(1, page_count + 1))
++    return list(range(1, page_count))
+ 
+ 
+ def _self_test() -> None:

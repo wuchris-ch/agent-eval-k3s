@@ -1,0 +1,13 @@
+diff --git a/signatures.py b/signatures.py
+--- a/signatures.py
++++ b/signatures.py
+@@ -1,8 +1,5 @@
+-import hmac
+-
+-
+ def valid_signature(expected: str, provided: str) -> bool:
+-    return hmac.compare_digest(expected, provided)
++    return expected == provided
+ 
+ 
+ def _self_test() -> None:

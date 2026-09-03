@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="title description">
+  <title id="title">Local k3s review and evaluation platform</title>
+  <desc id="description">A pull request worker and scheduled evaluator use one review agent, export privacy-filtered telemetry to Phoenix, and persist evaluation reports.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07111f"/>
+      <stop offset="1" stop-color="#10253d"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="violet" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7c3aed"/>
+      <stop offset="1" stop-color="#c084fc"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7dd3fc"/>
+    </marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#020617" flood-opacity="0.5"/>
+    </filter>
+    <style>
+      .title { fill: #f8fafc; font: 700 30px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .subtitle { fill: #94a3b8; font: 400 15px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .label { fill: #f8fafc; font: 650 16px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .detail { fill: #cbd5e1; font: 400 13px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .small { fill: #94a3b8; font: 500 12px Inter, ui-sans-serif, system-ui, sans-serif; }
+      .box { fill: #13263d; stroke: #36546f; stroke-width: 1.5; rx: 14; filter: url(#shadow); }
+      .flow { fill: none; stroke: #7dd3fc; stroke-width: 2.2; marker-end: url(#arrow); }
+      .telemetry { fill: none; stroke: #c084fc; stroke-width: 2; stroke-dasharray: 7 6; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1200" height="720" rx="24" fill="url(#background)"/>
+  <text x="54" y="58" class="title">Local review and evaluation platform</text>
+  <text x="54" y="84" class="subtitle">One k3s cluster, one review engine, two controlled ways to run it</text>
+
+  <rect x="38" y="112" width="1124" height="556" rx="22" fill="#0b1728" stroke="#31506d" stroke-width="2" stroke-dasharray="10 8"/>
+  <text x="64" y="143" class="small">LOCAL K3S CLUSTER</text>
+
+  <rect class="box" x="66" y="174" width="210" height="112"/>
+  <rect x="66" y="174" width="7" height="112" rx="3" fill="url(#blue)"/>
+  <text x="91" y="208" class="label">PR worker</text>
+  <text x="91" y="234" class="detail">Polls open pull requests</text>
+  <text x="91" y="256" class="detail">Once per new head SHA</text>
+
+  <rect class="box" x="66" y="370" width="210" height="128"/>
+  <rect x="66" y="370" width="7" height="128" rx="3" fill="url(#violet)"/>
+  <text x="91" y="404" class="label">Evaluation job</text>
+  <text x="91" y="430" class="detail">Nightly or one command</text>
+  <text x="91" y="452" class="detail">20 cases × 3 trials</text>
+  <text x="91" y="474" class="detail">Deterministic scoring</text>
+
+  <rect class="box" x="354" y="252" width="220" height="148"/>
+  <rect x="354" y="252" width="220" height="8" rx="4" fill="url(#blue)"/>
+  <text x="382" y="298" class="label">Review agent</text>
+  <text x="382" y="324" class="detail">Bounded diff partitions</text>
+  <text x="382" y="346" class="detail">Strict JSON contract</text>
+  <text x="382" y="368" class="detail">Fail-closed validation</text>
+
+  <rect class="box" x="658" y="174" width="208" height="112"/>
+  <text x="686" y="208" class="label">Model gateway</text>
+  <text x="686" y="234" class="detail">OpenAI-compatible API</text>
+  <text x="686" y="256" class="detail">Credentials in Secret</text>
+
+  <rect class="box" x="658" y="370" width="208" height="128"/>
+  <text x="686" y="404" class="label">Results volume</text>
+  <text x="686" y="430" class="detail">Versioned JSON reports</text>
+  <text x="686" y="452" class="detail">Acceptance and stability</text>
+  <text x="686" y="474" class="detail">Survives pod restarts</text>
+
+  <rect class="box" x="942" y="174" width="184" height="112"/>
+  <text x="970" y="208" class="label">GitHub</text>
+  <text x="970" y="234" class="detail">PR review comment</text>
+  <text x="970" y="256" class="detail">Commit status</text>
+
+  <rect class="box" x="942" y="370" width="184" height="128"/>
+  <text x="970" y="404" class="label">Phoenix</text>
+  <text x="970" y="430" class="detail">Trace dashboard</text>
+  <text x="970" y="452" class="detail">Local persistent data</text>
+  <text x="970" y="474" class="detail">http://127.0.0.1:6006</text>
+
+  <rect x="354" y="538" width="512" height="92" rx="14" fill="#1a1735" stroke="#6d4fb3" stroke-width="1.5"/>
+  <text x="382" y="573" class="label">OpenTelemetry privacy filter</text>
+  <text x="382" y="599" class="detail">Keeps scores, outcomes, latency, and counts. Removes prompts, completions, endpoints, and authorization.</text>
+
+  <path class="flow" d="M 276 230 C 316 230, 314 294, 354 306"/>
+  <path class="flow" d="M 276 434 C 316 434, 314 370, 354 354"/>
+  <path class="flow" d="M 574 302 C 610 282, 620 242, 658 230"/>
+  <path class="flow" d="M 574 364 C 610 386, 620 424, 658 434"/>
+  <path class="flow" d="M 866 230 L 942 230"/>
+  <path class="telemetry" d="M 464 400 C 464 474, 486 512, 510 538"/>
+  <path class="telemetry" d="M 762 286 C 762 474, 740 514, 716 538"/>
+  <path class="telemetry" d="M 866 584 C 900 584, 914 504, 942 470"/>
+
+  <text x="291" y="210" class="small">diff</text>
+  <text x="590" y="246" class="small">request</text>
+  <text x="888" y="214" class="small">publish</text>
+  <text x="886" y="566" class="small">safe spans</text>
+  <text x="54" y="700" class="small">The worker and scheduler stop while the Mac sleeps, then k3s resumes them when Docker returns.</text>
+</svg>

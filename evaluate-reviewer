@@ -1,0 +1,104 @@
+#!/bin/sh
+set -eu
+
+repository_root=$(CDPATH= cd "$(dirname "$0")" && pwd)
+compose_file="$repository_root/observability/compose.yaml"
+phoenix_port="${AGENT_EVAL_PHOENIX_PORT:-6006}"
+otlp_http_port="${AGENT_EVAL_OTLP_HTTP_PORT:-4318}"
+health_port="${AGENT_EVAL_OTEL_HEALTH_PORT:-13133}"
+
+is_true() {
+  case "${1:-}" in
+    1 | true | TRUE | yes | YES | on | ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+start_observability() {
+  if ! command -v docker >/dev/null 2>&1; then
+    printf '%s\n' \
+      'Docker is required for local observability. Set EVAL_OBSERVABILITY=0 to run without it.' >&2
+    exit 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    printf '%s\n' \
+      'Docker is not running. Start Docker Desktop, or set EVAL_OBSERVABILITY=0.' >&2
+    exit 1
+  fi
+
+  docker compose -f "$compose_file" up -d --wait
+
+  AGENT_EVAL_OTEL_ENABLED=1
+  OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+  OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:$otlp_http_port"
+  export AGENT_EVAL_OTEL_ENABLED
+  export OTEL_EXPORTER_OTLP_PROTOCOL
+  export OTEL_EXPORTER_OTLP_ENDPOINT
+
+  if ! curl -fsS "http://127.0.0.1:$health_port/" >/dev/null; then
+    printf '%s\n' 'The local OpenTelemetry Collector did not become healthy.' >&2
+    exit 1
+  fi
+}
+
+if ! command -v pr-review-agent >/dev/null 2>&1; then
+  printf '%s\n' \
+    'pr-review-agent is not installed. Run "npm link" once in the pr-review-agent repository.' >&2
+  exit 1
+fi
+
+if [ -z "${MODEL_GATEWAY_API_KEY:-}" ] \
+  || [ -z "${MODEL_GATEWAY_BASE_URL:-}" ] \
+  || [ -z "${REVIEW_AGENT_MODEL:-}" ]; then
+  printf '%s\n' \
+    'MODEL_GATEWAY_API_KEY, MODEL_GATEWAY_BASE_URL, and REVIEW_AGENT_MODEL must be set.' >&2
+  exit 1
+fi
+
+if is_true "${EVAL_K3S_SYNC:-0}"; then
+  exec "$repository_root/review-stack" sync-secrets
+fi
+
+cd "$repository_root"
+
+observability_enabled="${EVAL_OBSERVABILITY:-1}"
+if is_true "$observability_enabled"; then
+  start_observability
+fi
+
+set -- uv run
+if is_true "$observability_enabled"; then
+  set -- "$@" --extra observability
+fi
+if is_true "${EVAL_JUDGE:-0}"; then
+  if [ -z "${AGENT_EVAL_JUDGE_MODEL:-}" ]; then
+    printf '%s\n' \
+      'AGENT_EVAL_JUDGE_MODEL must be set when EVAL_JUDGE=1.' >&2
+    exit 1
+  fi
+  set -- "$@" --extra judge
+fi
+
+set -- "$@" agent-eval eval-review-agent \
+  --command "$(command -v pr-review-agent)" \
+  --corpus benchmarks/reviewer-corpus/v1/corpus.yaml \
+  --trials "${EVAL_TRIALS:-1}" \
+  --out review-agent-eval.json
+
+if [ -n "${EVAL_CASE:-}" ]; then
+  set -- "$@" --case "$EVAL_CASE"
+fi
+
+if is_true "${EVAL_JUDGE:-0}"; then
+  set -- "$@" --judge
+fi
+
+evaluation_status=0
+"$@" || evaluation_status=$?
+
+printf '\nEvaluation report: %s\n' "$repository_root/review-agent-eval.json"
+if is_true "$observability_enabled"; then
+  printf 'Phoenix dashboard: http://127.0.0.1:%s\n' "$phoenix_port"
+fi
+
+exit "$evaluation_status"

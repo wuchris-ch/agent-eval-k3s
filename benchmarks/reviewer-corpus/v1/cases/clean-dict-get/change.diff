@@ -1,0 +1,12 @@
+diff --git a/labels.py b/labels.py
+--- a/labels.py
++++ b/labels.py
+@@ -1,7 +1,5 @@
+ def label(values: dict[str, str], key: str) -> str:
+-    if key in values:
+-        return values[key]
+-    return "unknown"
++    return values.get(key, "unknown")
+ 
+ 
+ def _self_test() -> None:

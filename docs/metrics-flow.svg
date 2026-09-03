@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 330" role="img" aria-labelledby="title description">
+  <title id="title">Metric persistence and verification flow</title>
+  <desc id="description">Raw evidence is preserved in results.json as the canonical run record. metrics.db is a query projection used by compare and report. verify-run recomputes and cross-checks the record. Optional OpenTelemetry export is content-minimized and lossy.</desc>
+  <defs>
+    <style>
+      :root { --canvas:#fff; --surface:#f8fafc; --surface2:#f1f5f9; --ink:#0f172a; --muted:#64748b; --line:#cbd5e1; --strong:#94a3b8; --emphasis:#0f172a; --emphasis-ink:#fff; }
+      @media (prefers-color-scheme: dark) { :root { --canvas:#0b0f14; --surface:#111820; --surface2:#17202a; --ink:#e5e7eb; --muted:#9ca3af; --line:#334155; --strong:#64748b; --emphasis:#253140; --emphasis-ink:#f8fafc; } }
+      text { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; fill:var(--ink); }
+      .canvas { fill:var(--canvas); }
+      .card { fill:var(--surface); stroke:var(--line); stroke-width:1; }
+      .card2 { fill:var(--surface2); stroke:var(--line); stroke-width:1; }
+      .canonical { fill:var(--emphasis); }
+      .canonical-text, .detail.canonical-text { fill:var(--emphasis-ink); }
+      .flow { fill:none; stroke:var(--strong); stroke-width:1.5; marker-end:url(#arrow); }
+      .optional { fill:none; stroke:var(--strong); stroke-width:1.25; stroke-dasharray:5 4; marker-end:url(#arrow); }
+      .eyebrow { font-size:11px; font-weight:700; letter-spacing:.12em; fill:var(--muted); }
+      .title { font-size:22px; font-weight:650; letter-spacing:-.02em; }
+      .node-title { font-size:15px; font-weight:650; }
+      .detail { font-size:12px; fill:var(--muted); }
+      .label { font-size:10px; font-weight:700; letter-spacing:.08em; fill:var(--muted); }
+    </style>
+    <marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0 0 7 3.5 0 7Z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" width="1200" height="330"/>
+  <text class="eyebrow" x="40" y="31">PERSISTED METRICS</text>
+  <text class="title" x="40" y="60">The complete run record stays canonical</text>
+
+  <text class="label" x="40" y="102">RAW EVIDENCE</text>
+  <rect class="card" x="40" y="116" width="232" height="154" rx="6"/>
+  <text class="node-title" x="60" y="146">Independent sources</text>
+  <text class="detail" x="60" y="172">provider JSONL + process timing</text>
+  <text class="detail" x="60" y="195">JUnit + coverage</text>
+  <text class="detail" x="60" y="218">diff + scanner + judge results</text>
+  <text class="detail" x="60" y="241">governance + provenance</text>
+  <path class="flow" d="M272 193 H327"/>
+
+  <text class="label" x="328" y="102">CANONICAL RECORD</text>
+  <rect class="canonical" x="328" y="116" width="236" height="154" rx="6"/>
+  <text class="node-title canonical-text" x="350" y="151">results.json</text>
+  <text class="detail canonical-text" x="350" y="177">complete bounded run record</text>
+  <text class="detail canonical-text" x="350" y="200">explicit nulls for missing values</text>
+  <text class="detail canonical-text" x="350" y="223">artifact hashes + outcome</text>
+  <text class="detail canonical-text" x="350" y="246">source for later verification</text>
+
+  <text class="label" x="632" y="102">QUERY + VERIFY</text>
+  <path class="flow" d="M564 158 H631"/>
+  <rect class="card2" x="632" y="116" width="230" height="82" rx="6"/>
+  <text class="node-title" x="652" y="147">metrics.db</text>
+  <text class="detail" x="652" y="169">query projection + assessments</text>
+  <text class="detail" x="652" y="187">normalized across completed runs</text>
+
+  <path class="flow" d="M564 229 H631"/>
+  <rect class="card" x="632" y="216" width="230" height="54" rx="6"/>
+  <text class="node-title" x="652" y="241">verify-run</text>
+  <text class="detail" x="652" y="260">recompute and cross-check</text>
+
+  <text class="label" x="930" y="102">CONSUMERS</text>
+  <path class="flow" d="M862 157 H929"/>
+  <rect class="card2" x="930" y="116" width="230" height="82" rx="6"/>
+  <text class="node-title" x="950" y="147">compare + report</text>
+  <text class="detail" x="950" y="169">trial summaries, pass@k, trends</text>
+  <text class="detail" x="950" y="187">assessment and benchmark views</text>
+
+  <path class="optional" d="M564 253 H595 V300 H1045 V271"/>
+  <rect class="card" x="930" y="216" width="230" height="54" rx="6"/>
+  <text class="node-title" x="950" y="241">OpenTelemetry</text>
+  <text class="detail" x="950" y="260">optional, minimized, lossy export</text>
+</svg>

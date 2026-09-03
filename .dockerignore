@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+.pytest_cache
+.ruff_cache
+AGENTS.md
+review-agent-eval.json
+runs
+graphify-out
+build
+dist
+wheels
+*.egg-info
+__pycache__

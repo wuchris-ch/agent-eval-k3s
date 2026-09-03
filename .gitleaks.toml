@@ -1,0 +1,8 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "SHA-256 fixture identities in the reviewer corpus manifest"
+paths = ['''^benchmarks/reviewer-corpus/v1/corpus\.yaml$''']
+regexTarget = "match"
+regexes = ['''auth\.py:\s+[0-9a-f]{64}''']

@@ -1,0 +1,60 @@
+[project]
+name = "agent-eval"
+version = "0.4.0"
+description = "Evaluation-only harness for coding agents and external review agents with goldens, isolated trials, evidence gates, and telemetry"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Chris", email = "chriswu.ca@gmail.com" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.116.0",
+    "pydantic>=2.13.5",
+    "pyyaml>=6.0.3",
+    "regex==2026.7.19",
+    "rich>=13.6.0,<16",
+    "typer>=0.27.2",
+]
+
+[project.optional-dependencies]
+observability = [
+    "opentelemetry-api==1.43.0",
+    "opentelemetry-exporter-otlp==1.43.0",
+    "opentelemetry-sdk==1.43.0",
+]
+judge = [
+    "deepeval>=4,<5",
+    "openai>=2.8.0,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/wuchris-ch/agent-eval-k3s"
+Repository = "https://github.com/wuchris-ch/agent-eval-k3s"
+Issues = "https://github.com/wuchris-ch/agent-eval-k3s/issues"
+Security = "https://github.com/wuchris-ch/agent-eval-k3s/security/policy"
+
+[project.scripts]
+agent-eval = "agent_eval.cli:app"
+
+[build-system]
+requires = ["uv_build==0.12.7"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.15.21",
+]
+security = [
+    "pip-audit==2.10.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

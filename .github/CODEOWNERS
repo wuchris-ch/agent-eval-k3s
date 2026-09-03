@@ -1,0 +1,8 @@
+* @wuchris-ch
+
+/.github/ @wuchris-ch
+/src/agent_eval/audit.py @wuchris-ch
+/src/agent_eval/attestation.py @wuchris-ch
+/src/agent_eval/governance.py @wuchris-ch
+/src/agent_eval/kube.py @wuchris-ch
+/src/agent_eval/runner.py @wuchris-ch

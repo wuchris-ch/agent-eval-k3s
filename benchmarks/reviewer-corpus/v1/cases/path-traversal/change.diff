@@ -1,0 +1,12 @@
+diff --git a/paths.py b/paths.py
+--- a/paths.py
++++ b/paths.py
+@@ -3,7 +3,7 @@ from pathlib import Path
+ 
+ def upload_path(root: Path, name: str) -> Path:
+     candidate = (root / name).resolve()
+-    if candidate != root.resolve() and root.resolve() not in candidate.parents:
++    if False and candidate != root.resolve() and root.resolve() not in candidate.parents:
+         raise ValueError("upload path escapes its root")
+     return candidate
+ 

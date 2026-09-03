@@ -1,0 +1,270 @@
+schema_version: "1.0"
+corpus_id: agent-eval-reviewer-corpus
+version: "1.1.0"
+benchmark_manifest: benchmark.yaml
+benchmark_sha256: b0506d33b39e0adc06c04969512a1f40f212a8a67254c813ffdfbdb8d500e150
+cases:
+  - id: auth-bypass
+    kind: faulty
+    diff: cases/auth-bypass/change.diff
+    reproducer:
+      command: [python, reproduce.py]
+      base_cwd: cases/auth-bypass/base
+      head_cwd: cases/auth-bypass/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/auth-bypass/change.diff: a4cb8433f9eec4abe63a9f6f510dea189e1b86636edd6f082d7e5ea14d3280b2
+      cases/auth-bypass/base/auth.py: d430d77d842a80552160c0d23f22759ea97b4c9092d86c261b0c194abb4ac665
+      cases/auth-bypass/base/reproduce.py: 8765a1649cc5dcd28d5f64f21061a701c08b7207a999ec832cc3487cb1785aa4
+      cases/auth-bypass/head/auth.py: 57a86c9dd89a4d02750da3df2ed62a467dd3a03659148bcc6616da820b4166ac
+      cases/auth-bypass/head/reproduce.py: 8765a1649cc5dcd28d5f64f21061a701c08b7207a999ec832cc3487cb1785aa4
+  - id: clean-refactor
+    kind: clean
+    diff: cases/clean-refactor/change.diff
+    reproducer:
+      command: [python, reproduce.py]
+      base_cwd: cases/clean-refactor/base
+      head_cwd: cases/clean-refactor/head
+      expected_base_exit: 0
+      expected_head_exit: 0
+    artifact_sha256:
+      cases/clean-refactor/change.diff: 403884a1a898a0f1006e74ac0999f950d11db08df151f3ae3232e6dff04e069e
+      cases/clean-refactor/base/formatting.py: ac45a2383747e7376b3d75abee9dcc295a843bb2f5710df59873b20a31c5bfe4
+      cases/clean-refactor/base/reproduce.py: e69d658562b9474a73a94d433db4779e6a4724e422d473bc433f736af12692f5
+      cases/clean-refactor/head/formatting.py: 97cf988eb4fb9a6cf09ffed5a401aab70c37942fed7703e7a8129ca4a6b91365
+      cases/clean-refactor/head/reproduce.py: e69d658562b9474a73a94d433db4779e6a4724e422d473bc433f736af12692f5
+  - id: sql-injection
+    kind: faulty
+    diff: cases/sql-injection/change.diff
+    reproducer:
+      command: [python, queries.py]
+      base_cwd: cases/sql-injection/base
+      head_cwd: cases/sql-injection/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/sql-injection/change.diff: 51ad6b22af90ed080686f8be030aae186c1b949b4f06d5243ac642d65b52a495
+      cases/sql-injection/base/queries.py: fb977eda1e3e2a75e3df46eb13bd74b94b37fb245cdd11a47947313508e9db13
+      cases/sql-injection/head/queries.py: 3f4a533197ada0bbcd5548faf0db60ba25eba8f1c1af8707fa2d1baad8b59495
+  - id: shell-injection
+    kind: faulty
+    diff: cases/shell-injection/change.diff
+    reproducer:
+      command: [python, revisions.py]
+      base_cwd: cases/shell-injection/base
+      head_cwd: cases/shell-injection/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/shell-injection/change.diff: d5f74e400c658116f31a5c2bd681aa967786d0445f291338d662d2911179b4a2
+      cases/shell-injection/base/revisions.py: 66605a85719f67e632b30ff58af1eb2698ccc1714d65cbb6e9b2344b0fa3e7be
+      cases/shell-injection/head/revisions.py: 1bddda996f8026be50dd8fb06e0bedcb1e740a42f90c8105a63041986054fe78
+  - id: path-traversal
+    kind: faulty
+    diff: cases/path-traversal/change.diff
+    reproducer:
+      command: [python, paths.py]
+      base_cwd: cases/path-traversal/base
+      head_cwd: cases/path-traversal/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/path-traversal/change.diff: e4f635a44ce5103367286d3e51f87b788454bfbb7c96ac1a33cfec1e8d9b31a9
+      cases/path-traversal/base/paths.py: f59fca87a3a8a7accfd50fb8b82dd65847c467cb15adba98f55ed5b4556b0209
+      cases/path-traversal/head/paths.py: 27bae8f497def86a5f7344743c7c74eef52067d0f243a4ec7bf598ff23b8d65e
+  - id: secret-exposure
+    kind: faulty
+    diff: cases/secret-exposure/change.diff
+    reproducer:
+      command: [python, audit.py]
+      base_cwd: cases/secret-exposure/base
+      head_cwd: cases/secret-exposure/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/secret-exposure/change.diff: 1fef115563b15e95aabb07fac03fe9598737a2e5ecc29e79731a73ba26ff9cfd
+      cases/secret-exposure/base/audit.py: b1767bf153e0bca378b7c12fc41751f80e760c56830f0a2e9dc8cfd19807ecd1
+      cases/secret-exposure/head/audit.py: 255399c634cbf7e6d814fb838b95ee484e3deb8f9bf55f6412a27714e8bd4a6c
+  - id: tls-verification-disabled
+    kind: faulty
+    diff: cases/tls-verification-disabled/change.diff
+    reproducer:
+      command: [python, client.py]
+      base_cwd: cases/tls-verification-disabled/base
+      head_cwd: cases/tls-verification-disabled/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/tls-verification-disabled/change.diff: b910d49cfabc9b275f40283cc983a3f1ec22a33b4fba4213eeb5e1d39da95dbd
+      cases/tls-verification-disabled/base/client.py: ef05551bbdedde4065a6509e63095eb33b2dff85a69272b3441ff576f99bcb9a
+      cases/tls-verification-disabled/head/client.py: 2fdc6447ff91a10d19026ff4aa2c01e64d2a467d484f2ed6cd032e98272ebd09
+  - id: swallowed-error
+    kind: faulty
+    diff: cases/swallowed-error/change.diff
+    reproducer:
+      command: [python, config.py]
+      base_cwd: cases/swallowed-error/base
+      head_cwd: cases/swallowed-error/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/swallowed-error/change.diff: 5f7c4a3e59af873376651ee0937682337cc0f0325b0a88314bcc4d4c541e96bc
+      cases/swallowed-error/base/config.py: 5e33b3e51479c2d128c395e2ab78c511905bf927d5f425c8da5ab184ac30d6d9
+      cases/swallowed-error/head/config.py: ef2dee387187f4f50f95dbfd70ffe2924c786f2eca9ae36067c1830610f7cb20
+  - id: pagination-last-page
+    kind: faulty
+    diff: cases/pagination-last-page/change.diff
+    reproducer:
+      command: [python, pages.py]
+      base_cwd: cases/pagination-last-page/base
+      head_cwd: cases/pagination-last-page/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/pagination-last-page/change.diff: 6f385fc1145d911c0d1de67dbeadb4822ab534e3c03e763df5e2a26f7117a5ae
+      cases/pagination-last-page/base/pages.py: d8bd1bfd112debc63e165e65fd9dedc3cf15e347654064aa2ea46ad5bbf44c0b
+      cases/pagination-last-page/head/pages.py: ab077c174d54a931af5c25807740ebe5ddf51be74fff2f9c9a2049401ce0f470
+  - id: tenant-cache-collision
+    kind: faulty
+    diff: cases/tenant-cache-collision/change.diff
+    reproducer:
+      command: [python, cache.py]
+      base_cwd: cases/tenant-cache-collision/base
+      head_cwd: cases/tenant-cache-collision/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/tenant-cache-collision/change.diff: 75f52d28121552f6e3da2ee497b84b0a7db6e3f15959d15cad971364f5fcc53d
+      cases/tenant-cache-collision/base/cache.py: 42f982eaea6a88b14ef6afe77cc311400341f52a0a25ef04f26917f78a3cd9cf
+      cases/tenant-cache-collision/head/cache.py: 731be23a886ad8ffe541bed5a5ac348f474e53c3301a8ae45f38523b7fe431c7
+  - id: transfer-balance-loss
+    kind: faulty
+    diff: cases/transfer-balance-loss/change.diff
+    reproducer:
+      command: [python, ledger.py]
+      base_cwd: cases/transfer-balance-loss/base
+      head_cwd: cases/transfer-balance-loss/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/transfer-balance-loss/change.diff: 32a16a20a8d64b14cffe1a21862e92e0126b53e52b9ac39b99f43a4c06070091
+      cases/transfer-balance-loss/base/ledger.py: e275f5f2ba41857eeee4508b7f8e6f1ab7e70adbda9c44588d33476cd2220324
+      cases/transfer-balance-loss/head/ledger.py: 746d77d4ae1b217e2f6f9cb89dd1ca889928221fb7785978bd32f5d0efccc86f
+  - id: retry-extra-attempt
+    kind: faulty
+    diff: cases/retry-extra-attempt/change.diff
+    reproducer:
+      command: [python, retry.py]
+      base_cwd: cases/retry-extra-attempt/base
+      head_cwd: cases/retry-extra-attempt/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/retry-extra-attempt/change.diff: 08a69319103a80c737119bac8ba731247bf46452c0c7eccfcb90195bd6cfd8a5
+      cases/retry-extra-attempt/base/retry.py: 8228fd9a95b05224dcd6d6923d6277d8a116ba1986558fed6363a6ce4fc3b0d2
+      cases/retry-extra-attempt/head/retry.py: 0fb43bd0a032fd6e3c1cde61ae2cf686707952b5fc5b1637c134ee959c0d476b
+  - id: validation-boundary
+    kind: faulty
+    diff: cases/validation-boundary/change.diff
+    reproducer:
+      command: [python, validation.py]
+      base_cwd: cases/validation-boundary/base
+      head_cwd: cases/validation-boundary/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/validation-boundary/change.diff: 8aeaddaf7cc93b5d89e2a976e322734d6adfe4d453fea578319f87f4c0a73dc5
+      cases/validation-boundary/base/validation.py: bccd0598cf0ca17d3758b2bb47504885c716f420fcb6934df2c45e3ac5a9aab9
+      cases/validation-boundary/head/validation.py: b34081aa2dc848be1914038472168c89d5e9dd910d2a56f7ba09d5272cdfc1f8
+  - id: signature-timing-compare
+    kind: faulty
+    diff: cases/signature-timing-compare/change.diff
+    reproducer:
+      command: [python, signatures.py]
+      base_cwd: cases/signature-timing-compare/base
+      head_cwd: cases/signature-timing-compare/head
+      expected_base_exit: 0
+      expected_head_exit: 1
+    artifact_sha256:
+      cases/signature-timing-compare/change.diff: b10ad3d1e8e0e98e174d09d6283c8097e3000dcc7047c65c6ffe12b015bbd86b
+      cases/signature-timing-compare/base/signatures.py: 24194122abdf4e4640cca4a353865f54a7f26108cbdf5bc9cae895c6c8b142cc
+      cases/signature-timing-compare/head/signatures.py: c435988b7fb39b9706ee639b840988b4b4a32add044a3f071872b050bdffec65
+  - id: clean-fstring
+    kind: clean
+    diff: cases/clean-fstring/change.diff
+    reproducer:
+      command: [python, greeting.py]
+      base_cwd: cases/clean-fstring/base
+      head_cwd: cases/clean-fstring/head
+      expected_base_exit: 0
+      expected_head_exit: 0
+    artifact_sha256:
+      cases/clean-fstring/change.diff: 68a3c8a659b9e36737baa3b53711b05fec0d59332c40777fffc6c7e31697c712
+      cases/clean-fstring/base/greeting.py: a0084694cb5168309c4c895fa7d4f3a43cd69f7c1dce2e57bd8440a7dd373c78
+      cases/clean-fstring/head/greeting.py: 60003ef105070dede786c4f420336aadd74d2b48cf40c40c9897efb9af979a9f
+  - id: clean-constant
+    kind: clean
+    diff: cases/clean-constant/change.diff
+    reproducer:
+      command: [python, timeouts.py]
+      base_cwd: cases/clean-constant/base
+      head_cwd: cases/clean-constant/head
+      expected_base_exit: 0
+      expected_head_exit: 0
+    artifact_sha256:
+      cases/clean-constant/change.diff: 2d879127ee6bace872d8671b630b21074d279eba6f6e9300635aa575b143804c
+      cases/clean-constant/base/timeouts.py: b20fa78e6b8772a79a62fafa3278618ba8a670347c0d8a3de3fd1c23bd3db90d
+      cases/clean-constant/head/timeouts.py: 4de0f654c3bf2130093b2bc936518eb0d025ae7586b646edc099079242e3308f
+  - id: clean-comprehension
+    kind: clean
+    diff: cases/clean-comprehension/change.diff
+    reproducer:
+      command: [python, squares.py]
+      base_cwd: cases/clean-comprehension/base
+      head_cwd: cases/clean-comprehension/head
+      expected_base_exit: 0
+      expected_head_exit: 0
+    artifact_sha256:
+      cases/clean-comprehension/change.diff: 6bab2f4a928f09ff8e1cad8b8d8b7d2552b87f3ea476ad3a83c100b38897b863
+      cases/clean-comprehension/base/squares.py: 86c9589f1d42fcae4429f25b9f947a0b974cb7dadda8c63e71188e24deebf0a6
+      cases/clean-comprehension/head/squares.py: a48c3c0878ce910a593be60d628cc1e9ada0e6af111e0ba8e675a839684b01fe
+  - id: clean-guard-clause
+    kind: clean
+    diff: cases/clean-guard-clause/change.diff
+    reproducer:
+      command: [python, features.py]
+      base_cwd: cases/clean-guard-clause/base
+      head_cwd: cases/clean-guard-clause/head
+      expected_base_exit: 0
+      expected_head_exit: 0
+    artifact_sha256:
+      cases/clean-guard-clause/change.diff: f6fdaa0266b1e3b30f3a6a8744613b52502e6970903d9b9be89293d257ea51eb
+      cases/clean-guard-clause/base/features.py: 9ea66e6f50d5fdecdf4029b23f0af03a59951a97bd9bdf452615de48f57e3151
+      cases/clean-guard-clause/head/features.py: 1cc1b9722cbb7812fe6be957c6686559fd44a6aa1585fc41eb7d15290214e6c8
+  - id: clean-enumerate
+    kind: clean
+    diff: cases/clean-enumerate/change.diff
+    reproducer:
+      command: [python, numbering.py]
+      base_cwd: cases/clean-enumerate/base
+      head_cwd: cases/clean-enumerate/head
+      expected_base_exit: 0
+      expected_head_exit: 0
+    artifact_sha256:
+      cases/clean-enumerate/change.diff: 40fdb526e156c4bc3d43d56bfa8dcc8315e9e36edb979b7631e05259233f7fd8
+      cases/clean-enumerate/base/numbering.py: bd811995661abeccd34095c252748c7e6f7e24214f66391ae77c664de5e57b20
+      cases/clean-enumerate/head/numbering.py: a8a667bed62dbe3b84bd80dad033eaf526880f38b4e1176e5b479bcb2804d8be
+  - id: clean-dict-get
+    kind: clean
+    diff: cases/clean-dict-get/change.diff
+    reproducer:
+      command: [python, labels.py]
+      base_cwd: cases/clean-dict-get/base
+      head_cwd: cases/clean-dict-get/head
+      expected_base_exit: 0
+      expected_head_exit: 0
+    artifact_sha256:
+      cases/clean-dict-get/change.diff: 5f360cad8b8285409fe9c674a85c165f156b7f29697aa070124fc9ac83023bdf
+      cases/clean-dict-get/base/labels.py: 418605632a5aec2c6c78436d687d43cb9b404d1e9368bc786b4b821c5e07218d
+      cases/clean-dict-get/head/labels.py: 4af2d0a866e3875d07db660fea7d5d775d1b9437b5381936888efa658e009bb8

@@ -1,0 +1,13 @@
+diff --git a/config.py b/config.py
+--- a/config.py
++++ b/config.py
+@@ -1,5 +1,8 @@
+ def parse_port(value: str) -> int:
+-    return int(value)
++    try:
++        return int(value)
++    except ValueError:
++        return 0
+ 
+ 
+ def _self_test() -> None:

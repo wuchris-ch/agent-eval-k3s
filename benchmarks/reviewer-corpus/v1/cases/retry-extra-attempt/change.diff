@@ -1,0 +1,10 @@
+diff --git a/retry.py b/retry.py
+--- a/retry.py
++++ b/retry.py
+@@ -1,5 +1,5 @@
+ def attempt_numbers(max_attempts: int) -> list[int]:
+-    return list(range(max_attempts))
++    return list(range(max_attempts + 1))
+ 
+ 
+ def _self_test() -> None:

@@ -1,0 +1,26 @@
+version: 2
+benchmark: experiment-benchmark.yaml
+benchmark_sha256: b593a83a3242ec3f76d70fc98515059caf88f7e9f0e3c2624ee0b5db9b35c609
+baseline: single
+budgets:
+  max_fp_per_case: 0.5
+  max_latency_s: 5
+  max_tokens: 5000
+  max_cost_usd: 0.20
+systems:
+  - id: single
+    mode: single
+    trials:
+      - id: trial-1
+        outputs: outputs/single/trial-1
+      - id: trial-2
+        outputs: outputs/single/trial-2
+  - id: specialist-panel
+    mode: panel
+    members: [security, correctness]
+    quorum: 2
+    trials:
+      - id: trial-1
+        outputs: outputs/panel/trial-1
+      - id: trial-2
+        outputs: outputs/panel/trial-2

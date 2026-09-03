@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+repository_root=$(CDPATH= cd "$(dirname "$0")" && pwd)
+reviewer_root=${PR_REVIEW_AGENT_REPO:-"$(dirname "$repository_root")/pr-review-agent"}
+model=${1:-${REVIEW_AGENT_MODEL:-}}
+if [ -z "$model" ]; then
+  printf '%s\n' 'usage: ./record-review-eval <public-model-alias>' >&2
+  exit 2
+fi
+
+cd "$repository_root"
+date_utc=$(date -u +%Y-%m-%d)
+evaluator_commit=$(git rev-parse HEAD)
+reviewer_commit=$(git -C "$reviewer_root" rev-parse HEAD)
+exec uv run python scripts/record_review_eval.py \
+  --model "$model" \
+  --evaluator-commit "$evaluator_commit" \
+  --reviewer-commit "$reviewer_commit" \
+  --out "benchmarks/reviewer-corpus/v1/results/$date_utc.md"

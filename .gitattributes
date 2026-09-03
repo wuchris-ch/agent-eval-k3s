@@ -1,0 +1,2 @@
+# Unified-diff fixtures require a one-character context prefix on blank lines.
+benchmarks/reviewer-corpus/**/*.diff -whitespace

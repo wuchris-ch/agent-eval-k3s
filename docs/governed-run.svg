@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 350" role="img" aria-labelledby="title description">
+  <title id="title">Governed run admission flow</title>
+  <desc id="description">A request is checked against policy and registries before side effects. An admitted request gets a private task snapshot, then execution identity is checked again before the exact image and recipe run. A failed check stops the run.</desc>
+  <defs>
+    <style>
+      :root { --canvas:#fff; --surface:#f8fafc; --surface2:#f1f5f9; --ink:#0f172a; --muted:#64748b; --line:#cbd5e1; --strong:#94a3b8; --emphasis:#0f172a; --emphasis-ink:#fff; }
+      @media (prefers-color-scheme: dark) { :root { --canvas:#0b0f14; --surface:#111820; --surface2:#17202a; --ink:#e5e7eb; --muted:#9ca3af; --line:#334155; --strong:#64748b; --emphasis:#253140; --emphasis-ink:#f8fafc; } }
+      text { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; fill:var(--ink); }
+      .canvas { fill:var(--canvas); }
+      .card { fill:var(--surface); stroke:var(--line); stroke-width:1; }
+      .card2 { fill:var(--surface2); stroke:var(--line); stroke-width:1; }
+      .gate { fill:var(--emphasis); }
+      .gate-text, .detail.gate-text { fill:var(--emphasis-ink); }
+      .flow { fill:none; stroke:var(--strong); stroke-width:1.5; marker-end:url(#arrow); }
+      .reject { fill:none; stroke:var(--strong); stroke-width:1.25; stroke-dasharray:5 4; marker-end:url(#arrow); }
+      .eyebrow { font-size:11px; font-weight:700; letter-spacing:.12em; fill:var(--muted); }
+      .title { font-size:22px; font-weight:650; letter-spacing:-.02em; }
+      .node-title { font-size:14px; font-weight:650; }
+      .detail { font-size:11px; fill:var(--muted); }
+      .step { font-size:10px; font-weight:700; letter-spacing:.1em; fill:var(--muted); }
+      .label { font-size:10px; font-weight:700; fill:var(--muted); }
+    </style>
+    <marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0 0 7 3.5 0 7Z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" width="1200" height="350"/>
+  <text class="eyebrow" x="40" y="31">OPTIONAL GOVERNANCE</text>
+  <text class="title" x="40" y="60">Identity is checked before execution</text>
+
+  <text class="step" x="40" y="107">01  DEFINE</text>
+  <rect class="card" x="40" y="121" width="176" height="88" rx="6"/>
+  <text class="node-title" x="58" y="151">Request + policy</text>
+  <text class="detail" x="58" y="173">actor, task, model, limits</text>
+  <text class="detail" x="58" y="191">registries + allowed identities</text>
+  <path class="flow" d="M216 165 H250"/>
+
+  <text class="step" x="250" y="107">02  ADMIT</text>
+  <rect class="gate" x="250" y="121" width="154" height="88" rx="6"/>
+  <text class="node-title gate-text" x="269" y="151">Preflight gate</text>
+  <text class="detail gate-text" x="269" y="173">validate request, policy</text>
+  <text class="detail gate-text" x="269" y="191">and registered identities</text>
+  <text class="label" x="418" y="157">YES</text>
+  <path class="flow" d="M404 165 H448"/>
+
+  <text class="step" x="448" y="107">03  FREEZE</text>
+  <rect class="card2" x="448" y="121" width="154" height="88" rx="6"/>
+  <text class="node-title" x="467" y="151">Private snapshot</text>
+  <text class="detail" x="467" y="173">copy the exact task tree</text>
+  <text class="detail" x="467" y="191">for this run only</text>
+  <path class="flow" d="M602 165 H646"/>
+
+  <text class="step" x="646" y="107">04  RECHECK</text>
+  <rect class="gate" x="646" y="121" width="172" height="88" rx="6"/>
+  <text class="node-title gate-text" x="665" y="151">Execution identity</text>
+  <text class="detail gate-text" x="665" y="173">recompute task, image,</text>
+  <text class="detail gate-text" x="665" y="191">recipe + scanner identity</text>
+  <text class="label" x="832" y="157">MATCH</text>
+  <path class="flow" d="M818 165 H862"/>
+
+  <text class="step" x="862" y="107">05  RUN</text>
+  <rect class="card" x="862" y="121" width="130" height="88" rx="6"/>
+  <text class="node-title" x="881" y="151">Exact execution</text>
+  <text class="detail" x="881" y="173">approved image</text>
+  <text class="detail" x="881" y="191">+ recipe</text>
+  <path class="flow" d="M992 165 H1026"/>
+
+  <text class="step" x="1026" y="107">06  VERIFY</text>
+  <rect class="card2" x="1026" y="121" width="134" height="88" rx="6"/>
+  <text class="node-title" x="1045" y="151">Observed result</text>
+  <text class="detail" x="1045" y="173">evidence + limits</text>
+  <text class="detail" x="1045" y="191">+ final outcome</text>
+
+  <text class="label" x="327" y="230" text-anchor="middle">NO</text>
+  <path class="reject" d="M327 209 V267 H478"/>
+  <text class="label" x="732" y="230" text-anchor="middle">MISMATCH</text>
+  <path class="reject" d="M732 209 V267 H730"/>
+  <rect class="card2" x="479" y="245" width="250" height="47" rx="6"/>
+  <text class="node-title" x="604" y="274" text-anchor="middle">Stop and record the denial</text>
+  <text class="detail" x="604" y="315" text-anchor="middle">Preflight denial happens before cluster setup, image work, credential loading, or any model call.</text>
+</svg>

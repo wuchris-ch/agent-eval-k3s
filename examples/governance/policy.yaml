@@ -1,0 +1,71 @@
+schema_version: agent-eval.policy/v2
+policy_id: engineering-agent-evals
+revision: 2026-07-14.1
+rules:
+  allowed_tenants:
+    - acme-engineering
+  allowed_projects:
+    - developer-productivity
+  allowed_tasks:
+    - example-*
+  allowed_network_modes:
+    - proxy
+  allowed_egress_domains:
+    - .anthropic.com
+    - .claude.ai
+  allowed_proxy_images:
+    - ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
+  # Replace with the identity printed by a promotion-ready scanner preflight.
+  allowed_scanner_identities:
+    - "0000000000000000000000000000000000000000000000000000000000000000"
+  allowed_data_classifications:
+    - public
+    - internal
+  allowed_retention_classes:
+    - ephemeral
+    - standard
+  require_scans: true
+  require_judge: true
+  require_broker_credentials: false
+  max_trials: 3
+  max_agent_seconds: 900
+  max_eval_seconds: 300
+  max_observed_total_tokens: 100000
+  max_observed_cost_usd: 5.0
+task_registry:
+  registry_id: production-tasks
+  revision: 2026-07-14.1
+  tasks:
+    - task_id: example-todo-api
+      task_tree_sha256: 029b9fcb68e389256aa4ace3ae5bc6ffef4f081e168d1e07dddfdd03b6033e3d
+      execution_spec_digests:
+        - 0acce5c74ca26252226a2082b81cdb3375d170341c1e5056eadbe285fbea574f
+      approved_images:
+        - platform: linux/arm64
+          reference: agent-eval/example-todo-api:governed-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+          manifest_digest: sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+          builder_id: https://example.invalid/builders/replace-before-use
+          build_type: https://slsa.dev/container/v1
+          source_revision: replace-before-use
+          provenance_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      status: approved
+model_registry:
+  registry_id: production-models
+  revision: 2026-07-14.1
+  models:
+    - adapter: claude-code
+      model: claude-sonnet-4-5-20250929
+      provider: anthropic
+      status: approved
+      allowed_data_classifications:
+        - public
+        - internal
+      max_observed_total_tokens: 80000
+      max_observed_cost_usd: 3.0
+    - adapter: judge:claude
+      model: claude-sonnet-4-5-20250929
+      provider: anthropic
+      status: approved
+      allowed_data_classifications:
+        - public
+        - internal

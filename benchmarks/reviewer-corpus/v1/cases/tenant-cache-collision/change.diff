@@ -1,0 +1,10 @@
+diff --git a/cache.py b/cache.py
+--- a/cache.py
++++ b/cache.py
+@@ -1,5 +1,5 @@
+ def cache_key(tenant_id: str, user_id: str) -> str:
+-    return f"{tenant_id}:{user_id}"
++    return user_id
+ 
+ 
+ def _self_test() -> None:

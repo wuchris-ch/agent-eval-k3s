@@ -1,0 +1,19 @@
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: agent-eval
+servers: 1
+agents: 1
+ports:
+  - port: 127.0.0.1:6006:30606
+    nodeFilters:
+      - loadbalancer
+  - port: 127.0.0.1:4318:30318
+    nodeFilters:
+      - loadbalancer
+options:
+  k3s:
+    extraArgs:
+      - arg: --disable=servicelb
+        nodeFilters:
+          - server:*

@@ -1,0 +1,13 @@
+diff --git a/timeouts.py b/timeouts.py
+--- a/timeouts.py
++++ b/timeouts.py
+@@ -1,5 +1,8 @@
++DEFAULT_TIMEOUT_SECONDS = 30
++
++
+ def timeout_seconds() -> int:
+-    return 30
++    return DEFAULT_TIMEOUT_SECONDS
+ 
+ 
+ def _self_test() -> None:

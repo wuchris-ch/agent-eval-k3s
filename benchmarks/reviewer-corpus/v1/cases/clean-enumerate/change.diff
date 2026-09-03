@@ -1,0 +1,10 @@
+diff --git a/numbering.py b/numbering.py
+--- a/numbering.py
++++ b/numbering.py
+@@ -1,5 +1,5 @@
+ def numbered(values: list[str]) -> list[str]:
+-    return [f"{index}: {values[index]}" for index in range(len(values))]
++    return [f"{index}: {value}" for index, value in enumerate(values)]
+ 
+ 
+ def _self_test() -> None:
