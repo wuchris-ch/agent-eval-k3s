@@ -124,22 +124,45 @@ run_evaluation() {
     fi
     if [ "$failed" = True ] || [ "$(date +%s)" -ge "$deadline" ]; then
       kubectl logs "job/$job" -n "$namespace" --tail=100 || true
+      if ! copy_job_result "$job"; then
+        printf '%s\n' 'The failed job did not produce an evaluation report.' >&2
+      fi
       exit 1
     fi
     sleep 5
   done
   kubectl logs "job/$job" -n "$namespace" --tail=100
-  copy_results
+  copy_job_result "$job"
 }
 
-copy_results() {
-  pod=$(kubectl get pod -n "$namespace" \
+results_pod() {
+  kubectl get pod -n "$namespace" \
     -l app=results-keeper \
-    -o jsonpath='{.items[0].metadata.name}')
-  kubectl cp "$namespace/$pod:/results/latest.json" \
+    -o jsonpath='{.items[0].metadata.name}'
+}
+
+copy_result_path() {
+  source_path=$1
+  pod=$(results_pod)
+  kubectl cp "$namespace/$pod:$source_path" \
     "$repository_root/review-agent-eval.json" \
     -c results
   printf 'Latest report: %s/review-agent-eval.json\n' "$repository_root"
+}
+
+copy_job_result() {
+  job=$1
+  evaluation_pod=$(kubectl get pod -n "$namespace" \
+    -l "job-name=$job" \
+    -o jsonpath='{.items[0].metadata.name}')
+  pod=$(results_pod)
+  source_path="/results/$evaluation_pod.json"
+  kubectl exec "$pod" -n "$namespace" -c results -- test -f "$source_path"
+  copy_result_path "$source_path"
+}
+
+copy_results() {
+  copy_result_path /results/latest.json
 }
 
 command=${1:-}

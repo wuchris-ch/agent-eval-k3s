@@ -276,7 +276,7 @@ spec:
               args:
                 - |
                   set +e
-                  report="/results/reviewer-$(date -u +%Y%m%dT%H%M%SZ).json"
+                  report="/results/$HOSTNAME.json"
                   agent-eval eval-review-agent \
                     --command "/usr/local/bin/node /opt/reviewer/dist/cli.js" \
                     --corpus /app/benchmarks/reviewer-corpus/v1/corpus.yaml \
