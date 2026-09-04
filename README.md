@@ -4,10 +4,11 @@
 [![Python 3.12–3.14](https://img.shields.io/badge/python-3.12%E2%80%933.14-3776AB)](pyproject.toml)
 [![Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-2f855a)](LICENSE)
 
-An evidence-first evaluation platform for AI coding and pull-request review
-agents. It runs blinded, versioned tasks, keeps grading outside the agent's
-control, distinguishes bad answers from broken infrastructure, and exports
-privacy-filtered traces through OpenTelemetry and Phoenix.
+An evaluation platform for AI agents through their observable inputs and
+outputs. Evaluate CLI tools, HTTP services, or recorded responses from a database
+with versioned goldens, deterministic checks, and optional DeepEval judging.
+Agents do not need to expose their internals or use a particular framework.
+Specialized coding and pull-request review benchmarks remain available.
 
 [![Agent evaluation and observability architecture](docs/local-review-platform.svg)](https://wuchris-ch.github.io/agent-eval-k3s/)
 
@@ -17,7 +18,30 @@ to zoom, pan, use full screen, and move between the supporting system diagrams.
 This repository contains the evaluation system. The separately deployable
 reviewer lives in [`pr-review-agent`](https://github.com/wuchris-ch/pr-review-agent).
 
-## Latest validated benchmark
+## Start with black-box evaluation
+
+```sh
+uv run agent-eval blackbox run \
+  --suite examples/blackbox/faq.yaml --agent faq-smoke \
+  --command "python3 $PWD/examples/blackbox/smoke_target.py"
+```
+
+This credential-free fixture demonstrates the connection and scoring path.
+Replace the command with your agent, use `--url-env` for an HTTP service, or
+use `blackbox replay-db` to evaluate final responses from SQLite or Postgres.
+Generated golden files can be frozen with `blackbox import-goldens`.
+
+Read the [black-box evaluation guide](docs/blackbox-evaluation.md) for FAQ and
+triage examples, native JSON response mapping, DeepEval metrics, generated
+goldens, database queries, and private result storage.
+
+For agents with available source or execution traces, add
+[optional source and trace inspection](docs/agent-inspection.md). It supports
+repository checks, tool-call checks, and DeepEval inspection while keeping the
+shared input/output score separate. Saved runs can be inspected without rerunning
+the agent.
+
+## Latest validated reviewer benchmark
 
 The release-quality benchmark runs every one of the 20 reviewer cases three
 times. This result was recorded on September 3, 2026 with `gemini-3.8-flash`
@@ -40,8 +64,9 @@ for run identities, report digests, and every case and trial.
 
 ## What makes the evaluation trustworthy
 
-- **Blind execution.** The target receives the raw diff or task workspace, not
-  the case ID, golden findings, scoring threshold, or expected answer.
+- **Blind execution.** The target receives the declared input, raw diff, or task
+  workspace. Case IDs, goldens, scoring thresholds, and expected answers remain
+  with the evaluator.
 - **Independent evidence.** The harness owns hidden tests, scanners, golden
   matches, acceptance policy, and the final result.
 - **Explicit failure semantics.** `accepted`, `rejected`, and `infra_error`
@@ -58,6 +83,7 @@ for run identities, report digests, and every case and trial.
 
 | Mode | Target | Evidence |
 |---|---|---|
+| General black-box evaluation | Any CLI or HTTP agent; recorded JSONL, SQLite, or Postgres observations | Versioned input/output cases, exact/contains/JSON checks, optional configurable GEval, repeated trials |
 | Reviewer benchmark | External review-agent executable | 20 golden diffs, exact finding matches, block decisions, stability, optional GEval |
 | Coding-agent run | Agent working inside k3s | Hidden tests, coverage, Semgrep, Gitleaks, Trivy, Ruff, challenges, optional judge |
 | Existing workspace | Already-produced code | The same evaluator without launching an agent |

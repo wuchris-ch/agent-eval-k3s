@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import cluster as cluster_mod
+from .blackbox.cli import app as blackbox_app
 from .report import (
     markdown_report,
     print_run_detail,
@@ -26,8 +27,8 @@ from .runner import evaluate_workspace, validate_task
 from .task import list_tasks, load_task
 
 app = typer.Typer(
-    help="Evaluation-only harness for coding agents and separately installed "
-    "review agents.",
+    help="Evaluation-only harness for agents through black-box CLI/HTTP interfaces, "
+    "recorded outputs, or specialized coding and review benchmarks.",
     no_args_is_help=True,
 )
 cluster_app = typer.Typer(help="Manage the k3d/k3s cluster.", no_args_is_help=True)
@@ -50,6 +51,7 @@ app.add_typer(corpus_app, name="corpus")
 app.add_typer(audit_app, name="audit")
 app.add_typer(state_app, name="state")
 app.add_typer(scanners_app, name="scanners")
+app.add_typer(blackbox_app, name="blackbox")
 console = Console()
 
 

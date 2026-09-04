@@ -1,0 +1,8 @@
+schema_version: "1.0"
+source:
+  include: [smoke_target.py]
+checks:
+  - name: answer-handler-present
+    kind: source_contains
+    path: smoke_target.py
+    text: "def answer("

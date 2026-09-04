@@ -1,0 +1,18 @@
+schema_version: "1.0"
+source:
+  include: [instrumented_fixture.py]
+checks:
+  - name: implementation-supports-answer
+    kind: source_geval
+    criteria: >-
+      Does the selected source support the observed answer for this input?
+      Identify unsupported claims or contradictions. Assess only the provided
+      files. Static code does not establish which path ran in this trial.
+    threshold: 0.7
+  - name: validates-retrieved-answer
+    kind: trace_geval
+    criteria: >-
+      Does the trace show the retrieved answer being checked before it is returned?
+      Compare the search result with the arguments and result of validation.
+      Checking the user's question instead of the retrieved answer is insufficient.
+    threshold: 0.7

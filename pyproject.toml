@@ -1,7 +1,7 @@
 [project]
 name = "agent-eval"
 version = "0.4.0"
-description = "Evaluation-only harness for coding agents and external review agents with goldens, isolated trials, evidence gates, and telemetry"
+description = "Black-box agent evaluation through CLI, HTTP, and recorded observations, with specialized coding and review benchmarks"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -24,6 +24,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+database = [
+    "psycopg[binary]>=3.3.3,<4",
+]
 observability = [
     "opentelemetry-api==1.43.0",
     "opentelemetry-exporter-otlp==1.43.0",

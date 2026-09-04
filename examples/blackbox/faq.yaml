@@ -1,0 +1,13 @@
+schema_version: "1.0"
+id: faq-smoke
+version: "1.0.0"
+metrics:
+  - name: required-fact
+    kind: contains
+cases:
+  - id: support-hours
+    input: "When is support available?"
+    expected_output: "09:00 to 17:00 UTC"
+  - id: unknown-policy
+    input: "Can you guarantee a refund next year?"
+    expected_output: "I don't have that information"
