@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+from fnmatch import fnmatchcase
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
 from ..limits import read_stable_bounded_file
@@ -35,9 +37,27 @@ EXCLUDED_FILES = {
 
 
 def _matches(path: str, pattern: str) -> bool:
-    return PurePosixPath(path).match(pattern) or (
-        pattern.startswith("**/") and PurePosixPath(path).match(pattern[3:])
-    )
+    # PurePath.match treats ** like a single directory on Python 3.12. Match
+    # root-relative components explicitly so ** includes zero or more levels.
+    parts = PurePosixPath(path).parts
+    patterns = PurePosixPath(pattern).parts
+
+    @lru_cache(maxsize=None)
+    def match(path_index: int, pattern_index: int) -> bool:
+        if pattern_index == len(patterns):
+            return path_index == len(parts)
+        current = patterns[pattern_index]
+        if current == "**":
+            return match(path_index, pattern_index + 1) or (
+                path_index < len(parts) and match(path_index + 1, pattern_index)
+            )
+        return (
+            path_index < len(parts)
+            and fnmatchcase(parts[path_index], current)
+            and match(path_index + 1, pattern_index + 1)
+        )
+
+    return match(0, 0)
 
 
 def collect_source(root: Path, selection: SourceSelection) -> SourceSnapshot:

@@ -117,6 +117,29 @@ def test_collects_selected_source_without_executing_it(tmp_path):
     assert not marker.exists()
 
 
+def test_source_patterns_are_recursive_and_relative_to_root(tmp_path):
+    paths = [
+        "src/agent.py",
+        "src/tools/search.py",
+        "src/tools/nested/search.py",
+        "src/fixtures/skip.py",
+        "src/tools/fixtures/skip.py",
+        "vendor/src/agent.py",
+        "agent.py",
+    ]
+    for name in paths:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("example")
+    snapshot = collect_source(
+        tmp_path,
+        SourceSelection(include=["src/**/*.py"], exclude=["**/fixtures/**"]),
+    )
+    assert [file.path for file in snapshot.files] == sorted(paths[:3])
+    exact = collect_source(tmp_path, SourceSelection(include=["agent.py"]))
+    assert [file.path for file in exact.files] == ["agent.py"]
+
+
 @pytest.mark.parametrize(
     "pattern",
     ["../agent.py", "/absolute.py", "folder/../../a", "C:/a", "folder\\a", "a\nb"],

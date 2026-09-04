@@ -96,6 +96,9 @@ checks:
 
 Use a source-only profile without trace checks, or a trace-only profile without
 the `source` section. Paths and patterns are relative to `--source-root`.
+`*` matches within one path component; `**` matches zero or more directory
+levels. For example, `src/**/*.py` includes both `src/agent.py` and files in
+nested subdirectories. A literal `agent.py` selects only the root-level file.
 Inspection rejects absolute paths, traversal, and selected symlinks. It skips
 dependency and credential directories, `.env` files, and common credential/key
 filenames. Limits are 100 selected UTF-8 files, 512 KiB of source content, and
