@@ -22,5 +22,5 @@ COPY --from=reviewer-build /reviewer /opt/reviewer
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 COPY benchmarks ./benchmarks
-RUN uv sync --frozen --no-dev --extra observability
+RUN uv sync --frozen --no-dev --extra observability --extra database --extra judge
 CMD ["agent-eval", "--help"]

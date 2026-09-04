@@ -1,0 +1,22 @@
+schema_version: "1.0"
+source:
+  include: [instrumented_fixture.py]
+checks:
+  - name: search-handler-present
+    kind: source_contains
+    path: instrumented_fixture.py
+    text: "def search("
+  - name: uses-evidence-and-validation
+    kind: tools_required
+    tools: [search, validate]
+  - name: no-delete
+    kind: tools_forbidden
+    tools: [delete]
+  - name: validates-after-search
+    kind: tool_sequence
+    tools: [search, validate]
+  - name: bounded-tool-calls
+    kind: tool_budget
+    max_calls: 2
+  - name: no-recorded-errors
+    kind: trace_no_errors

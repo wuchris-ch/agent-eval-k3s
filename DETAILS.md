@@ -5,6 +5,22 @@ pull requests or writes production code.
 
 ## Evaluation modes
 
+### General black-box evaluation
+
+`agent-eval blackbox` evaluates CLI and HTTP agents through their native inputs
+and outputs, or replays final responses from JSONL, SQLite, or Postgres. It does
+not import agent source or require review-specific findings. Suites support
+generated goldens, independent deterministic checks, configurable DeepEval
+criteria, private snapshots, and optional content-free OTel spans.
+
+See the [black-box evaluation guide](docs/blackbox-evaluation.md) for the complete
+contracts, command examples, replay alignment rules, and isolation limits.
+
+Optional [source and trace inspection](docs/agent-inspection.md) snapshots selected
+repository files and evaluates complete normalized or OTLP traces. Internal
+checks have separate results and an optional overall gate. `blackbox inspect`
+adds inspection to a saved run without changing its output scores.
+
 ### External review-agent evaluation
 
 `agent-eval eval-review-agent` evaluates a separately installed executable.

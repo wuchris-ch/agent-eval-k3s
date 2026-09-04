@@ -1,0 +1,21 @@
+schema_version: "1.0"
+id: triage-smoke
+version: "1.0.0"
+metrics:
+  - name: escalation-decision
+    kind: json_subset
+cases:
+  - id: service-unavailable
+    input:
+      incident: "All requests to the public API return 503."
+      affected_users: "all"
+    expected_output:
+      severity: critical
+      escalate: true
+  - id: isolated-client-error
+    input:
+      incident: "One client gets a 400 after sending malformed JSON. Other clients work."
+      affected_users: "one"
+    expected_output:
+      severity: low
+      escalate: false
